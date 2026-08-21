@@ -32,7 +32,7 @@ from intelligram.services.messaging import (
     get_peer,
     send_message,
 )
-from intelligram.services.updates import get_state
+from intelligram.services.updates import get_difference, get_state
 from intelligram.mtproto.tl import (
     TLDecodeError,
     encode_account_privacy_rules,
@@ -56,6 +56,8 @@ from intelligram.mtproto.tl import (
     encode_photos_photo,
     encode_peer_user,
     encode_updates,
+    encode_updates_difference,
+    encode_updates_difference_empty,
     encode_upload_file,
     encode_update_message_id,
     encode_update_new_message,
@@ -120,6 +122,8 @@ class MTProtoSessionAdapter:
                 expires=now + 3_600,
             )
             return self._encrypt_result(message, result)
+        if request.name == "updates_get_difference":
+            return self._handle_updates_get_difference(message, after_pts=int(request.fields["pts"]))
         if request.name == "updates_get_state":
             if self.database is not None and self.user_id is not None:
                 with self.database.transaction() as connection:
@@ -223,6 +227,61 @@ class MTProtoSessionAdapter:
             return self._encrypt_result(message, encode_account_privacy_rules())
         LOGGER.warning("Unsupported MTProto encrypted request: %s (0x%08x)", request.name, request.constructor_id)
         return self._encrypt_rpc_error(message, "METHOD_INVALID")
+
+    def _handle_updates_get_difference(self, message: EncryptedMessage, *, after_pts: int) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                envelopes = get_difference(connection, user_id=self_user_id, after_pts=max(after_pts, 0), limit=100)
+                state = get_state(connection, self_user_id)
+                if not envelopes:
+                    result = encode_updates_difference_empty(date=state["date"], seq=state["seq"])
+                else:
+                    encoded_messages: list[bytes] = []
+                    user_ids: set[int] = {self_user_id}
+                    chat_ids: set[int] = set()
+                    for envelope in envelopes:
+                        if envelope.kind == "updateNewMessage":
+                            stored = envelope.payload.get("message")
+                            if not isinstance(stored, dict):
+                                continue
+                            summary = get_peer(
+                                connection,
+                                peer_id=int(stored["peer_id"]),
+                                user_id=self_user_id,
+                            )
+                            recipient_peer = self._encode_peer(summary)
+                            encoded_messages.append(
+                                encode_message(
+                                    message=stored,
+                                    recipient_peer=recipient_peer,
+                                    outgoing=bool(envelope.payload.get("is_outgoing")),
+                                )
+                            )
+                            user_ids.add(int(stored["sender_user_id"]))
+                            if summary.get("direct_user_id") is not None:
+                                user_ids.add(int(summary["direct_user_id"]))
+                            elif str(summary.get("kind")) == "chat":
+                                chat_ids.add(int(summary["peer_id"]))
+                        elif envelope.kind == "updateNewChat":
+                            chat_ids.add(int(envelope.payload["chat_id"]))
+                    users = self._load_users(connection, user_ids)
+                    result = encode_updates_difference(
+                        new_messages=encoded_messages,
+                        other_updates=[],
+                        chats=self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
+                        users=self._encode_users(users, self_user_id=self_user_id),
+                        pts=state["pts"],
+                        qts=state["qts"],
+                        date=state["date"],
+                        seq=state["seq"],
+                    )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
 
     def _handle_auth_send_code(self, message: EncryptedMessage, *, phone_number: str) -> bytes:
         if self.database is None:

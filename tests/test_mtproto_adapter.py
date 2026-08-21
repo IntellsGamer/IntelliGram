@@ -727,3 +727,65 @@ def test_web_k_upload_get_file_returns_persisted_profile_photo_bytes(tmp_path) -
     assert reader.uint32() == STORAGE_FILE_UNKNOWN_CONSTRUCTOR
     assert reader.int32() > 0
     assert reader.bytes() == content
+
+
+def test_web_k_updates_get_difference_replays_durable_message(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_DIFFERENCE_CONSTRUCTOR,
+        UPDATES_GET_DIFFERENCE_CONSTRUCTOR,
+        encode_int32,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 159, 753
+    database = Database(tmp_path / "updates-difference.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection,
+            phone="+15550000151",
+            password="correct-horse-battery-staple",
+            first_name="Alice",
+            device_label="Alice device",
+        )
+        bob = register_password_account(
+            connection,
+            phone="+15550000152",
+            password="correct-horse-battery-staple",
+            first_name="Bob",
+            device_label="Bob device",
+        )
+        peer_id = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        send_message(
+            connection,
+            peer_id=peer_id,
+            sender_user_id=alice.user_id,
+            body="durable difference message",
+            client_random_id="difference-1",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=bob.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    get_difference = (
+        encode_uint32(UPDATES_GET_DIFFERENCE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int32(0)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=get_difference,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
+    assert reader.uint32() == 0x1CB5C415
+    assert reader.int32() == 1

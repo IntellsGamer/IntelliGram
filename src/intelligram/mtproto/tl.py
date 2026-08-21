@@ -94,6 +94,9 @@ UPLOAD_GET_FILE_CONSTRUCTOR = 0xBE5335BE
 INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR = 0x40181FFE
 STORAGE_FILE_UNKNOWN_CONSTRUCTOR = 0xAA963B05
 UPLOAD_FILE_CONSTRUCTOR = 0x096A18D5
+UPDATES_GET_DIFFERENCE_CONSTRUCTOR = 0x19C2F763
+UPDATES_DIFFERENCE_EMPTY_CONSTRUCTOR = 0x5D75A138
+UPDATES_DIFFERENCE_CONSTRUCTOR = 0x00F49CA0
 
 
 class TLDecodeError(ValueError):
@@ -415,6 +418,22 @@ def parse_request(data: bytes) -> TLRequest:
                 raise TLDecodeError("Expected an inputDialogPeer constructor")
             peers.append(_read_input_peer(reader))
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
+    elif constructor_id == UPDATES_GET_DIFFERENCE_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b111:
+            raise TLDecodeError("Unsupported updates.getDifference optional fields")
+        pts = reader.int32()
+        if flags & (1 << 1):
+            reader.int32()  # pts_limit
+        if flags & 1:
+            reader.int32()  # pts_total_limit
+        request = TLRequest(constructor_id, "updates_get_difference", {
+            "pts": pts,
+            "date": reader.int32(),
+            "qts": reader.int32(),
+        })
+        if flags & (1 << 2):
+            reader.int32()  # qts_limit
     elif constructor_id == UPLOAD_GET_FILE_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b11:
@@ -801,6 +820,32 @@ def encode_auth_authorization(*, user: dict[str, Any]) -> bytes:
         encode_uint32(AUTH_AUTHORIZATION_CONSTRUCTOR)
         + encode_uint32(0)
         + encode_user(user=user, self_user_id=int(user["id"]))
+    )
+
+
+def encode_updates_difference_empty(*, date: int, seq: int) -> bytes:
+    return encode_uint32(UPDATES_DIFFERENCE_EMPTY_CONSTRUCTOR) + encode_int32(date) + encode_int32(seq)
+
+
+def encode_updates_difference(
+    *,
+    new_messages: Iterable[bytes],
+    other_updates: Iterable[bytes],
+    chats: Iterable[bytes],
+    users: Iterable[bytes],
+    pts: int,
+    qts: int,
+    date: int,
+    seq: int,
+) -> bytes:
+    return (
+        encode_uint32(UPDATES_DIFFERENCE_CONSTRUCTOR)
+        + encode_vector(new_messages)
+        + encode_vector([])  # new_encrypted_messages
+        + encode_vector(other_updates)
+        + encode_vector(chats)
+        + encode_vector(users)
+        + encode_updates_state(pts=pts, qts=qts, date=date, seq=seq, unread_count=0)
     )
 
 

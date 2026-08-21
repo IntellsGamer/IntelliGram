@@ -60,6 +60,8 @@ const wanted = new Set([
   'inputPhotoFileLocation',
   'upload.file',
   'storage.fileUnknown',
+  'updates.difference',
+  'updates.differenceEmpty',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -77,6 +79,7 @@ const wantedMethods = new Set([
   'upload.saveBigFilePart',
   'photos.uploadProfilePhoto',
   'upload.getFile',
+  'updates.getDifference',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));
