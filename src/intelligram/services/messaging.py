@@ -161,6 +161,107 @@ def _ensure_dialog(connection: sqlite3.Connection, user_id: int, peer_id: int, m
     )
 
 
+def _require_chat_manager(connection: sqlite3.Connection, *, chat_id: int, user_id: int) -> sqlite3.Row:
+    row = connection.execute(
+        """
+        SELECT p.id, p.title, p.about, pm.role
+        FROM peers p
+        JOIN peer_memberships pm ON pm.peer_id = p.id
+        WHERE p.id = ? AND p.kind = 'chat' AND pm.user_id = ? AND pm.left_at IS NULL
+        """,
+        (chat_id, user_id),
+    ).fetchone()
+    if row is None:
+        raise MessagingError("CHAT_ID_INVALID")
+    if str(row["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    return row
+
+
+def _active_chat_member_ids(connection: sqlite3.Connection, *, chat_id: int) -> list[int]:
+    return [
+        int(row["user_id"])
+        for row in connection.execute(
+            "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL ORDER BY user_id",
+            (chat_id,),
+        ).fetchall()
+    ]
+
+
+def add_chat_user(connection: sqlite3.Connection, *, chat_id: int, actor_user_id: int, added_user_id: int) -> list[UpdateEnvelope]:
+    _require_chat_manager(connection, chat_id=chat_id, user_id=actor_user_id)
+    user = connection.execute("SELECT id FROM users WHERE id = ?", (added_user_id,)).fetchone()
+    if user is None:
+        raise MessagingError("USER_ID_INVALID")
+    existing = connection.execute(
+        "SELECT left_at FROM peer_memberships WHERE peer_id = ? AND user_id = ?",
+        (chat_id, added_user_id),
+    ).fetchone()
+    if existing is not None and existing["left_at"] is None:
+        raise MessagingError("USER_ALREADY_PARTICIPANT")
+    now = now_unix()
+    if existing is None:
+        connection.execute(
+            "INSERT INTO peer_memberships(peer_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+            (chat_id, added_user_id, now),
+        )
+    else:
+        connection.execute(
+            "UPDATE peer_memberships SET role = 'member', joined_at = ?, left_at = NULL WHERE peer_id = ? AND user_id = ?",
+            (now, chat_id, added_user_id),
+        )
+    _ensure_dialog(connection, added_user_id, chat_id, None, 0)
+    title_row = connection.execute("SELECT title FROM peers WHERE id = ?", (chat_id,)).fetchone()
+    title = str(title_row["title"]) if title_row is not None else ""
+    emitted: list[UpdateEnvelope] = []
+    for member_id in _active_chat_member_ids(connection, chat_id=chat_id):
+        if member_id == added_user_id:
+            emitted.append(append_update(connection, user_id=member_id, kind="updateNewChat", payload={"chat_id": chat_id, "title": title}))
+        emitted.append(append_update(connection, user_id=member_id, kind="updateChatParticipants", payload={"chat_id": chat_id}))
+    return emitted
+
+
+def delete_chat_user(connection: sqlite3.Connection, *, chat_id: int, actor_user_id: int, deleted_user_id: int) -> list[UpdateEnvelope]:
+    if actor_user_id != deleted_user_id:
+        _require_chat_manager(connection, chat_id=chat_id, user_id=actor_user_id)
+    member = connection.execute(
+        "SELECT role FROM peer_memberships WHERE peer_id = ? AND user_id = ? AND left_at IS NULL",
+        (chat_id, deleted_user_id),
+    ).fetchone()
+    if member is None:
+        raise MessagingError("USER_NOT_PARTICIPANT")
+    if str(member["role"]) == "owner":
+        raise MessagingError("USER_CREATOR")
+    connection.execute(
+        "UPDATE peer_memberships SET left_at = ? WHERE peer_id = ? AND user_id = ?",
+        (now_unix(), chat_id, deleted_user_id),
+    )
+    connection.execute("DELETE FROM dialogs WHERE user_id = ? AND peer_id = ?", (deleted_user_id, chat_id))
+    return [
+        append_update(connection, user_id=member_id, kind="updateChatParticipants", payload={"chat_id": chat_id})
+        for member_id in _active_chat_member_ids(connection, chat_id=chat_id)
+    ]
+
+
+def edit_chat_title(connection: sqlite3.Connection, *, chat_id: int, actor_user_id: int, title: str) -> list[UpdateEnvelope]:
+    _require_chat_manager(connection, chat_id=chat_id, user_id=actor_user_id)
+    title = title.strip()
+    if not title:
+        raise MessagingError("CHAT_TITLE_EMPTY")
+    connection.execute("UPDATE peers SET title = ? WHERE id = ? AND kind = 'chat'", (title, chat_id))
+    return [
+        append_update(connection, user_id=member_id, kind="updateChatTitle", payload={"chat_id": chat_id, "title": title})
+        for member_id in _active_chat_member_ids(connection, chat_id=chat_id)
+    ]
+
+
+def edit_chat_about(connection: sqlite3.Connection, *, chat_id: int, actor_user_id: int, about: str) -> None:
+    _require_chat_manager(connection, chat_id=chat_id, user_id=actor_user_id)
+    if len(about) > 255:
+        raise MessagingError("CHAT_ABOUT_TOO_LONG")
+    connection.execute("UPDATE peers SET about = ? WHERE id = ? AND kind = 'chat'", (about, chat_id))
+
+
 def create_group(
     connection: sqlite3.Connection, *, owner_user_id: int, title: str, member_user_ids: list[int]
 ) -> tuple[int, list[UpdateEnvelope]]:

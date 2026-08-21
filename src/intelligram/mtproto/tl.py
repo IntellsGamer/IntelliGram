@@ -116,6 +116,11 @@ HELP_COUNTRIES_LIST_CONSTRUCTOR = 0x93CC1F32
 CONTACTS_RESOLVE_USERNAME_CONSTRUCTOR = 0x725AFBBC
 CONTACTS_RESOLVED_PEER_CONSTRUCTOR = 0x7F077AD9
 UPDATE_READ_HISTORY_INBOX_CONSTRUCTOR = 0x9E84BC99
+UPDATE_CHAT_PARTICIPANTS_CONSTRUCTOR = 0x07761198
+MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR = 0x73783FFD
+MESSAGES_ADD_CHAT_USER_CONSTRUCTOR = 0xCBC6D107
+MESSAGES_DELETE_CHAT_USER_CONSTRUCTOR = 0xA2185CAB
+MESSAGES_EDIT_CHAT_ABOUT_CONSTRUCTOR = 0xDEF60797
 
 
 class TLDecodeError(ValueError):
@@ -457,6 +462,31 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
     elif constructor_id == MESSAGES_GET_FULL_CHAT_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_full_chat", {"chat_id": reader.int64()})
+    elif constructor_id == MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_edit_chat_title", {
+            "chat_id": reader.int64(),
+            "title": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == MESSAGES_ADD_CHAT_USER_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_add_chat_user", {
+            "chat_id": reader.int64(),
+            "user": _read_input_user(reader),
+            "fwd_limit": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_DELETE_CHAT_USER_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~1:
+            raise TLDecodeError("Unsupported messages.deleteChatUser optional fields")
+        request = TLRequest(constructor_id, "messages_delete_chat_user", {
+            "chat_id": reader.int64(),
+            "user": _read_input_user(reader),
+            "revoke_history": bool(flags & 1),
+        })
+    elif constructor_id == MESSAGES_EDIT_CHAT_ABOUT_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_edit_chat_about", {
+            "peer": _read_input_peer(reader),
+            "about": reader.bytes().decode("utf-8"),
+        })
     elif constructor_id == MESSAGES_READ_HISTORY_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_read_history", {
             "peer": _read_input_peer(reader),
@@ -924,6 +954,10 @@ def encode_users_user_full(*, user: dict[str, Any], self_user_id: int | None = N
 
 def encode_update_new_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
     return encode_uint32(UPDATE_NEW_MESSAGE_CONSTRUCTOR) + message + encode_int32(pts) + encode_int32(pts_count)
+
+
+def encode_update_chat_participants(*, participants: bytes) -> bytes:
+    return encode_uint32(UPDATE_CHAT_PARTICIPANTS_CONSTRUCTOR) + participants
 
 
 def encode_update_read_history_inbox(

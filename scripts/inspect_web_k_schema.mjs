@@ -77,6 +77,7 @@ const wanted = new Set([
   'help.countriesListNotModified',
   'contacts.resolvedPeer',
   'updateReadHistoryInbox',
+  'updateChatParticipants',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -103,6 +104,10 @@ const wantedMethods = new Set([
   'langpack.getLangPack',
   'help.getCountriesList',
   'contacts.resolveUsername',
+  'messages.addChatUser',
+  'messages.deleteChatUser',
+  'messages.editChatTitle',
+  'messages.editChatAbout',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

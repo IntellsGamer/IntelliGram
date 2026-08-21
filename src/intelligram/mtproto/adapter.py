@@ -25,7 +25,11 @@ from intelligram.services.accounts import (
 )
 from intelligram.services.messaging import (
     MessagingError,
+    add_chat_user,
     create_group,
+    delete_chat_user,
+    edit_chat_about,
+    edit_chat_title,
     get_dialogs,
     get_history,
     get_or_create_direct_peer,
@@ -74,6 +78,7 @@ from intelligram.mtproto.tl import (
     encode_update_message_id,
     encode_update_new_message,
     encode_update_read_history_inbox,
+    encode_update_chat_participants,
     encode_user,
     encode_users_user_full,
     encode_pong,
@@ -203,6 +208,22 @@ class MTProtoSessionAdapter:
             return self._handle_contacts_resolve_username(message, username=str(request.fields["username"]))
         if request.name == "messages_get_full_chat":
             return self._handle_messages_get_full_chat(message, chat_id=int(request.fields["chat_id"]))
+        if request.name == "messages_add_chat_user":
+            return self._handle_messages_add_chat_user(
+                message, chat_id=int(request.fields["chat_id"]), user=request.fields["user"]
+            )
+        if request.name == "messages_delete_chat_user":
+            return self._handle_messages_delete_chat_user(
+                message, chat_id=int(request.fields["chat_id"]), user=request.fields["user"]
+            )
+        if request.name == "messages_edit_chat_title":
+            return self._handle_messages_edit_chat_title(
+                message, chat_id=int(request.fields["chat_id"]), title=str(request.fields["title"])
+            )
+        if request.name == "messages_edit_chat_about":
+            return self._handle_messages_edit_chat_about(
+                message, peer=request.fields["peer"], about=str(request.fields["about"])
+            )
         if request.name == "messages_read_history":
             return self._handle_messages_read_history(
                 message, peer=request.fields["peer"], max_id=int(request.fields["max_id"])
@@ -307,6 +328,16 @@ class MTProtoSessionAdapter:
                             elif str(summary.get("kind")) == "chat":
                                 chat_ids.add(int(summary["peer_id"]))
                         elif envelope.kind == "updateNewChat":
+                            chat_ids.add(int(envelope.payload["chat_id"]))
+                        elif envelope.kind == "updateChatParticipants":
+                            chat_id = int(envelope.payload["chat_id"])
+                            chat_ids.add(chat_id)
+                            other_updates.append(
+                                encode_update_chat_participants(
+                                    participants=self._encode_current_chat_participants(connection, chat_id=chat_id)
+                                )
+                            )
+                        elif envelope.kind == "updateChatTitle":
                             chat_ids.add(int(envelope.payload["chat_id"]))
                         elif envelope.kind == "updateReadHistoryInbox":
                             summary = get_peer(
@@ -764,6 +795,140 @@ class MTProtoSessionAdapter:
             self._encode_users(users, self_user_id=self_user_id),
         )
 
+    def _encode_current_chat_participants(self, connection: object, *, chat_id: int) -> bytes:
+        rows = connection.execute(
+            """
+            SELECT pm.user_id, pm.role, pm.joined_at, p.created_by_user_id
+            FROM peer_memberships pm JOIN peers p ON p.id = pm.peer_id
+            WHERE pm.peer_id = ? AND pm.left_at IS NULL
+            ORDER BY pm.joined_at, pm.user_id
+            """,
+            (chat_id,),
+        ).fetchall()
+        if not rows:
+            raise MessagingError("CHAT_ID_INVALID")
+        owner_id = int(rows[0]["created_by_user_id"] or rows[0]["user_id"])
+        return encode_chat_participants(
+            chat_id=chat_id,
+            participants=[
+                encode_chat_participant(
+                    user_id=int(row["user_id"]),
+                    inviter_id=owner_id,
+                    date=int(row["joined_at"]),
+                    rank="owner" if str(row["role"]) == "owner" else None,
+                )
+                for row in rows
+            ],
+        )
+
+    def _handle_messages_add_chat_user(self, message: EncryptedMessage, *, chat_id: int, user: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            kind = str(user.get("kind"))
+            added_user_id = self_user_id if kind == "self" else int(user["user_id"]) if kind == "user" else 0
+            if not added_user_id:
+                raise MessagingError("USER_ID_INVALID")
+            with database.transaction(immediate=True) as connection:
+                emitted = add_chat_user(
+                    connection, chat_id=chat_id, actor_user_id=self_user_id, added_user_id=added_user_id
+                )
+                actor_update = next((item for item in emitted if item.user_id == self_user_id), None)
+                if actor_update is None:
+                    raise RuntimeError("Group add produced no actor update")
+                participants = self._encode_current_chat_participants(connection, chat_id=chat_id)
+                members = connection.execute(
+                    "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL", (chat_id,)
+                ).fetchall()
+                users = self._load_users(connection, {int(row["user_id"]) for row in members})
+                chats = self._encode_chats(connection, chat_ids={chat_id}, self_user_id=self_user_id)
+                updates = encode_updates(
+                    updates=[encode_update_chat_participants(participants=participants)],
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=chats,
+                    date=actor_update.date,
+                    seq=actor_update.seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, encode_messages_invited_users(updates=updates, missing_invitees=[]))
+
+    def _handle_messages_delete_chat_user(self, message: EncryptedMessage, *, chat_id: int, user: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            kind = str(user.get("kind"))
+            deleted_user_id = self_user_id if kind == "self" else int(user["user_id"]) if kind == "user" else 0
+            if not deleted_user_id:
+                raise MessagingError("USER_ID_INVALID")
+            with database.transaction(immediate=True) as connection:
+                emitted = delete_chat_user(
+                    connection, chat_id=chat_id, actor_user_id=self_user_id, deleted_user_id=deleted_user_id
+                )
+                state = get_state(connection, self_user_id)
+                participants = self._encode_current_chat_participants(connection, chat_id=chat_id)
+                members = connection.execute(
+                    "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL", (chat_id,)
+                ).fetchall()
+                users = self._load_users(connection, {self_user_id, *(int(row["user_id"]) for row in members)})
+                chats = self._encode_chats(connection, chat_ids={chat_id}, self_user_id=self_user_id)
+                actor_update = next((item for item in emitted if item.user_id == self_user_id), None)
+                updates = encode_updates(
+                    updates=[encode_update_chat_participants(participants=participants)],
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=chats,
+                    date=actor_update.date if actor_update else state["date"],
+                    seq=actor_update.seq if actor_update else state["seq"],
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, updates)
+
+    def _handle_messages_edit_chat_title(self, message: EncryptedMessage, *, chat_id: int, title: str) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                emitted = edit_chat_title(connection, chat_id=chat_id, actor_user_id=self_user_id, title=title)
+                actor_update = next((item for item in emitted if item.user_id == self_user_id), None)
+                if actor_update is None:
+                    raise RuntimeError("Group title update produced no actor update")
+                members = connection.execute(
+                    "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL", (chat_id,)
+                ).fetchall()
+                users = self._load_users(connection, {int(row["user_id"]) for row in members})
+                chats = self._encode_chats(connection, chat_ids={chat_id}, self_user_id=self_user_id)
+                updates = encode_updates(
+                    updates=[], users=self._encode_users(users, self_user_id=self_user_id), chats=chats,
+                    date=actor_update.date, seq=actor_update.seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, updates)
+
+    def _handle_messages_edit_chat_about(self, message: EncryptedMessage, *, peer: dict[str, object], about: str) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                if str(summary["kind"]) != "chat":
+                    raise MessagingError("PEER_ID_INVALID")
+                edit_chat_about(
+                    connection, chat_id=int(summary["peer_id"]), actor_user_id=self_user_id, about=about
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, encode_bool(True))
+
     def _handle_auth_log_out(self, message: EncryptedMessage) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -889,7 +1054,7 @@ class MTProtoSessionAdapter:
                 if str(chat.get("kind")) != "chat":
                     raise MessagingError("CHAT_ID_INVALID")
                 row = connection.execute(
-                    "SELECT id, title, created_at, created_by_user_id FROM peers WHERE id = ? AND kind = 'chat'",
+                    "SELECT id, title, about, created_at, created_by_user_id FROM peers WHERE id = ? AND kind = 'chat'",
                     (chat_id,),
                 ).fetchone()
                 members = connection.execute(
@@ -913,7 +1078,7 @@ class MTProtoSessionAdapter:
                     for member in members
                 ]
                 participants = encode_chat_participants(chat_id=chat_id, participants=participant_entries)
-                full_chat = encode_chat_full(chat_id=chat_id, about="", participants=participants)
+                full_chat = encode_chat_full(chat_id=chat_id, about=str(row["about"]), participants=participants)
                 users = self._load_users(connection, {int(member["user_id"]) for member in members})
                 chats = self._encode_chats(connection, chat_ids={chat_id}, self_user_id=self_user_id)
         except MessagingError as exc:

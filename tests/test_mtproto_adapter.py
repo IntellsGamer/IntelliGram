@@ -1181,3 +1181,200 @@ def test_web_k_updates_get_difference_replays_durable_read_history(tmp_path) -> 
     assert reader.int32() == 0
     assert reader.int32() == read_update.pts
     assert reader.int32() == read_update.pts_count
+
+
+def test_web_k_group_membership_and_metadata_operations_are_durable(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_CHAT_CONSTRUCTOR,
+        INPUT_USER_CONSTRUCTOR,
+        MESSAGES_ADD_CHAT_USER_CONSTRUCTOR,
+        MESSAGES_CREATE_CHAT_CONSTRUCTOR,
+        MESSAGES_DELETE_CHAT_USER_CONSTRUCTOR,
+        MESSAGES_EDIT_CHAT_ABOUT_CONSTRUCTOR,
+        MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR,
+        MESSAGES_INVITED_USERS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 923, 198
+    database = Database(tmp_path / "group-management.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000211", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+        member = register_password_account(
+            connection, phone="+15550000212", password="correct-horse-battery-staple", first_name="Member", device_label="Member",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    message_id = (int(time.time()) << 32) + 4
+
+    create_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=(
+            encode_uint32(MESSAGES_CREATE_CHAT_CONSTRUCTOR) + encode_uint32(0) + encode_vector([]) + encode_tl_string("Management group")
+        ),
+    ))
+    assert create_response is not None
+    with database.transaction() as connection:
+        row = connection.execute("SELECT id FROM peers WHERE kind = 'chat'").fetchone()
+        assert row is not None
+        chat_id = int(row["id"])
+
+    add_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=(
+            encode_uint32(MESSAGES_ADD_CHAT_USER_CONSTRUCTOR)
+            + encode_int64(chat_id)
+            + encode_uint32(INPUT_USER_CONSTRUCTOR)
+            + encode_int64(member.user_id)
+            + encode_int64(user_access_hash(member.user_id))
+            + encode_uint32(0)
+        ),
+    ))
+    assert add_response is not None
+    _, _, _, _, add_body = _decrypt_server(auth_key, add_response)
+    reader = TLReader(add_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == MESSAGES_INVITED_USERS_CONSTRUCTOR
+    with database.transaction() as connection:
+        membership = connection.execute(
+            "SELECT role, left_at FROM peer_memberships WHERE peer_id = ? AND user_id = ?", (chat_id, member.user_id)
+        ).fetchone()
+        assert membership is not None and membership["role"] == "member" and membership["left_at"] is None
+
+    title_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 8,
+        seq_no=5,
+        body=encode_uint32(MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR) + encode_int64(chat_id) + encode_tl_string("Renamed group"),
+    ))
+    assert title_response is not None
+    _, _, _, _, title_body = _decrypt_server(auth_key, title_response)
+    reader = TLReader(title_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 8
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+
+    about_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 12,
+        seq_no=7,
+        body=(
+            encode_uint32(MESSAGES_EDIT_CHAT_ABOUT_CONSTRUCTOR)
+            + encode_uint32(INPUT_PEER_CHAT_CONSTRUCTOR)
+            + encode_int64(chat_id)
+            + encode_tl_string("A durable group description")
+        ),
+    ))
+    assert about_response is not None
+    with database.transaction() as connection:
+        peer = connection.execute("SELECT title, about FROM peers WHERE id = ?", (chat_id,)).fetchone()
+        assert peer is not None
+        assert (peer["title"], peer["about"]) == ("Renamed group", "A durable group description")
+
+    delete_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 16,
+        seq_no=9,
+        body=(
+            encode_uint32(MESSAGES_DELETE_CHAT_USER_CONSTRUCTOR)
+            + encode_uint32(0)
+            + encode_int64(chat_id)
+            + encode_uint32(INPUT_USER_CONSTRUCTOR)
+            + encode_int64(member.user_id)
+            + encode_int64(user_access_hash(member.user_id))
+        ),
+    ))
+    assert delete_response is not None
+    with database.transaction() as connection:
+        membership = connection.execute(
+            "SELECT left_at FROM peer_memberships WHERE peer_id = ? AND user_id = ?", (chat_id, member.user_id)
+        ).fetchone()
+        assert membership is not None and membership["left_at"] is not None
+
+
+def test_web_k_updates_get_difference_replays_group_participant_change(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CHAT_PARTICIPANTS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATE_CHAT_PARTICIPANTS_CONSTRUCTOR,
+        UPDATES_DIFFERENCE_CONSTRUCTOR,
+        UPDATES_GET_DIFFERENCE_CONSTRUCTOR,
+        encode_int32,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import add_chat_user, create_group
+
+    auth_key = bytes(range(256))
+    salt, session_id = 924, 199
+    database = Database(tmp_path / "group-update-difference.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000221", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+        member = register_password_account(
+            connection, phone="+15550000222", password="correct-horse-battery-staple", first_name="Member", device_label="Member",
+        )
+        chat_id, create_updates = create_group(
+            connection, owner_user_id=owner.user_id, title="Update group", member_user_ids=[]
+        )
+        assert len(create_updates) == 1
+        membership_updates = add_chat_user(
+            connection, chat_id=chat_id, actor_user_id=owner.user_id, added_user_id=member.user_id
+        )
+        owner_update = next(item for item in membership_updates if item.user_id == owner.user_id)
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    request = (
+        encode_uint32(UPDATES_GET_DIFFERENCE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(owner_update.pts - 1)
+        + encode_int32(0)
+        + encode_int32(0)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=request,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 1
+    assert reader.uint32() == UPDATE_CHAT_PARTICIPANTS_CONSTRUCTOR
+    assert reader.uint32() == CHAT_PARTICIPANTS_CONSTRUCTOR
+    assert reader.int64() == chat_id
+    assert reader.vector_count() == 2

@@ -88,6 +88,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind TEXT NOT NULL CHECK(kind IN ('user', 'chat', 'channel')),
                     title TEXT NOT NULL,
+                    about TEXT NOT NULL DEFAULT '',
                     created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     created_at INTEGER NOT NULL
                 );
@@ -211,6 +212,12 @@ class Database:
                 connection.execute("ALTER TABLE users ADD COLUMN about TEXT NOT NULL DEFAULT ''")
             if "profile_photo_id" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN profile_photo_id INTEGER")
+            peer_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(peers)").fetchall()
+            }
+            if "about" not in peer_columns:
+                connection.execute("ALTER TABLE peers ADD COLUMN about TEXT NOT NULL DEFAULT ''")
             upload_part_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(upload_parts)").fetchall()
