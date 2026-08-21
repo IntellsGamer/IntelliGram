@@ -1,0 +1,25 @@
+# IntelliGram source files are linted with LF line endings on every platform.
+* text=auto eol=lf
+
+# Keep binary assets out of Git text conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.wasm binary
+*.mp3 binary
+*.mp4 binary
+*.webm binary
+*.zip binary
+*.gz binary
+*.pdf binary
+
+# Native Windows command scripts must retain their conventional CRLF endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
