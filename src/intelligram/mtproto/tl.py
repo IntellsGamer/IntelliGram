@@ -81,6 +81,7 @@ CHAT_CONSTRUCTOR = 0x41CBF256
 CHAT_PHOTO_EMPTY_CONSTRUCTOR = 0x37C1011C
 MESSAGES_INVITED_USERS_CONSTRUCTOR = 0x7F5DEFA6
 MESSAGES_CREATE_CHAT_CONSTRUCTOR = 0x92CEDDD4
+ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR = 0x78515775
 
 
 class TLDecodeError(ValueError):
@@ -369,6 +370,15 @@ def parse_request(data: bytes) -> TLRequest:
                 raise TLDecodeError("Expected an inputDialogPeer constructor")
             peers.append(_read_input_peer(reader))
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
+    elif constructor_id == ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b111:
+            raise TLDecodeError("Unsupported account.updateProfile optional fields")
+        request = TLRequest(constructor_id, "account_update_profile", {
+            "first_name": reader.bytes().decode("utf-8") if flags & 1 else None,
+            "last_name": reader.bytes().decode("utf-8") if flags & 2 else None,
+            "about": reader.bytes().decode("utf-8") if flags & 4 else None,
+        })
     elif constructor_id == ACCOUNT_UPDATE_STATUS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "account_update_status", {"offline": _read_bool(reader)})
     elif constructor_id == ACCOUNT_GET_PRIVACY_CONSTRUCTOR:
@@ -625,11 +635,14 @@ def encode_messages_peer_dialogs(
 
 def encode_users_user_full(*, user: dict[str, Any], self_user_id: int | None = None) -> bytes:
     user_id = int(user["id"])
+    about = str(user.get("about") or "")
+    flags = 1 << 1 if about else 0
     full_user = (
         encode_uint32(USER_FULL_CONSTRUCTOR)
-        + encode_uint32(0)  # flags
+        + encode_uint32(flags)
         + encode_uint32(0)  # flags2
         + encode_int64(user_id)
+        + (encode_tl_string(about) if about else b"")
         + encode_peer_settings()
         + encode_peer_notify_settings()
         + encode_int32(0)  # common_chats_count

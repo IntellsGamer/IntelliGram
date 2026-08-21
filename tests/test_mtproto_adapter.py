@@ -515,3 +515,68 @@ def test_web_k_create_chat_returns_messages_invited_users(tmp_path) -> None:
     assert group is not None
     assert group["title"] == "IntelliGram Research"
     assert [int(member["user_id"]) for member in members] == sorted([alice.user_id, bob.user_id])
+
+
+def test_web_k_account_update_profile_persists_identity_and_full_user_about(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR,
+        INPUT_USER_SELF_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        USERS_GET_FULL_USER_CONSTRUCTOR,
+        USERS_USER_FULL_CONSTRUCTOR,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 654, 987
+    database = Database(tmp_path / "update-profile.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15550000121",
+            password="correct-horse-battery-staple",
+            first_name="Initial",
+            device_label="Initial device",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=issued.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    update_profile = (
+        encode_uint32(ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR)
+        + encode_uint32(0b111)
+        + encode_tl_string("Ilya")
+        + encode_tl_string("Researcher")
+        + encode_tl_string("Building IntelliGram")
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=update_profile,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+
+    full_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=encode_uint32(USERS_GET_FULL_USER_CONSTRUCTOR) + encode_uint32(INPUT_USER_SELF_CONSTRUCTOR),
+    ))
+    assert full_response is not None
+    _, _, _, _, full_body = _decrypt_server(auth_key, full_response)
+    full_reader = TLReader(full_body)
+    assert full_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert full_reader.int64() == message_id + 4
+    assert full_reader.uint32() == USERS_USER_FULL_CONSTRUCTOR
+
+    with database.transaction() as connection:
+        row = connection.execute("SELECT first_name, last_name, about FROM users WHERE id = ?", (issued.user_id,)).fetchone()
+    assert row is not None
+    assert dict(row) == {"first_name": "Ilya", "last_name": "Researcher", "about": "Building IntelliGram"}

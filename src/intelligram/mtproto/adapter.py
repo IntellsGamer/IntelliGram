@@ -190,6 +190,13 @@ class MTProtoSessionAdapter:
                 body=str(request.fields["message"]),
                 random_id=int(request.fields["random_id"]),
             )
+        if request.name == "account_update_profile":
+            return self._handle_account_update_profile(
+                message,
+                first_name=request.fields["first_name"],
+                last_name=request.fields["last_name"],
+                about=request.fields["about"],
+            )
         if request.name == "account_update_status":
             return self._encrypt_result(message, b"\xb5\x75\x72\x99")
         if request.name == "account_get_privacy":
@@ -287,7 +294,7 @@ class MTProtoSessionAdapter:
             raise RuntimeError("Database is required for a signed-in user")
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT id, phone, username, first_name, last_name FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         if row is None:
@@ -309,7 +316,7 @@ class MTProtoSessionAdapter:
             return {}
         placeholders = ",".join("?" for _ in user_ids)
         rows = connection.execute(
-            f"SELECT id, phone, username, first_name, last_name FROM users WHERE id IN ({placeholders})",
+            f"SELECT id, phone, username, first_name, last_name, about FROM users WHERE id IN ({placeholders})",
             sorted(user_ids),
         ).fetchall()
         return {int(row["id"]): dict(row) for row in rows}
@@ -394,6 +401,49 @@ class MTProtoSessionAdapter:
         if user is None:
             return self._encrypt_rpc_error(message, "USER_ID_INVALID")
         return self._encrypt_result(message, encode_users_user_full(user=user, self_user_id=self_user_id))
+
+    def _handle_account_update_profile(
+        self,
+        message: EncryptedMessage,
+        *,
+        first_name: object,
+        last_name: object,
+        about: object,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        updates: dict[str, object] = {}
+        if first_name is not None:
+            normalized = str(first_name).strip()
+            if not normalized:
+                return self._encrypt_rpc_error(message, "FIRSTNAME_INVALID")
+            updates["first_name"] = normalized
+        if last_name is not None:
+            updates["last_name"] = str(last_name).strip()
+        if about is not None:
+            normalized_about = str(about).strip()
+            if len(normalized_about) > 70:
+                return self._encrypt_rpc_error(message, "ABOUT_TOO_LONG")
+            updates["about"] = normalized_about
+        with database.transaction(immediate=True) as connection:
+            if updates:
+                assignments = ", ".join(f"{column} = ?" for column in updates)
+                connection.execute(
+                    f"UPDATE users SET {assignments}, updated_at = ? WHERE id = ?",
+                    [*updates.values(), int(time.time()), self_user_id],
+                )
+            user = connection.execute(
+                "SELECT id, phone, username, first_name, last_name, about FROM users WHERE id = ?",
+                (self_user_id,),
+            ).fetchone()
+        if user is None:
+            return self._encrypt_rpc_error(message, "USER_ID_INVALID")
+        return self._encrypt_result(
+            message,
+            encode_user(user=dict(user), self_user_id=self_user_id),
+        )
 
     def _handle_contacts_get_contacts(self, message: EncryptedMessage) -> bytes:
         authenticated = self._require_authenticated(message)

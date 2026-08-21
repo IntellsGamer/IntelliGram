@@ -63,6 +63,7 @@ const wantedMethods = new Set([
   'account.updateStatus',
   'account.getPrivacy',
   'messages.createChat',
+  'account.updateProfile',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

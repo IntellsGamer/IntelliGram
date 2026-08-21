@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +39,7 @@ class Database:
                     username TEXT UNIQUE,
                     first_name TEXT NOT NULL,
                     last_name TEXT NOT NULL DEFAULT '',
+                    about TEXT NOT NULL DEFAULT '',
                     password_hash TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
@@ -169,7 +170,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '5')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
@@ -181,6 +182,12 @@ class Database:
                 connection.execute("ALTER TABLE auth_keys ADD COLUMN key_material BLOB")
             if "server_salt" not in auth_key_columns:
                 connection.execute("ALTER TABLE auth_keys ADD COLUMN server_salt TEXT")
+            user_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "about" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN about TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
