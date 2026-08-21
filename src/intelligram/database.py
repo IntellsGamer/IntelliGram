@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+import sqlite3
+import threading
+import time
+from typing import Iterator
+
+
+SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class Database:
+    path: Path
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def initialize(self) -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL UNIQUE,
+                    username TEXT UNIQUE,
+                    first_name TEXT NOT NULL,
+                    last_name TEXT NOT NULL DEFAULT '',
+                    password_hash TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS auth_keys (
+                    auth_key_id TEXT PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    key_fingerprint TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL,
+                    revoked_at INTEGER,
+                    expires_at INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    auth_key_id TEXT REFERENCES auth_keys(auth_key_id) ON DELETE SET NULL,
+                    device_label TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    revoked_at INTEGER,
+                    expires_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS peers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK(kind IN ('user', 'chat', 'channel')),
+                    title TEXT NOT NULL,
+                    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS peer_memberships (
+                    peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member')),
+                    joined_at INTEGER NOT NULL,
+                    left_at INTEGER,
+                    PRIMARY KEY(peer_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+                    sender_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    client_random_id TEXT,
+                    body TEXT NOT NULL,
+                    reply_to_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                    sent_at INTEGER NOT NULL,
+                    edited_at INTEGER,
+                    deleted_at INTEGER,
+                    UNIQUE(sender_user_id, client_random_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS messages_peer_sent_idx ON messages(peer_id, sent_at DESC, id DESC);
+
+                CREATE TABLE IF NOT EXISTS dialogs (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+                    top_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                    unread_count INTEGER NOT NULL DEFAULT 0 CHECK(unread_count >= 0),
+                    read_inbox_max_id INTEGER NOT NULL DEFAULT 0,
+                    read_outbox_max_id INTEGER NOT NULL DEFAULT 0,
+                    pinned_order INTEGER,
+                    draft_text TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(user_id, peer_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS update_state (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    pts INTEGER NOT NULL DEFAULT 0,
+                    qts INTEGER NOT NULL DEFAULT 0,
+                    seq INTEGER NOT NULL DEFAULT 0,
+                    date INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS updates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    pts INTEGER NOT NULL,
+                    pts_count INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    date INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(user_id, pts)
+                );
+
+                CREATE INDEX IF NOT EXISTS updates_user_pts_idx ON updates(user_id, pts);
+
+                CREATE TABLE IF NOT EXISTS outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    aggregate_type TEXT NOT NULL,
+                    aggregate_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    delivered_at INTEGER
+                );
+
+                INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+                """
+            )
+
+    @contextmanager
+    def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+def now_unix() -> int:
+    return int(time.time())

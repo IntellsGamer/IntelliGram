@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+
+# IntelliGram local runtime state
+/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.pem
+.env
+
+# Node / Telegram Web A build outputs
+node_modules/
+dist/
+.cache/
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
