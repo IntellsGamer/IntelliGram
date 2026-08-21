@@ -80,6 +80,10 @@ const wanted = new Set([
   'updateChatParticipants',
   'updateEditMessage',
   'updateDeleteMessages',
+  'contacts.importedContacts',
+  'contacts.found',
+  'importedContact',
+  'inputPhoneContact',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -113,6 +117,8 @@ const wantedMethods = new Set([
   'messages.editMessage',
   'messages.deleteMessages',
   'messages.forwardMessages',
+  'contacts.importContacts',
+  'contacts.search',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

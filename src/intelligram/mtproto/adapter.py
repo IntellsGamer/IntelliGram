@@ -57,9 +57,12 @@ from intelligram.mtproto.tl import (
     encode_help_countries_list,
     encode_lang_pack_difference,
     encode_contacts_contacts,
+    encode_contacts_found,
+    encode_contacts_imported_contacts,
     encode_contacts_resolved_peer,
     encode_bool,
     encode_contact,
+    encode_imported_contact,
     encode_dialog,
     encode_message,
     encode_messages_affected_messages,
@@ -218,6 +221,12 @@ class MTProtoSessionAdapter:
             return self._handle_contacts_get_contacts(message)
         if request.name == "contacts_resolve_username":
             return self._handle_contacts_resolve_username(message, username=str(request.fields["username"]))
+        if request.name == "contacts_import_contacts":
+            return self._handle_contacts_import_contacts(message, contacts=request.fields["contacts"])
+        if request.name == "contacts_search":
+            return self._handle_contacts_search(
+                message, query=str(request.fields["query"]), limit=int(request.fields["limit"])
+            )
         if request.name == "messages_get_full_chat":
             return self._handle_messages_get_full_chat(message, chat_id=int(request.fields["chat_id"]))
         if request.name == "messages_add_chat_user":
@@ -1217,6 +1226,80 @@ class MTProtoSessionAdapter:
             encode_messages_affected_messages(
                 pts=update.pts if update is not None else state["pts"],
                 pts_count=update.pts_count if update is not None else 0,
+            ),
+        )
+
+    def _handle_contacts_import_contacts(self, message: EncryptedMessage, *, contacts: list[dict[str, object]]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        imported: list[tuple[int, int]] = []
+        try:
+            with database.transaction(immediate=True) as connection:
+                for contact in contacts:
+                    normalized_phone = normalize_phone(str(contact["phone"]))
+                    target = connection.execute("SELECT id FROM users WHERE phone = ?", (normalized_phone,)).fetchone()
+                    if target is None or int(target["id"]) == self_user_id:
+                        continue
+                    target_id = int(target["id"])
+                    client_id = int(contact["client_id"])
+                    connection.execute(
+                        """
+                        INSERT INTO contacts(user_id, contact_user_id, client_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(user_id, contact_user_id) DO UPDATE SET client_id = excluded.client_id
+                        """,
+                        (self_user_id, target_id, client_id, int(time.time())),
+                    )
+                    imported.append((target_id, client_id))
+                users = self._load_users(connection, {target_id for target_id, _ in imported})
+        except AccountAuthError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_contacts_imported_contacts(
+                imported=[encode_imported_contact(user_id=target_id, client_id=client_id) for target_id, client_id in imported],
+                users=self._encode_users(users, self_user_id=self_user_id),
+            ),
+        )
+
+    def _handle_contacts_search(self, message: EncryptedMessage, *, query: str, limit: int) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        normalized = query.strip().lstrip("@").lower()
+        if len(normalized) < 2:
+            return self._encrypt_rpc_error(message, "QUERY_TOO_SHORT")
+        bounded_limit = min(max(limit, 1), 50)
+        with database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM users
+                WHERE id != ? AND (
+                    lower(coalesce(username, '')) LIKE ? OR
+                    lower(first_name) LIKE ? OR lower(last_name) LIKE ?
+                )
+                ORDER BY CASE WHEN lower(coalesce(username, '')) = ? THEN 0 ELSE 1 END, id
+                LIMIT ?
+                """,
+                (self_user_id, f"%{normalized}%", f"%{normalized}%", f"%{normalized}%", normalized, bounded_limit),
+            ).fetchall()
+            target_ids = [int(row["id"]) for row in rows]
+            contacts = {
+                int(row["contact_user_id"])
+                for row in connection.execute(
+                    "SELECT contact_user_id FROM contacts WHERE user_id = ?", (self_user_id,)
+                ).fetchall()
+            }
+            users = self._load_users(connection, set(target_ids))
+        return self._encrypt_result(
+            message,
+            encode_contacts_found(
+                my_results=[encode_peer_user(user_id=user_id) for user_id in target_ids if user_id in contacts],
+                results=[encode_peer_user(user_id=user_id) for user_id in target_ids if user_id not in contacts],
+                users=self._encode_users(users, self_user_id=self_user_id),
             ),
         )
 

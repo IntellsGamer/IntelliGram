@@ -127,6 +127,12 @@ MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR = 0x13704A7C
 UPDATE_DELETE_MESSAGES_CONSTRUCTOR = 0xA20DB0E5
 UPDATE_EDIT_MESSAGE_CONSTRUCTOR = 0xE40370A3
 UPDATES_TOO_LONG_CONSTRUCTOR = 0xE317AF7E
+INPUT_PHONE_CONTACT_CONSTRUCTOR = 0x6A1DC4BE
+CONTACTS_IMPORT_CONTACTS_CONSTRUCTOR = 0x2C800BE5
+IMPORTED_CONTACT_CONSTRUCTOR = 0xC13E3C50
+CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR = 0x77D01C3B
+CONTACTS_SEARCH_CONSTRUCTOR = 0x05F58D0F
+CONTACTS_FOUND_CONSTRUCTOR = 0xB3134D9D
 
 
 class TLDecodeError(ValueError):
@@ -285,6 +291,20 @@ def _read_input_peer(reader: TLReader) -> dict[str, Any]:
     raise TLDecodeError(f"Unsupported InputPeer constructor: 0x{constructor_id:08x}")
 
 
+def _read_input_phone_contact(reader: TLReader) -> dict[str, Any]:
+    if reader.uint32() != INPUT_PHONE_CONTACT_CONSTRUCTOR:
+        raise TLDecodeError("Expected an inputPhoneContact constructor")
+    flags = reader.uint32()
+    if flags:
+        raise TLDecodeError("Unsupported inputPhoneContact optional fields")
+    return {
+        "client_id": reader.int64(),
+        "phone": reader.bytes().decode("utf-8"),
+        "first_name": reader.bytes().decode("utf-8"),
+        "last_name": reader.bytes().decode("utf-8"),
+    }
+
+
 def _read_input_user(reader: TLReader) -> dict[str, Any]:
     constructor_id = reader.uint32()
     if constructor_id == INPUT_USER_SELF_CONSTRUCTOR:
@@ -419,6 +439,18 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "contacts_resolve_username", {
             "username": reader.bytes().decode("utf-8"),
             "referer": reader.bytes().decode("utf-8") if flags & 1 else None,
+        })
+    elif constructor_id == CONTACTS_IMPORT_CONTACTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "contacts_import_contacts", {
+            "contacts": [_read_input_phone_contact(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == CONTACTS_SEARCH_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b11:
+            raise TLDecodeError("Unsupported contacts.search optional fields")
+        request = TLRequest(constructor_id, "contacts_search", {
+            "query": reader.bytes().decode("utf-8"),
+            "limit": reader.int32(),
         })
     elif constructor_id == MESSAGES_GET_DIALOGS_CONSTRUCTOR:
         flags = reader.uint32()
@@ -632,6 +664,30 @@ def encode_pong(*, message_id: int, ping_id: int) -> bytes:
 
 def encode_bool(value: bool) -> bytes:
     return encode_uint32(BOOL_TRUE_CONSTRUCTOR if value else BOOL_FALSE_CONSTRUCTOR)
+
+
+def encode_imported_contact(*, user_id: int, client_id: int) -> bytes:
+    return encode_uint32(IMPORTED_CONTACT_CONSTRUCTOR) + encode_int64(user_id) + encode_int64(client_id)
+
+
+def encode_contacts_imported_contacts(*, imported: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return (
+        encode_uint32(CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR)
+        + encode_vector(imported)
+        + encode_vector([])
+        + encode_vector_longs([])
+        + encode_vector(users)
+    )
+
+
+def encode_contacts_found(*, my_results: Iterable[bytes], results: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return (
+        encode_uint32(CONTACTS_FOUND_CONSTRUCTOR)
+        + encode_vector(my_results)
+        + encode_vector(results)
+        + encode_vector([])
+        + encode_vector(users)
+    )
 
 
 def encode_contacts_resolved_peer(*, peer: bytes, chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:

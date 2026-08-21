@@ -1573,3 +1573,89 @@ def test_web_k_forwards_text_message_into_saved_messages(tmp_path) -> None:
         ).fetchone()
         assert forwarded is not None
         assert (forwarded["body"], int(forwarded["sender_user_id"])) == ("Forwardable", alice.user_id)
+
+
+def test_web_k_contacts_import_and_search_are_durable(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CONTACTS_FOUND_CONSTRUCTOR,
+        CONTACTS_IMPORT_CONTACTS_CONSTRUCTOR,
+        CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR,
+        CONTACTS_SEARCH_CONSTRUCTOR,
+        IMPORTED_CONTACT_CONSTRUCTOR,
+        INPUT_PHONE_CONTACT_CONSTRUCTOR,
+        PEER_USER_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 929, 202
+    database = Database(tmp_path / "contact-discovery.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000251", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000252", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        connection.execute("UPDATE users SET username = ? WHERE id = ?", ("bob_search", bob.user_id))
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    input_contact = (
+        encode_uint32(INPUT_PHONE_CONTACT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int64(7001)
+        + encode_tl_string("+1 (555) 000-0252")
+        + encode_tl_string("Bob")
+        + encode_tl_string("Imported")
+    )
+    import_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=encode_uint32(CONTACTS_IMPORT_CONTACTS_CONSTRUCTOR) + encode_vector([input_contact]),
+    ))
+    assert import_response is not None
+    _, _, _, _, import_body = _decrypt_server(auth_key, import_response)
+    reader = TLReader(import_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == IMPORTED_CONTACT_CONSTRUCTOR
+    assert reader.int64() == bob.user_id
+    assert reader.int64() == 7001
+    with database.transaction() as connection:
+        contact = connection.execute(
+            "SELECT client_id FROM contacts WHERE user_id = ? AND contact_user_id = ?", (alice.user_id, bob.user_id)
+        ).fetchone()
+        assert contact is not None and int(contact["client_id"]) == 7001
+
+    search_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=encode_uint32(CONTACTS_SEARCH_CONSTRUCTOR) + encode_uint32(0) + encode_tl_string("bob") + encode_int32(20),
+    ))
+    assert search_response is not None
+    _, _, _, _, search_body = _decrypt_server(auth_key, search_response)
+    reader = TLReader(search_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == CONTACTS_FOUND_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == PEER_USER_CONSTRUCTOR
+    assert reader.int64() == bob.user_id
+    assert reader.vector_count() == 0

@@ -93,6 +93,14 @@ class Database:
                     created_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS contacts (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    contact_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    client_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(user_id, contact_user_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS direct_peer_users (
                     peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
                     user_low_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
