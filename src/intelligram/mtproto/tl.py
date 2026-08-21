@@ -102,6 +102,20 @@ CHAT_FULL_CONSTRUCTOR = 0x2633421B
 CHAT_PARTICIPANT_CONSTRUCTOR = 0x38E79FDE
 CHAT_PARTICIPANTS_CONSTRUCTOR = 0x3CBC93F8
 MESSAGES_CHAT_FULL_CONSTRUCTOR = 0xE5D7D19C
+AUTH_LOG_OUT_CONSTRUCTOR = 0x3E72BA19
+AUTH_LOGGED_OUT_CONSTRUCTOR = 0xC3A2835F
+MESSAGES_READ_HISTORY_CONSTRUCTOR = 0x0E306D3A
+MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR = 0x84D19185
+MESSAGES_SET_TYPING_CONSTRUCTOR = 0x58943EE2
+MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR = 0xEFD9A6A2
+MESSAGES_PEER_SETTINGS_CONSTRUCTOR = 0x6880B94D
+LANGPACK_GET_LANG_PACK_CONSTRUCTOR = 0xF2F2330A
+LANG_PACK_DIFFERENCE_CONSTRUCTOR = 0xF385C1F6
+HELP_GET_COUNTRIES_LIST_CONSTRUCTOR = 0x735787A8
+HELP_COUNTRIES_LIST_CONSTRUCTOR = 0x93CC1F32
+CONTACTS_RESOLVE_USERNAME_CONSTRUCTOR = 0x725AFBBC
+CONTACTS_RESOLVED_PEER_CONSTRUCTOR = 0x7F077AD9
+UPDATE_READ_HISTORY_INBOX_CONSTRUCTOR = 0x9E84BC99
 
 
 class TLDecodeError(ValueError):
@@ -319,6 +333,16 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "msgs_ack", {"msg_ids": reader.vector_longs()})
     elif constructor_id == HELP_GET_CONFIG_CONSTRUCTOR:
         request = TLRequest(constructor_id, "help_get_config", {})
+    elif constructor_id == LANGPACK_GET_LANG_PACK_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "langpack_get_lang_pack", {
+            "lang_pack": reader.bytes().decode("utf-8"),
+            "lang_code": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == HELP_GET_COUNTRIES_LIST_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "help_get_countries_list", {
+            "lang_code": reader.bytes().decode("utf-8"),
+            "hash": reader.int32(),
+        })
     elif constructor_id == AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR:
         request = TLRequest(constructor_id, "auth_export_login_token", {
             "api_id": reader.int32(),
@@ -372,6 +396,14 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "users_get_full_user", {"user": _read_input_user(reader)})
     elif constructor_id == CONTACTS_GET_CONTACTS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "contacts_get_contacts", {"hash": reader.int64()})
+    elif constructor_id == CONTACTS_RESOLVE_USERNAME_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~1:
+            raise TLDecodeError("Unsupported contacts.resolveUsername optional fields")
+        request = TLRequest(constructor_id, "contacts_resolve_username", {
+            "username": reader.bytes().decode("utf-8"),
+            "referer": reader.bytes().decode("utf-8") if flags & 1 else None,
+        })
     elif constructor_id == MESSAGES_GET_DIALOGS_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b11:
@@ -425,6 +457,31 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
     elif constructor_id == MESSAGES_GET_FULL_CHAT_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_full_chat", {"chat_id": reader.int64()})
+    elif constructor_id == MESSAGES_READ_HISTORY_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_read_history", {
+            "peer": _read_input_peer(reader),
+            "max_id": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_SET_TYPING_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~1:
+            raise TLDecodeError("Unsupported messages.setTyping optional fields")
+        peer = _read_input_peer(reader)
+        top_msg_id = reader.int32() if flags & 1 else None
+        # SendMessageAction is the final request field. Preserve its encoded form
+        # so every official typing action is safely accepted without losing TL alignment.
+        action = reader.raw_bytes(reader.remaining)
+        if not action:
+            raise TLDecodeError("Missing SendMessageAction")
+        request = TLRequest(constructor_id, "messages_set_typing", {
+            "peer": peer,
+            "top_msg_id": top_msg_id,
+            "action": action,
+        })
+    elif constructor_id == MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_peer_settings", {"peer": _read_input_peer(reader)})
+    elif constructor_id == AUTH_LOG_OUT_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "auth_log_out", {})
     elif constructor_id == UPDATES_GET_DIFFERENCE_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b111:
@@ -500,6 +557,36 @@ def encode_pong(*, message_id: int, ping_id: int) -> bytes:
 
 def encode_bool(value: bool) -> bytes:
     return encode_uint32(BOOL_TRUE_CONSTRUCTOR if value else BOOL_FALSE_CONSTRUCTOR)
+
+
+def encode_contacts_resolved_peer(*, peer: bytes, chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return encode_uint32(CONTACTS_RESOLVED_PEER_CONSTRUCTOR) + peer + encode_vector(chats) + encode_vector(users)
+
+
+def encode_lang_pack_difference(*, lang_code: str, from_version: int = 0, version: int = 0) -> bytes:
+    return (
+        encode_uint32(LANG_PACK_DIFFERENCE_CONSTRUCTOR)
+        + encode_tl_string(lang_code)
+        + encode_int32(from_version)
+        + encode_int32(version)
+        + encode_vector([])
+    )
+
+
+def encode_help_countries_list(*, countries: Iterable[bytes] = (), hash_value: int = 0) -> bytes:
+    return encode_uint32(HELP_COUNTRIES_LIST_CONSTRUCTOR) + encode_vector(countries) + encode_int32(hash_value)
+
+
+def encode_messages_affected_messages(*, pts: int, pts_count: int) -> bytes:
+    return encode_uint32(MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR) + encode_int32(pts) + encode_int32(pts_count)
+
+
+def encode_auth_logged_out() -> bytes:
+    return encode_uint32(AUTH_LOGGED_OUT_CONSTRUCTOR) + encode_uint32(0)
+
+
+def encode_messages_peer_settings(*, settings: bytes, chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return encode_uint32(MESSAGES_PEER_SETTINGS_CONSTRUCTOR) + settings + encode_vector(chats) + encode_vector(users)
 
 
 def encode_vector(values: Iterable[bytes]) -> bytes:
@@ -837,6 +924,16 @@ def encode_users_user_full(*, user: dict[str, Any], self_user_id: int | None = N
 
 def encode_update_new_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
     return encode_uint32(UPDATE_NEW_MESSAGE_CONSTRUCTOR) + message + encode_int32(pts) + encode_int32(pts_count)
+
+
+def encode_update_read_history_inbox(
+    *, peer: bytes, max_id: int, still_unread_count: int, pts: int, pts_count: int, top_msg_id: int | None = None
+) -> bytes:
+    flags = 2 if top_msg_id is not None else 0
+    result = encode_uint32(UPDATE_READ_HISTORY_INBOX_CONSTRUCTOR) + encode_uint32(flags) + peer
+    if top_msg_id is not None:
+        result += encode_int32(top_msg_id)
+    return result + encode_int32(max_id) + encode_int32(still_unread_count) + encode_int32(pts) + encode_int32(pts_count)
 
 
 def encode_update_message_id(*, message_id: int, random_id: int) -> bytes:

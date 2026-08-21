@@ -30,6 +30,7 @@ from intelligram.services.messaging import (
     get_history,
     get_or_create_direct_peer,
     get_peer,
+    read_history,
     send_message,
 )
 from intelligram.services.updates import get_difference, get_state
@@ -41,21 +42,28 @@ from intelligram.mtproto.tl import (
     encode_chat_participant,
     encode_chat_participants,
     encode_auth_authorization,
+    encode_auth_logged_out,
     encode_auth_login_token,
     encode_auth_sent_code,
     encode_auth_sent_code_success_for_sign_up,
     encode_config,
+    encode_help_countries_list,
+    encode_lang_pack_difference,
     encode_contacts_contacts,
+    encode_contacts_resolved_peer,
     encode_bool,
     encode_contact,
     encode_dialog,
     encode_message,
+    encode_messages_affected_messages,
     encode_messages_chat_full,
+    encode_messages_peer_settings,
     encode_messages_dialogs,
     encode_messages_invited_users,
     encode_messages_messages,
     encode_messages_peer_dialogs,
     encode_peer_chat,
+    encode_peer_settings,
     encode_photo,
     encode_photos_photo,
     encode_peer_user,
@@ -65,6 +73,7 @@ from intelligram.mtproto.tl import (
     encode_upload_file,
     encode_update_message_id,
     encode_update_new_message,
+    encode_update_read_history_inbox,
     encode_user,
     encode_users_user_full,
     encode_pong,
@@ -126,6 +135,18 @@ class MTProtoSessionAdapter:
                 expires=now + 3_600,
             )
             return self._encrypt_result(message, result)
+        if request.name == "langpack_get_lang_pack":
+            # IntelliGram ships the Web K UI language bundle locally. Returning
+            # an empty version-zero difference acknowledges the remote request
+            # without replacing client-side translations.
+            return self._encrypt_result(
+                message,
+                encode_lang_pack_difference(lang_code=str(request.fields["lang_code"])),
+            )
+        if request.name == "help_get_countries_list":
+            # Registration is intentionally SMS-free; no country calling-code
+            # catalog is required server-side, but Web K expects a valid list.
+            return self._encrypt_result(message, encode_help_countries_list())
         if request.name == "updates_get_difference":
             return self._handle_updates_get_difference(message, after_pts=int(request.fields["pts"]))
         if request.name == "updates_get_state":
@@ -178,8 +199,20 @@ class MTProtoSessionAdapter:
             return self._handle_users_get_full_user(message, request.fields["user"])
         if request.name == "contacts_get_contacts":
             return self._handle_contacts_get_contacts(message)
+        if request.name == "contacts_resolve_username":
+            return self._handle_contacts_resolve_username(message, username=str(request.fields["username"]))
         if request.name == "messages_get_full_chat":
             return self._handle_messages_get_full_chat(message, chat_id=int(request.fields["chat_id"]))
+        if request.name == "messages_read_history":
+            return self._handle_messages_read_history(
+                message, peer=request.fields["peer"], max_id=int(request.fields["max_id"])
+            )
+        if request.name == "messages_set_typing":
+            return self._handle_messages_set_typing(message, peer=request.fields["peer"])
+        if request.name == "messages_get_peer_settings":
+            return self._handle_messages_get_peer_settings(message, peer=request.fields["peer"])
+        if request.name == "auth_log_out":
+            return self._handle_auth_log_out(message)
         if request.name == "messages_get_dialogs":
             return self._handle_messages_get_dialogs(message, limit=int(request.fields["limit"]))
         if request.name == "messages_get_peer_dialogs":
@@ -247,6 +280,7 @@ class MTProtoSessionAdapter:
                     result = encode_updates_difference_empty(date=state["date"], seq=state["seq"])
                 else:
                     encoded_messages: list[bytes] = []
+                    other_updates: list[bytes] = []
                     user_ids: set[int] = {self_user_id}
                     chat_ids: set[int] = set()
                     for envelope in envelopes:
@@ -274,10 +308,29 @@ class MTProtoSessionAdapter:
                                 chat_ids.add(int(summary["peer_id"]))
                         elif envelope.kind == "updateNewChat":
                             chat_ids.add(int(envelope.payload["chat_id"]))
+                        elif envelope.kind == "updateReadHistoryInbox":
+                            summary = get_peer(
+                                connection,
+                                peer_id=int(envelope.payload["peer_id"]),
+                                user_id=self_user_id,
+                            )
+                            if summary.get("direct_user_id") is not None:
+                                user_ids.add(int(summary["direct_user_id"]))
+                            elif str(summary.get("kind")) == "chat":
+                                chat_ids.add(int(summary["peer_id"]))
+                            other_updates.append(
+                                encode_update_read_history_inbox(
+                                    peer=self._encode_peer(summary),
+                                    max_id=int(envelope.payload["max_id"]),
+                                    still_unread_count=int(envelope.payload["still_unread_count"]),
+                                    pts=envelope.pts,
+                                    pts_count=envelope.pts_count,
+                                )
+                            )
                     users = self._load_users(connection, user_ids)
                     result = encode_updates_difference(
                         new_messages=encoded_messages,
-                        other_updates=[],
+                        other_updates=other_updates,
                         chats=self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
                         users=self._encode_users(users, self_user_id=self_user_id),
                         pts=state["pts"],
@@ -711,6 +764,120 @@ class MTProtoSessionAdapter:
             self._encode_users(users, self_user_id=self_user_id),
         )
 
+    def _handle_auth_log_out(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        key_id = str(auth_key_id(self.auth_key))
+        with database.transaction(immediate=True) as connection:
+            now = int(time.time())
+            connection.execute(
+                "UPDATE auth_keys SET revoked_at = ? WHERE auth_key_id = ? AND user_id = ?",
+                (now, key_id, self_user_id),
+            )
+            connection.execute(
+                "UPDATE sessions SET revoked_at = ? WHERE auth_key_id = ? AND revoked_at IS NULL",
+                (now, key_id),
+            )
+        self.user_id = None
+        return self._encrypt_result(message, encode_auth_logged_out())
+
+    def _handle_messages_get_peer_settings(self, message: EncryptedMessage, *, peer: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                user_ids = {self_user_id}
+                chat_ids: set[int] = set()
+                if summary.get("direct_user_id") is not None:
+                    user_ids.add(int(summary["direct_user_id"]))
+                elif str(summary["kind"]) == "chat":
+                    chat_ids.add(int(summary["peer_id"]))
+                users = self._load_users(connection, user_ids)
+                chats = self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_messages_peer_settings(
+                settings=encode_peer_settings(),
+                chats=chats,
+                users=self._encode_users(users, self_user_id=self_user_id),
+            ),
+        )
+
+    def _handle_messages_set_typing(self, message: EncryptedMessage, *, peer: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        # Typing update fan-out is handled by the WebSocket session registry;
+        # accepting all layer-228 SendMessageAction variants is intentionally
+        # separate from durable message state.
+        return self._encrypt_result(message, encode_bool(True))
+
+    def _handle_messages_read_history(self, message: EncryptedMessage, *, peer: dict[str, object], max_id: int) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                update = read_history(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    user_id=self_user_id,
+                    max_id=max_id,
+                )
+                state = get_state(connection, self_user_id)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_messages_affected_messages(
+                pts=update.pts if update is not None else state["pts"],
+                pts_count=update.pts_count if update is not None else 0,
+            ),
+        )
+
+    def _handle_contacts_resolve_username(self, message: EncryptedMessage, *, username: str) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        normalized = username.strip().lstrip("@").lower()
+        if not normalized or len(normalized) > 32 or not all(character.isalnum() or character == "_" for character in normalized):
+            return self._encrypt_rpc_error(message, "USERNAME_INVALID")
+        with database.transaction() as connection:
+            target = connection.execute(
+                """
+                SELECT id, phone, username, first_name, last_name, about, profile_photo_id
+                FROM users WHERE lower(username) = ?
+                """,
+                (normalized,),
+            ).fetchone()
+            if target is None:
+                return self._encrypt_rpc_error(message, "USERNAME_NOT_OCCUPIED")
+            users = self._load_users(connection, {self_user_id, int(target["id"])})
+        return self._encrypt_result(
+            message,
+            encode_contacts_resolved_peer(
+                peer=encode_peer_user(user_id=int(target["id"])),
+                chats=[],
+                users=self._encode_users(users, self_user_id=self_user_id),
+            ),
+        )
+
     def _handle_messages_get_full_chat(self, message: EncryptedMessage, *, chat_id: int) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -873,9 +1040,10 @@ class MTProtoSessionAdapter:
                     member_ids.append(int(input_user["user_id"]))
                 else:
                     raise MessagingError("USER_ID_INVALID")
+            # IntelliGram deliberately permits private one-person groups. Web K
+            # submits an empty invitee vector for this case; the durable service
+            # still inserts the authenticated creator as the owner member.
             invited_ids = sorted({user_id for user_id in member_ids if user_id != self_user_id})
-            if not invited_ids:
-                raise MessagingError("USERS_TOO_FEW")
             with database.transaction(immediate=True) as connection:
                 chat_id, emitted = create_group(
                     connection,

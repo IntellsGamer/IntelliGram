@@ -847,3 +847,337 @@ def test_web_k_messages_get_full_chat_returns_durable_members(tmp_path) -> None:
     assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
     assert reader.int64() == message_id + 4
     assert reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+
+
+def test_web_k_everyday_read_typing_peer_settings_and_logout_rpcs(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        AUTH_LOGGED_OUT_CONSTRUCTOR,
+        AUTH_LOG_OUT_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR,
+        MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR,
+        MESSAGES_PEER_SETTINGS_CONSTRUCTOR,
+        MESSAGES_READ_HISTORY_CONSTRUCTOR,
+        MESSAGES_SET_TYPING_CONSTRUCTOR,
+        PEER_SETTINGS_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_int64,
+        encode_uint32,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 918, 193
+    database = Database(tmp_path / "everyday-rpcs.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000171", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000172", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        peer_id = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        stored, _ = send_message(
+            connection, peer_id=peer_id, sender_user_id=bob.user_id, body="Unread", client_random_id="bob-unread",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    adapter._associate_auth_key(alice.user_id)
+    input_bob = encode_uint32(INPUT_PEER_USER_CONSTRUCTOR) + encode_int64(bob.user_id) + encode_int64(user_access_hash(bob.user_id))
+    message_id = (int(time.time()) << 32) + 4
+
+    read_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=encode_uint32(MESSAGES_READ_HISTORY_CONSTRUCTOR) + input_bob + encode_int32(int(stored["id"])),
+    ))
+    assert read_response is not None
+    _, _, _, _, read_body = _decrypt_server(auth_key, read_response)
+    reader = TLReader(read_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR
+    assert reader.int32() > 0
+    assert reader.int32() == 1
+    with database.transaction() as connection:
+        dialog = connection.execute(
+            "SELECT unread_count, read_inbox_max_id FROM dialogs WHERE user_id = ? AND peer_id = ?",
+            (alice.user_id, peer_id),
+        ).fetchone()
+        assert dialog is not None
+        assert (int(dialog["unread_count"]), int(dialog["read_inbox_max_id"])) == (0, int(stored["id"]))
+
+    settings_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=encode_uint32(MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR) + input_bob,
+    ))
+    assert settings_response is not None
+    _, _, _, _, settings_body = _decrypt_server(auth_key, settings_response)
+    reader = TLReader(settings_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == MESSAGES_PEER_SETTINGS_CONSTRUCTOR
+    assert reader.uint32() == PEER_SETTINGS_CONSTRUCTOR
+    assert reader.uint32() == 0
+
+    typing_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 8,
+        seq_no=5,
+        body=encode_uint32(MESSAGES_SET_TYPING_CONSTRUCTOR) + encode_uint32(0) + input_bob + encode_uint32(0x16BF744E),
+    ))
+    assert typing_response is not None
+    _, _, _, _, typing_body = _decrypt_server(auth_key, typing_response)
+    reader = TLReader(typing_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 8
+    assert reader.uint32() == 0x997275B5
+
+    logout_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 12,
+        seq_no=7,
+        body=encode_uint32(AUTH_LOG_OUT_CONSTRUCTOR),
+    ))
+    assert logout_response is not None
+    _, _, _, _, logout_body = _decrypt_server(auth_key, logout_response)
+    reader = TLReader(logout_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 12
+    assert reader.uint32() == AUTH_LOGGED_OUT_CONSTRUCTOR
+    assert reader.uint32() == 0
+    with database.transaction() as connection:
+        auth_row = connection.execute(
+            "SELECT revoked_at FROM auth_keys WHERE auth_key_id = ?", (str(auth_key_id(auth_key)),)
+        ).fetchone()
+        assert auth_row is not None and auth_row["revoked_at"] is not None
+
+
+def test_web_k_messages_create_chat_permits_owner_only_group(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        MESSAGES_CREATE_CHAT_CONSTRUCTOR,
+        MESSAGES_INVITED_USERS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 919, 194
+    database = Database(tmp_path / "owner-only-group.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000181", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    request = (
+        encode_uint32(MESSAGES_CREATE_CHAT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_vector([])
+        + encode_tl_string("Solo group")
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=request,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == MESSAGES_INVITED_USERS_CONSTRUCTOR
+    with database.transaction() as connection:
+        chat = connection.execute("SELECT id FROM peers WHERE kind = 'chat'").fetchone()
+        assert chat is not None
+        members = connection.execute(
+            "SELECT user_id, role FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL", (int(chat["id"]),)
+        ).fetchall()
+        assert [(int(row["user_id"]), str(row["role"])) for row in members] == [(owner.user_id, "owner")]
+
+
+def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:
+    from intelligram.mtproto.tl import (
+        HELP_COUNTRIES_LIST_CONSTRUCTOR,
+        HELP_GET_COUNTRIES_LIST_CONSTRUCTOR,
+        LANG_PACK_DIFFERENCE_CONSTRUCTOR,
+        LANGPACK_GET_LANG_PACK_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_tl_string,
+        encode_uint32,
+    )
+
+    auth_key = bytes(range(256))
+    salt, session_id = 920, 195
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt)
+    message_id = (int(time.time()) << 32) + 4
+    langpack_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=encode_uint32(LANGPACK_GET_LANG_PACK_CONSTRUCTOR) + encode_tl_string("web") + encode_tl_string("en"),
+    ))
+    assert langpack_response is not None
+    _, _, _, _, langpack_body = _decrypt_server(auth_key, langpack_response)
+    reader = TLReader(langpack_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == LANG_PACK_DIFFERENCE_CONSTRUCTOR
+    assert reader.bytes() == b"en"
+    assert (reader.int32(), reader.int32()) == (0, 0)
+    assert reader.vector_count() == 0
+
+    countries_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=encode_uint32(HELP_GET_COUNTRIES_LIST_CONSTRUCTOR) + encode_tl_string("en") + encode_int32(0),
+    ))
+    assert countries_response is not None
+    _, _, _, _, countries_body = _decrypt_server(auth_key, countries_response)
+    reader = TLReader(countries_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == HELP_COUNTRIES_LIST_CONSTRUCTOR
+    assert reader.vector_count() == 0
+    assert reader.int32() == 0
+
+
+def test_web_k_contacts_resolve_username_returns_self_hosted_user_entities(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CONTACTS_RESOLVE_USERNAME_CONSTRUCTOR,
+        CONTACTS_RESOLVED_PEER_CONSTRUCTOR,
+        PEER_USER_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        USER_CONSTRUCTOR,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 921, 196
+    database = Database(tmp_path / "resolve-username.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000191", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000192", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        connection.execute("UPDATE users SET username = ? WHERE id = ?", ("IntelliGramBob", bob.user_id))
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=encode_uint32(CONTACTS_RESOLVE_USERNAME_CONSTRUCTOR) + encode_uint32(0) + encode_tl_string("@intelligrambob"),
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == CONTACTS_RESOLVED_PEER_CONSTRUCTOR
+    assert reader.uint32() == PEER_USER_CONSTRUCTOR
+    assert reader.int64() == bob.user_id
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 2
+    # User objects are variable length; the first entity constructor confirms
+    # that the resolved-peer wrapper starts the expected entity vector.
+    assert reader.uint32() == USER_CONSTRUCTOR
+
+
+def test_web_k_updates_get_difference_replays_durable_read_history(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        PEER_USER_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATE_READ_HISTORY_INBOX_CONSTRUCTOR,
+        UPDATES_DIFFERENCE_CONSTRUCTOR,
+        UPDATES_GET_DIFFERENCE_CONSTRUCTOR,
+        encode_int32,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, read_history, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 922, 197
+    database = Database(tmp_path / "read-history-difference.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000201", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000202", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        peer_id = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        stored, _ = send_message(
+            connection, peer_id=peer_id, sender_user_id=alice.user_id, body="Read me", client_random_id="read-difference",
+        )
+        read_update = read_history(connection, peer_id=peer_id, user_id=bob.user_id, max_id=int(stored["id"]))
+        assert read_update is not None
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=bob.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    request = (
+        encode_uint32(UPDATES_GET_DIFFERENCE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(read_update.pts - 1)
+        + encode_int32(0)
+        + encode_int32(0)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=request,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
+    assert reader.vector_count() == 0  # new_messages
+    assert reader.vector_count() == 0  # new_encrypted_messages
+    assert reader.vector_count() == 1  # other_updates
+    assert reader.uint32() == UPDATE_READ_HISTORY_INBOX_CONSTRUCTOR
+    assert reader.uint32() == 0  # flags
+    assert reader.uint32() == PEER_USER_CONSTRUCTOR
+    assert reader.int64() == alice.user_id
+    assert reader.int32() == int(stored["id"])
+    assert reader.int32() == 0
+    assert reader.int32() == read_update.pts
+    assert reader.int32() == read_update.pts_count

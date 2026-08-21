@@ -66,6 +66,17 @@ const wanted = new Set([
   'messages.chatFull',
   'chatParticipants',
   'chatParticipant',
+  'messages.affectedMessages',
+  'messages.peerSettings',
+  'auth.loggedOut',
+  'updateShort',
+  'updateUserTyping',
+  'updateChatUserTyping',
+  'langPackDifference',
+  'help.countriesList',
+  'help.countriesListNotModified',
+  'contacts.resolvedPeer',
+  'updateReadHistoryInbox',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -85,6 +96,13 @@ const wantedMethods = new Set([
   'upload.getFile',
   'updates.getDifference',
   'messages.getFullChat',
+  'messages.readHistory',
+  'messages.setTyping',
+  'messages.getPeerSettings',
+  'auth.logOut',
+  'langpack.getLangPack',
+  'help.getCountriesList',
+  'contacts.resolveUsername',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

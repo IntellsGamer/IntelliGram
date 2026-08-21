@@ -260,6 +260,47 @@ def send_message(
     return message, emitted
 
 
+def read_history(connection: sqlite3.Connection, *, peer_id: int, user_id: int, max_id: int) -> UpdateEnvelope | None:
+    """Advance a member's inbox cursor and return its durable update, if changed."""
+
+    _require_active_membership(connection, peer_id, user_id)
+    dialog = connection.execute(
+        "SELECT read_inbox_max_id FROM dialogs WHERE user_id = ? AND peer_id = ?",
+        (user_id, peer_id),
+    ).fetchone()
+    if dialog is None:
+        _ensure_dialog(connection, user_id, peer_id, None, 0)
+        current_max_id = 0
+    else:
+        current_max_id = int(dialog["read_inbox_max_id"])
+    effective_max_id = max(current_max_id, max(max_id, 0))
+    if effective_max_id == current_max_id:
+        return None
+    unread_row = connection.execute(
+        """
+        SELECT COUNT(*) AS unread_count
+        FROM messages
+        WHERE peer_id = ? AND sender_user_id != ? AND deleted_at IS NULL AND id > ?
+        """,
+        (peer_id, user_id, effective_max_id),
+    ).fetchone()
+    unread_count = int(unread_row["unread_count"])
+    connection.execute(
+        """
+        UPDATE dialogs
+        SET read_inbox_max_id = ?, unread_count = ?, updated_at = ?
+        WHERE user_id = ? AND peer_id = ?
+        """,
+        (effective_max_id, unread_count, now_unix(), user_id, peer_id),
+    )
+    return append_update(
+        connection,
+        user_id=user_id,
+        kind="updateReadHistoryInbox",
+        payload={"peer_id": peer_id, "max_id": effective_max_id, "still_unread_count": unread_count},
+    )
+
+
 def get_history(connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | None, limit: int) -> list[dict[str, Any]]:
     _require_active_membership(connection, peer_id, user_id)
     if limit < 1 or limit > 100:
