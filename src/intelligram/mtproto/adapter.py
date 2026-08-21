@@ -37,6 +37,9 @@ from intelligram.mtproto.tl import (
     TLDecodeError,
     encode_account_privacy_rules,
     encode_chat,
+    encode_chat_full,
+    encode_chat_participant,
+    encode_chat_participants,
     encode_auth_authorization,
     encode_auth_login_token,
     encode_auth_sent_code,
@@ -47,6 +50,7 @@ from intelligram.mtproto.tl import (
     encode_contact,
     encode_dialog,
     encode_message,
+    encode_messages_chat_full,
     encode_messages_dialogs,
     encode_messages_invited_users,
     encode_messages_messages,
@@ -174,6 +178,8 @@ class MTProtoSessionAdapter:
             return self._handle_users_get_full_user(message, request.fields["user"])
         if request.name == "contacts_get_contacts":
             return self._handle_contacts_get_contacts(message)
+        if request.name == "messages_get_full_chat":
+            return self._handle_messages_get_full_chat(message, chat_id=int(request.fields["chat_id"]))
         if request.name == "messages_get_dialogs":
             return self._handle_messages_get_dialogs(message, limit=int(request.fields["limit"]))
         if request.name == "messages_get_peer_dialogs":
@@ -703,6 +709,55 @@ class MTProtoSessionAdapter:
             encoded_messages,
             self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
             self._encode_users(users, self_user_id=self_user_id),
+        )
+
+    def _handle_messages_get_full_chat(self, message: EncryptedMessage, *, chat_id: int) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                chat = get_peer(connection, peer_id=chat_id, user_id=self_user_id)
+                if str(chat.get("kind")) != "chat":
+                    raise MessagingError("CHAT_ID_INVALID")
+                row = connection.execute(
+                    "SELECT id, title, created_at, created_by_user_id FROM peers WHERE id = ? AND kind = 'chat'",
+                    (chat_id,),
+                ).fetchone()
+                members = connection.execute(
+                    """
+                    SELECT user_id, role, joined_at FROM peer_memberships
+                    WHERE peer_id = ? AND left_at IS NULL
+                    ORDER BY joined_at, user_id
+                    """,
+                    (chat_id,),
+                ).fetchall()
+                if row is None:
+                    raise MessagingError("CHAT_ID_INVALID")
+                owner_id = int(row["created_by_user_id"] or self_user_id)
+                participant_entries = [
+                    encode_chat_participant(
+                        user_id=int(member["user_id"]),
+                        inviter_id=owner_id,
+                        date=int(member["joined_at"]),
+                        rank="owner" if str(member["role"]) == "owner" else None,
+                    )
+                    for member in members
+                ]
+                participants = encode_chat_participants(chat_id=chat_id, participants=participant_entries)
+                full_chat = encode_chat_full(chat_id=chat_id, about="", participants=participants)
+                users = self._load_users(connection, {int(member["user_id"]) for member in members})
+                chats = self._encode_chats(connection, chat_ids={chat_id}, self_user_id=self_user_id)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_messages_chat_full(
+                full_chat=full_chat,
+                chats=chats,
+                users=self._encode_users(users, self_user_id=self_user_id),
+            ),
         )
 
     def _handle_messages_get_dialogs(self, message: EncryptedMessage, *, limit: int) -> bytes:

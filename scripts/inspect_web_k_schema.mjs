@@ -62,6 +62,10 @@ const wanted = new Set([
   'storage.fileUnknown',
   'updates.difference',
   'updates.differenceEmpty',
+  'chatFull',
+  'messages.chatFull',
+  'chatParticipants',
+  'chatParticipant',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -80,6 +84,7 @@ const wantedMethods = new Set([
   'photos.uploadProfilePhoto',
   'upload.getFile',
   'updates.getDifference',
+  'messages.getFullChat',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

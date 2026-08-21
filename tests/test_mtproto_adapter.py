@@ -789,3 +789,61 @@ def test_web_k_updates_get_difference_replays_durable_message(tmp_path) -> None:
     assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
     assert reader.uint32() == 0x1CB5C415
     assert reader.int32() == 1
+
+
+def test_web_k_messages_get_full_chat_returns_durable_members(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        MESSAGES_CHAT_FULL_CONSTRUCTOR,
+        MESSAGES_CREATE_CHAT_CONSTRUCTOR,
+        MESSAGES_GET_FULL_CHAT_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+        user_access_hash,
+        INPUT_USER_CONSTRUCTOR,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 456, 789
+    database = Database(tmp_path / "full-chat.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000161", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000162", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    create_chat = (
+        encode_uint32(MESSAGES_CREATE_CHAT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_vector([encode_uint32(INPUT_USER_CONSTRUCTOR) + encode_int64(bob.user_id) + encode_int64(user_access_hash(bob.user_id))])
+        + encode_tl_string("Full chat")
+    )
+    created = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=create_chat,
+    ))
+    assert created is not None
+    with database.transaction() as connection:
+        chat_id = int(connection.execute("SELECT id FROM peers WHERE kind = 'chat' ORDER BY id DESC LIMIT 1").fetchone()["id"])
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=encode_uint32(MESSAGES_GET_FULL_CHAT_CONSTRUCTOR) + encode_int64(chat_id),
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR

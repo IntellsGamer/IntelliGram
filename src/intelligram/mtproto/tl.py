@@ -97,6 +97,11 @@ UPLOAD_FILE_CONSTRUCTOR = 0x096A18D5
 UPDATES_GET_DIFFERENCE_CONSTRUCTOR = 0x19C2F763
 UPDATES_DIFFERENCE_EMPTY_CONSTRUCTOR = 0x5D75A138
 UPDATES_DIFFERENCE_CONSTRUCTOR = 0x00F49CA0
+MESSAGES_GET_FULL_CHAT_CONSTRUCTOR = 0xAEB00B34
+CHAT_FULL_CONSTRUCTOR = 0x2633421B
+CHAT_PARTICIPANT_CONSTRUCTOR = 0x38E79FDE
+CHAT_PARTICIPANTS_CONSTRUCTOR = 0x3CBC93F8
+MESSAGES_CHAT_FULL_CONSTRUCTOR = 0xE5D7D19C
 
 
 class TLDecodeError(ValueError):
@@ -418,6 +423,8 @@ def parse_request(data: bytes) -> TLRequest:
                 raise TLDecodeError("Expected an inputDialogPeer constructor")
             peers.append(_read_input_peer(reader))
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
+    elif constructor_id == MESSAGES_GET_FULL_CHAT_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_full_chat", {"chat_id": reader.int64()})
     elif constructor_id == UPDATES_GET_DIFFERENCE_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b111:
@@ -647,6 +654,47 @@ def encode_photo(*, photo_id: int, file_reference: bytes, date: int, size: int, 
 
 def encode_photos_photo(*, photo: bytes, users: Iterable[bytes]) -> bytes:
     return encode_uint32(PHOTOS_PHOTO_CONSTRUCTOR) + photo + encode_vector(users)
+
+
+def encode_chat_participant(*, user_id: int, inviter_id: int, date: int, rank: str | None = None) -> bytes:
+    flags = 1 if rank else 0
+    result = (
+        encode_uint32(CHAT_PARTICIPANT_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_int64(user_id)
+        + encode_int64(inviter_id)
+        + encode_int32(date)
+    )
+    return result + (encode_tl_string(rank) if rank else b"")
+
+
+def encode_chat_participants(*, chat_id: int, participants: Iterable[bytes], version: int = 1) -> bytes:
+    return (
+        encode_uint32(CHAT_PARTICIPANTS_CONSTRUCTOR)
+        + encode_int64(chat_id)
+        + encode_vector(participants)
+        + encode_int32(version)
+    )
+
+
+def encode_chat_full(*, chat_id: int, about: str, participants: bytes) -> bytes:
+    return (
+        encode_uint32(CHAT_FULL_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int64(chat_id)
+        + encode_tl_string(about)
+        + participants
+        + encode_peer_notify_settings()
+    )
+
+
+def encode_messages_chat_full(*, full_chat: bytes, chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return (
+        encode_uint32(MESSAGES_CHAT_FULL_CONSTRUCTOR)
+        + full_chat
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
 
 
 def encode_chat(*, chat_id: int, title: str, participants_count: int, date: int, creator: bool = False, version: int = 1) -> bytes:

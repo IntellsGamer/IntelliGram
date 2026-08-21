@@ -65,3 +65,7 @@ The authenticated browser console shows no post-login TL parsing or runtime exce
 ## Fresh environment regression check
 
 With the ignored client `.env` temporarily removed, the updated Web K client completed state loading and logged `Will mount auth page: authStateSignQr` rather than throwing `compareVersion(...).split` on an undefined version. The browser view was captured immediately after navigation while still visually white; a follow-up render check is required before declaring the fresh-start fix complete.
+
+## 2026-08-21 — Live Saved Messages verification
+
+After restarting the local IntelliGram gateway with the Saved Messages dialog repair, the Web K main menu’s **Saved Messages** entry opened successfully. The client rendered its native cloud-storage informational state and no longer stalled on the self `inputPeerSelf` / peer-dialog route. This confirms that materializing the durable self-dialog resolves the previously reported navigation failure.
