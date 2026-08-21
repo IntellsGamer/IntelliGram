@@ -9,6 +9,7 @@ const virtualClientId = 'virtual:tweb-dev-checks-client';
 const resolvedVirtualClientId = `\0${virtualClientId}`;
 const virtualClientPath = `/@id/__x00__${virtualClientId}`;
 const maxOverlayOutputLength = 50_000;
+const shouldRunLint = process.env.INTELLIGRAM_DEV_LINT === '1';
 const colors = {
   lint: '\u001B[33m',
   typecheck: '\u001B[35m'
@@ -225,6 +226,10 @@ export default function devChecks(rootDir) {
       }
 
       function scheduleLint(_eventName, filename) {
+        if(!shouldRunLint) {
+          return;
+        }
+
         const relativePath = path.relative(sourceDir, path.resolve(filename));
         if(relativePath.startsWith('..') || path.isAbsolute(relativePath) || !sourceFilePattern.test(relativePath)) {
           return;
@@ -309,7 +314,9 @@ export default function devChecks(rootDir) {
       server.httpServer?.once('close', dispose);
       process.once('SIGINT', dispose);
       process.once('SIGTERM', dispose);
-      runLint();
+      if(shouldRunLint) {
+        runLint();
+      }
     }
   };
 }
