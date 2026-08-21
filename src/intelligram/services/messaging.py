@@ -73,7 +73,16 @@ def get_or_create_direct_peer(connection: sqlite3.Connection, *, user_id: int, o
         (low_user_id, high_user_id),
     ).fetchone()
     if existing is not None:
-        return int(existing["peer_id"])
+        peer_id = int(existing["peer_id"])
+        if user_id == other_user_id:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO dialogs(user_id, peer_id, top_message_id, unread_count, updated_at)
+                VALUES (?, ?, NULL, 0, ?)
+                """,
+                (user_id, peer_id, now_unix()),
+            )
+        return peer_id
 
     names = {int(row["id"]): f"{str(row['first_name'])} {str(row['last_name'])}".strip() for row in users}
     title = "Saved Messages" if user_id == other_user_id else names[other_user_id]
@@ -94,6 +103,14 @@ def get_or_create_direct_peer(connection: sqlite3.Connection, *, user_id: int, o
             VALUES (?, ?, ?, ?)
             """,
             (peer_id, member_id, "owner" if member_id == user_id else "member", now),
+        )
+    if user_id == other_user_id:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO dialogs(user_id, peer_id, top_message_id, unread_count, updated_at)
+            VALUES (?, ?, NULL, 0, ?)
+            """,
+            (user_id, peer_id, now),
         )
     return peer_id
 

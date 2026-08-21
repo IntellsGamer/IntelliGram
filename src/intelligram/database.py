@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +124,27 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS messages_peer_sent_idx ON messages(peer_id, sent_at DESC, id DESC);
 
+                CREATE TABLE IF NOT EXISTS upload_parts (
+                    file_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    part_index INTEGER NOT NULL CHECK(part_index >= 0),
+                    content BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(file_id, part_index)
+                );
+
+                CREATE TABLE IF NOT EXISTS profile_photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    source_file_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS profile_photos_user_created_idx
+                    ON profile_photos(user_id, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS dialogs (
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
@@ -170,7 +191,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '5')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '6')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
@@ -188,6 +209,14 @@ class Database:
             }
             if "about" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN about TEXT NOT NULL DEFAULT ''")
+            if "profile_photo_id" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN profile_photo_id INTEGER")
+            upload_part_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(upload_parts)").fetchall()
+            }
+            if "user_id" not in upload_part_columns:
+                connection.execute("ALTER TABLE upload_parts ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:

@@ -82,6 +82,14 @@ CHAT_PHOTO_EMPTY_CONSTRUCTOR = 0x37C1011C
 MESSAGES_INVITED_USERS_CONSTRUCTOR = 0x7F5DEFA6
 MESSAGES_CREATE_CHAT_CONSTRUCTOR = 0x92CEDDD4
 ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR = 0x78515775
+INPUT_FILE_CONSTRUCTOR = 0xF52FF27F
+INPUT_FILE_BIG_CONSTRUCTOR = 0xFA4F0BB5
+UPLOAD_SAVE_FILE_PART_CONSTRUCTOR = 0xB304A621
+UPLOAD_SAVE_BIG_FILE_PART_CONSTRUCTOR = 0xDE7B673D
+PHOTOS_UPLOAD_PROFILE_PHOTO_CONSTRUCTOR = 0x0388A3B5
+PHOTO_CONSTRUCTOR = 0xFB197A65
+PHOTO_SIZE_CONSTRUCTOR = 0x75C78E60
+PHOTOS_PHOTO_CONSTRUCTOR = 0x20212CA8
 
 
 class TLDecodeError(ValueError):
@@ -248,6 +256,26 @@ def _read_input_user(reader: TLReader) -> dict[str, Any]:
     raise TLDecodeError(f"Unsupported InputUser constructor: 0x{constructor_id:08x}")
 
 
+def _read_input_file(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_FILE_CONSTRUCTOR:
+        return {
+            "kind": "regular",
+            "file_id": reader.int64(),
+            "parts": reader.int32(),
+            "name": reader.bytes().decode("utf-8"),
+            "md5_checksum": reader.bytes().decode("utf-8"),
+        }
+    if constructor_id == INPUT_FILE_BIG_CONSTRUCTOR:
+        return {
+            "kind": "big",
+            "file_id": reader.int64(),
+            "parts": reader.int32(),
+            "name": reader.bytes().decode("utf-8"),
+        }
+    raise TLDecodeError(f"Unsupported InputFile constructor: 0x{constructor_id:08x}")
+
+
 def _read_bool(reader: TLReader) -> bool:
     constructor_id = reader.uint32()
     if constructor_id == BOOL_TRUE_CONSTRUCTOR:
@@ -370,6 +398,29 @@ def parse_request(data: bytes) -> TLRequest:
                 raise TLDecodeError("Expected an inputDialogPeer constructor")
             peers.append(_read_input_peer(reader))
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
+    elif constructor_id == UPLOAD_SAVE_FILE_PART_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "upload_save_file_part", {
+            "file_id": reader.int64(),
+            "file_part": reader.int32(),
+            "bytes": reader.bytes(),
+        })
+    elif constructor_id == UPLOAD_SAVE_BIG_FILE_PART_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "upload_save_big_file_part", {
+            "file_id": reader.int64(),
+            "file_part": reader.int32(),
+            "file_total_parts": reader.int32(),
+            "bytes": reader.bytes(),
+        })
+    elif constructor_id == PHOTOS_UPLOAD_PROFILE_PHOTO_CONSTRUCTOR:
+        flags = reader.uint32()
+        # The initial self-hosted avatar flow accepts an image file and optional
+        # fallback flag; video, bot-target, and video-emoji uploads follow later.
+        if flags & ~((1 << 0) | (1 << 3)):
+            raise TLDecodeError("Unsupported photos.uploadProfilePhoto optional fields")
+        request = TLRequest(constructor_id, "photos_upload_profile_photo", {
+            "file": _read_input_file(reader) if flags & 1 else None,
+            "fallback": bool(flags & (1 << 3)),
+        })
     elif constructor_id == ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b111:
@@ -515,6 +566,33 @@ def encode_peer_user(*, user_id: int) -> bytes:
 
 def encode_peer_chat(*, chat_id: int) -> bytes:
     return encode_uint32(PEER_CHAT_CONSTRUCTOR) + encode_int64(chat_id)
+
+
+def encode_photo_size(*, type_: str, width: int, height: int, size: int) -> bytes:
+    return (
+        encode_uint32(PHOTO_SIZE_CONSTRUCTOR)
+        + encode_tl_string(type_)
+        + encode_int32(width)
+        + encode_int32(height)
+        + encode_int32(size)
+    )
+
+
+def encode_photo(*, photo_id: int, file_reference: bytes, date: int, size: int, dc_id: int = 1) -> bytes:
+    return (
+        encode_uint32(PHOTO_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int64(photo_id)
+        + encode_int64((photo_id << 32) | 1)
+        + encode_tl_bytes(file_reference)
+        + encode_int32(date)
+        + encode_vector([encode_photo_size(type_="m", width=0, height=0, size=size)])
+        + encode_int32(dc_id)
+    )
+
+
+def encode_photos_photo(*, photo: bytes, users: Iterable[bytes]) -> bytes:
+    return encode_uint32(PHOTOS_PHOTO_CONSTRUCTOR) + photo + encode_vector(users)
 
 
 def encode_chat(*, chat_id: int, title: str, participants_count: int, date: int, creator: bool = False, version: int = 1) -> bytes:

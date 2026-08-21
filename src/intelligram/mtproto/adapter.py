@@ -43,6 +43,7 @@ from intelligram.mtproto.tl import (
     encode_auth_sent_code_success_for_sign_up,
     encode_config,
     encode_contacts_contacts,
+    encode_bool,
     encode_contact,
     encode_dialog,
     encode_message,
@@ -51,6 +52,8 @@ from intelligram.mtproto.tl import (
     encode_messages_messages,
     encode_messages_peer_dialogs,
     encode_peer_chat,
+    encode_photo,
+    encode_photos_photo,
     encode_peer_user,
     encode_updates,
     encode_update_message_id,
@@ -190,6 +193,15 @@ class MTProtoSessionAdapter:
                 body=str(request.fields["message"]),
                 random_id=int(request.fields["random_id"]),
             )
+        if request.name == "upload_save_file_part" or request.name == "upload_save_big_file_part":
+            return self._handle_upload_save_file_part(
+                message,
+                file_id=int(request.fields["file_id"]),
+                file_part=int(request.fields["file_part"]),
+                content=request.fields["bytes"],
+            )
+        if request.name == "photos_upload_profile_photo":
+            return self._handle_photos_upload_profile_photo(message, file=request.fields["file"])
         if request.name == "account_update_profile":
             return self._handle_account_update_profile(
                 message,
@@ -401,6 +413,82 @@ class MTProtoSessionAdapter:
         if user is None:
             return self._encrypt_rpc_error(message, "USER_ID_INVALID")
         return self._encrypt_result(message, encode_users_user_full(user=user, self_user_id=self_user_id))
+
+    def _handle_upload_save_file_part(
+        self, message: EncryptedMessage, *, file_id: int, file_part: int, content: object,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        if file_part < 0 or file_part >= 8_000 or not isinstance(content, bytes) or len(content) > 1_048_576:
+            return self._encrypt_rpc_error(message, "FILE_PART_INVALID")
+        with database.transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT user_id FROM upload_parts WHERE file_id = ? LIMIT 1", (file_id,)
+            ).fetchone()
+            if existing is not None and int(existing["user_id"]) not in (0, self_user_id):
+                return self._encrypt_rpc_error(message, "FILE_ID_INVALID")
+            connection.execute(
+                """
+                INSERT INTO upload_parts(file_id, user_id, part_index, content, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(file_id, part_index) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    content = excluded.content,
+                    created_at = excluded.created_at
+                """,
+                (file_id, self_user_id, file_part, content, int(time.time())),
+            )
+        return self._encrypt_result(message, encode_bool(True))
+
+    def _handle_photos_upload_profile_photo(self, message: EncryptedMessage, *, file: object) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        if not isinstance(file, dict):
+            return self._encrypt_rpc_error(message, "PHOTO_FILE_MISSING")
+        file_id = int(file.get("file_id", 0))
+        parts = int(file.get("parts", 0))
+        filename = str(file.get("name") or "profile-photo")
+        if parts < 1 or parts > 4_000 or not file_id:
+            return self._encrypt_rpc_error(message, "FILE_PART_INVALID")
+        with database.transaction(immediate=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT part_index, content FROM upload_parts
+                WHERE file_id = ? AND user_id = ?
+                ORDER BY part_index
+                """,
+                (file_id, self_user_id),
+            ).fetchall()
+            if len(rows) != parts or [int(row["part_index"]) for row in rows] != list(range(parts)):
+                return self._encrypt_rpc_error(message, "FILE_PART_INVALID")
+            content = b"".join(bytes(row["content"]) for row in rows)
+            if not content or len(content) > 20 * 1024 * 1024:
+                return self._encrypt_rpc_error(message, "FILE_TOO_BIG")
+            now = int(time.time())
+            photo = connection.execute(
+                """
+                INSERT INTO profile_photos(user_id, source_file_id, filename, content, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (self_user_id, file_id, filename, content, now),
+            )
+            photo_id = int(photo.lastrowid)
+            connection.execute(
+                "UPDATE users SET profile_photo_id = ?, updated_at = ? WHERE id = ?",
+                (photo_id, now, self_user_id),
+            )
+            connection.execute("DELETE FROM upload_parts WHERE file_id = ? AND user_id = ?", (file_id, self_user_id))
+        encoded_photo = encode_photo(
+            photo_id=photo_id,
+            file_reference=f"intelligram-photo:{photo_id}".encode("ascii"),
+            date=now,
+            size=len(content),
+        )
+        return self._encrypt_result(message, encode_photos_photo(photo=encoded_photo, users=[]))
 
     def _handle_account_update_profile(
         self,

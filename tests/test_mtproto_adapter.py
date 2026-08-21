@@ -580,3 +580,84 @@ def test_web_k_account_update_profile_persists_identity_and_full_user_about(tmp_
         row = connection.execute("SELECT first_name, last_name, about FROM users WHERE id = ?", (issued.user_id,)).fetchone()
     assert row is not None
     assert dict(row) == {"first_name": "Ilya", "last_name": "Researcher", "about": "Building IntelliGram"}
+
+
+def test_web_k_profile_photo_upload_assembles_staged_file_parts(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        INPUT_FILE_CONSTRUCTOR,
+        PHOTOS_PHOTO_CONSTRUCTOR,
+        PHOTOS_UPLOAD_PROFILE_PHOTO_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPLOAD_SAVE_FILE_PART_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 741, 852
+    database = Database(tmp_path / "profile-photo.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15550000141",
+            password="correct-horse-battery-staple",
+            first_name="Photo",
+            device_label="Photo test",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=issued.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    file_id = 777_001
+    content = b"self-hosted-intelligram-profile-photo"
+
+    save_part = (
+        encode_uint32(UPLOAD_SAVE_FILE_PART_CONSTRUCTOR)
+        + encode_int64(file_id)
+        + encode_int32(0)
+        + encode_tl_bytes(content)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=save_part,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    input_file = (
+        encode_uint32(INPUT_FILE_CONSTRUCTOR)
+        + encode_int64(file_id)
+        + encode_int32(1)
+        + encode_tl_string("avatar.png")
+        + encode_tl_string("")
+    )
+    upload_photo = encode_uint32(PHOTOS_UPLOAD_PROFILE_PHOTO_CONSTRUCTOR) + encode_uint32(1) + input_file
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=upload_photo,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    photo_reader = TLReader(body)
+    assert photo_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert photo_reader.int64() == message_id + 4
+    assert photo_reader.uint32() == PHOTOS_PHOTO_CONSTRUCTOR
+
+    with database.transaction() as connection:
+        photo = connection.execute(
+            "SELECT user_id, filename, content FROM profile_photos WHERE user_id = ?", (issued.user_id,)
+        ).fetchone()
+        user = connection.execute("SELECT profile_photo_id FROM users WHERE id = ?", (issued.user_id,)).fetchone()
+    assert photo is not None
+    assert int(photo["user_id"]) == issued.user_id
+    assert photo["filename"] == "avatar.png"
+    assert bytes(photo["content"]) == content
+    assert user is not None and user["profile_photo_id"] is not None

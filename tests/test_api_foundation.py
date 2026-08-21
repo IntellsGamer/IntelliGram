@@ -208,3 +208,30 @@ def test_application_restores_persisted_mtproto_authorization_key(tmp_path: Path
     restored = app.state.mtproto_auth_keys[int(auth_key_id)]
     assert restored.auth_key == auth_key
     assert restored.server_salt == 987654321
+
+
+def test_saved_messages_direct_peer_materializes_empty_dialog(tmp_path: Path) -> None:
+    from intelligram.database import Database
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer
+
+    database = Database(tmp_path / "saved-messages.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15550000131",
+            password="correct-horse-battery-staple",
+            first_name="Saved",
+            device_label="Saved Messages test",
+        )
+        peer_id = get_or_create_direct_peer(connection, user_id=issued.user_id, other_user_id=issued.user_id)
+        dialog = connection.execute(
+            "SELECT user_id, peer_id, top_message_id, unread_count FROM dialogs WHERE user_id = ? AND peer_id = ?",
+            (issued.user_id, peer_id),
+        ).fetchone()
+    assert dialog is not None
+    assert int(dialog["user_id"]) == issued.user_id
+    assert int(dialog["peer_id"]) == peer_id
+    assert dialog["top_message_id"] is None
+    assert int(dialog["unread_count"]) == 0
