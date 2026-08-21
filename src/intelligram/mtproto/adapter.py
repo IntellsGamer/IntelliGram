@@ -56,6 +56,7 @@ from intelligram.mtproto.tl import (
     encode_photos_photo,
     encode_peer_user,
     encode_updates,
+    encode_upload_file,
     encode_update_message_id,
     encode_update_new_message,
     encode_user,
@@ -192,6 +193,13 @@ class MTProtoSessionAdapter:
                 peer=request.fields["peer"],
                 body=str(request.fields["message"]),
                 random_id=int(request.fields["random_id"]),
+            )
+        if request.name == "upload_get_file":
+            return self._handle_upload_get_file(
+                message,
+                location=request.fields["location"],
+                offset=int(request.fields["offset"]),
+                limit=int(request.fields["limit"]),
             )
         if request.name == "upload_save_file_part" or request.name == "upload_save_big_file_part":
             return self._handle_upload_save_file_part(
@@ -413,6 +421,33 @@ class MTProtoSessionAdapter:
         if user is None:
             return self._encrypt_rpc_error(message, "USER_ID_INVALID")
         return self._encrypt_result(message, encode_users_user_full(user=user, self_user_id=self_user_id))
+
+    def _handle_upload_get_file(
+        self, message: EncryptedMessage, *, location: object, offset: int, limit: int,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, _self_user_id = authenticated
+        if not isinstance(location, dict) or location.get("kind") != "photo":
+            return self._encrypt_rpc_error(message, "LOCATION_INVALID")
+        photo_id = int(location.get("photo_id", 0))
+        expected_access_hash = (photo_id << 32) | 1
+        if photo_id <= 0 or int(location.get("access_hash", 0)) != expected_access_hash:
+            return self._encrypt_rpc_error(message, "FILE_REFERENCE_INVALID")
+        if offset < 0 or limit <= 0 or limit > 1_048_576:
+            return self._encrypt_rpc_error(message, "OFFSET_INVALID")
+        with database.transaction() as connection:
+            photo = connection.execute(
+                "SELECT content, created_at FROM profile_photos WHERE id = ?", (photo_id,)
+            ).fetchone()
+        if photo is None:
+            return self._encrypt_rpc_error(message, "LOCATION_INVALID")
+        content = bytes(photo["content"])[offset:offset + limit]
+        return self._encrypt_result(
+            message,
+            encode_upload_file(mtime=int(photo["created_at"]), content=content),
+        )
 
     def _handle_upload_save_file_part(
         self, message: EncryptedMessage, *, file_id: int, file_part: int, content: object,

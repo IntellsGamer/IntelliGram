@@ -57,6 +57,9 @@ const wanted = new Set([
   'photoEmpty',
   'photoSize',
   'photos.photo',
+  'inputPhotoFileLocation',
+  'upload.file',
+  'storage.fileUnknown',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -73,6 +76,7 @@ const wantedMethods = new Set([
   'upload.saveFilePart',
   'upload.saveBigFilePart',
   'photos.uploadProfilePhoto',
+  'upload.getFile',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

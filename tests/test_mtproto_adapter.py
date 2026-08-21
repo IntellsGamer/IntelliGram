@@ -661,3 +661,69 @@ def test_web_k_profile_photo_upload_assembles_staged_file_parts(tmp_path) -> Non
     assert photo["filename"] == "avatar.png"
     assert bytes(photo["content"]) == content
     assert user is not None and user["profile_photo_id"] is not None
+
+
+def test_web_k_upload_get_file_returns_persisted_profile_photo_bytes(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        STORAGE_FILE_UNKNOWN_CONSTRUCTOR,
+        TLReader,
+        UPLOAD_FILE_CONSTRUCTOR,
+        UPLOAD_GET_FILE_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 963, 852
+    database = Database(tmp_path / "profile-photo-download.sqlite3")
+    database.initialize()
+    content = b"intelligram-avatar-download-content"
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15550000142",
+            password="correct-horse-battery-staple",
+            first_name="Download",
+            device_label="Photo download test",
+        )
+        photo = connection.execute(
+            """
+            INSERT INTO profile_photos(user_id, source_file_id, filename, content, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (issued.user_id, 99, "avatar.png", content, int(time.time())),
+        )
+        photo_id = int(photo.lastrowid)
+        connection.execute("UPDATE users SET profile_photo_id = ? WHERE id = ?", (photo_id, issued.user_id))
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=issued.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    get_file = (
+        encode_uint32(UPLOAD_GET_FILE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR)
+        + encode_int64(photo_id)
+        + encode_int64((photo_id << 32) | 1)
+        + encode_tl_bytes(f"intelligram-photo:{photo_id}".encode("ascii"))
+        + encode_tl_string("m")
+        + encode_int64(0)
+        + encode_int32(len(content))
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=get_file,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPLOAD_FILE_CONSTRUCTOR
+    assert reader.uint32() == STORAGE_FILE_UNKNOWN_CONSTRUCTOR
+    assert reader.int32() > 0
+    assert reader.bytes() == content

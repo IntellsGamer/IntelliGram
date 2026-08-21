@@ -90,6 +90,10 @@ PHOTOS_UPLOAD_PROFILE_PHOTO_CONSTRUCTOR = 0x0388A3B5
 PHOTO_CONSTRUCTOR = 0xFB197A65
 PHOTO_SIZE_CONSTRUCTOR = 0x75C78E60
 PHOTOS_PHOTO_CONSTRUCTOR = 0x20212CA8
+UPLOAD_GET_FILE_CONSTRUCTOR = 0xBE5335BE
+INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR = 0x40181FFE
+STORAGE_FILE_UNKNOWN_CONSTRUCTOR = 0xAA963B05
+UPLOAD_FILE_CONSTRUCTOR = 0x096A18D5
 
 
 class TLDecodeError(ValueError):
@@ -276,6 +280,19 @@ def _read_input_file(reader: TLReader) -> dict[str, Any]:
     raise TLDecodeError(f"Unsupported InputFile constructor: 0x{constructor_id:08x}")
 
 
+def _read_input_file_location(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR:
+        return {
+            "kind": "photo",
+            "photo_id": reader.int64(),
+            "access_hash": reader.int64(),
+            "file_reference": reader.bytes(),
+            "thumb_size": reader.bytes().decode("utf-8"),
+        }
+    raise TLDecodeError(f"Unsupported InputFileLocation constructor: 0x{constructor_id:08x}")
+
+
 def _read_bool(reader: TLReader) -> bool:
     constructor_id = reader.uint32()
     if constructor_id == BOOL_TRUE_CONSTRUCTOR:
@@ -398,6 +415,15 @@ def parse_request(data: bytes) -> TLRequest:
                 raise TLDecodeError("Expected an inputDialogPeer constructor")
             peers.append(_read_input_peer(reader))
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
+    elif constructor_id == UPLOAD_GET_FILE_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b11:
+            raise TLDecodeError("Unsupported upload.getFile optional fields")
+        request = TLRequest(constructor_id, "upload_get_file", {
+            "location": _read_input_file_location(reader),
+            "offset": reader.int64(),
+            "limit": reader.int32(),
+        })
     elif constructor_id == UPLOAD_SAVE_FILE_PART_CONSTRUCTOR:
         request = TLRequest(constructor_id, "upload_save_file_part", {
             "file_id": reader.int64(),
@@ -566,6 +592,15 @@ def encode_peer_user(*, user_id: int) -> bytes:
 
 def encode_peer_chat(*, chat_id: int) -> bytes:
     return encode_uint32(PEER_CHAT_CONSTRUCTOR) + encode_int64(chat_id)
+
+
+def encode_upload_file(*, mtime: int, content: bytes) -> bytes:
+    return (
+        encode_uint32(UPLOAD_FILE_CONSTRUCTOR)
+        + encode_uint32(STORAGE_FILE_UNKNOWN_CONSTRUCTOR)
+        + encode_int32(mtime)
+        + encode_tl_bytes(content)
+    )
 
 
 def encode_photo_size(*, type_: str, width: int, height: int, size: int) -> bytes:
