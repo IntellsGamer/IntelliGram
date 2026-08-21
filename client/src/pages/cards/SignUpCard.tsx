@@ -133,9 +133,13 @@ export default function SignUpCard(props: {spec: Spec}) {
       switch(response._) {
         case 'auth.authorization':
           await managers.apiManager.setUser(response.user);
-          sendAvatar().finally(() => {
-            toIm();
-          });
+          // The global upload manager is constructed by the authenticated shell.
+          // Enter it first, then defer this optional profile-photo upload until that
+          // lifecycle boundary has completed instead of dereferencing an unset manager.
+          toIm();
+          setTimeout(() => {
+            sendAvatar().catch((error) => console.error('Initial avatar upload failed', error));
+          }, 0);
           break;
         default:
           setSignUpKey(response._ as LangPackKey);

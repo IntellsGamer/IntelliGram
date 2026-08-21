@@ -77,6 +77,10 @@ ACCOUNT_UPDATE_STATUS_CONSTRUCTOR = 0x6628562C
 ACCOUNT_GET_PRIVACY_CONSTRUCTOR = 0xDADBC950
 PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR = 0x65427B82
 ACCOUNT_PRIVACY_RULES_CONSTRUCTOR = 0x50A04E45
+CHAT_CONSTRUCTOR = 0x41CBF256
+CHAT_PHOTO_EMPTY_CONSTRUCTOR = 0x37C1011C
+MESSAGES_INVITED_USERS_CONSTRUCTOR = 0x7F5DEFA6
+MESSAGES_CREATE_CHAT_CONSTRUCTOR = 0x92CEDDD4
 
 
 class TLDecodeError(ValueError):
@@ -349,6 +353,15 @@ def parse_request(data: bytes) -> TLRequest:
             "random_id": reader.int64(),
             "silent": bool(flags & (1 << 5)),
         })
+    elif constructor_id == MESSAGES_CREATE_CHAT_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~1:
+            raise TLDecodeError("Unsupported messages.createChat optional fields")
+        request = TLRequest(constructor_id, "messages_create_chat", {
+            "users": [_read_input_user(reader) for _ in range(reader.vector_count())],
+            "title": reader.bytes().decode("utf-8"),
+            "ttl_period": reader.int32() if flags & 1 else None,
+        })
     elif constructor_id == MESSAGES_GET_PEER_DIALOGS_CONSTRUCTOR:
         peers: list[dict[str, Any]] = []
         for _ in range(reader.vector_count()):
@@ -494,6 +507,20 @@ def encode_peer_chat(*, chat_id: int) -> bytes:
     return encode_uint32(PEER_CHAT_CONSTRUCTOR) + encode_int64(chat_id)
 
 
+def encode_chat(*, chat_id: int, title: str, participants_count: int, date: int, creator: bool = False, version: int = 1) -> bytes:
+    flags = 1 if creator else 0
+    return (
+        encode_uint32(CHAT_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_int64(chat_id)
+        + encode_tl_string(title)
+        + encode_uint32(CHAT_PHOTO_EMPTY_CONSTRUCTOR)
+        + encode_int32(participants_count)
+        + encode_int32(date)
+        + encode_int32(version)
+    )
+
+
 def encode_peer_notify_settings() -> bytes:
     return encode_uint32(PEER_NOTIFY_SETTINGS_CONSTRUCTOR) + encode_uint32(0)
 
@@ -551,6 +578,14 @@ def encode_contacts_contacts(*, contacts: Iterable[bytes], users: Iterable[bytes
         + encode_vector(contacts)
         + encode_int32(0)
         + encode_vector(users)
+    )
+
+
+def encode_messages_invited_users(*, updates: bytes, missing_invitees: Iterable[bytes] = ()) -> bytes:
+    return (
+        encode_uint32(MESSAGES_INVITED_USERS_CONSTRUCTOR)
+        + updates
+        + encode_vector(missing_invitees)
     )
 
 

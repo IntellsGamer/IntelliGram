@@ -438,3 +438,80 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
 
     privacy_reader = invoke(encode_uint32(ACCOUNT_GET_PRIVACY_CONSTRUCTOR) + encode_uint32(0xBC2EAB30))
     assert privacy_reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR
+
+
+def test_web_k_create_chat_returns_messages_invited_users(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_USER_CONSTRUCTOR,
+        MESSAGES_CREATE_CHAT_CONSTRUCTOR,
+        MESSAGES_INVITED_USERS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 321, 654
+    database = Database(tmp_path / "create-chat.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection,
+            phone="+15550000111",
+            password="correct-horse-battery-staple",
+            first_name="Alice",
+            device_label="Alice primary",
+        )
+        bob = register_password_account(
+            connection,
+            phone="+15550000112",
+            password="correct-horse-battery-staple",
+            first_name="Bob",
+            device_label="Bob primary",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    create_chat = (
+        encode_uint32(MESSAGES_CREATE_CHAT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_vector([
+            encode_uint32(INPUT_USER_CONSTRUCTOR)
+            + encode_int64(bob.user_id)
+            + encode_int64(user_access_hash(bob.user_id))
+        ])
+        + encode_tl_string("IntelliGram Research")
+    )
+
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=create_chat,
+    ))
+
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == MESSAGES_INVITED_USERS_CONSTRUCTOR
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        group = connection.execute(
+            "SELECT id, title FROM peers WHERE kind = 'chat' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        members = connection.execute(
+            "SELECT user_id FROM peer_memberships WHERE peer_id = ? ORDER BY user_id", (group["id"],)
+        ).fetchall()
+    assert group is not None
+    assert group["title"] == "IntelliGram Research"
+    assert [int(member["user_id"]) for member in members] == sorted([alice.user_id, bob.user_id])

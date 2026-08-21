@@ -16,6 +16,7 @@ const wanted = new Set([
   'user',
   'userEmpty',
   'users.userFull',
+  'userFull',
   'contacts.contacts',
   'messages.dialogs',
   'messages.dialogsSlice',
@@ -43,6 +44,13 @@ const wanted = new Set([
   'updates',
   'updatesCombined',
   'updatesTooLong',
+  'messages.invitedUsers',
+  'chat',
+  'chatEmpty',
+  'updateNewChat',
+  'updateChatParticipants',
+  'chatParticipants',
+  'chatPhotoEmpty',
 ]);
 const wantedMethods = new Set([
   'users.getUsers',
@@ -54,6 +62,7 @@ const wantedMethods = new Set([
   'messages.sendMessage',
   'account.updateStatus',
   'account.getPrivacy',
+  'messages.createChat',
 ]);
 for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));

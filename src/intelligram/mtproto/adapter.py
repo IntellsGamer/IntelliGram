@@ -25,6 +25,7 @@ from intelligram.services.accounts import (
 )
 from intelligram.services.messaging import (
     MessagingError,
+    create_group,
     get_dialogs,
     get_history,
     get_or_create_direct_peer,
@@ -35,6 +36,7 @@ from intelligram.services.updates import get_state
 from intelligram.mtproto.tl import (
     TLDecodeError,
     encode_account_privacy_rules,
+    encode_chat,
     encode_auth_authorization,
     encode_auth_login_token,
     encode_auth_sent_code,
@@ -45,6 +47,7 @@ from intelligram.mtproto.tl import (
     encode_dialog,
     encode_message,
     encode_messages_dialogs,
+    encode_messages_invited_users,
     encode_messages_messages,
     encode_messages_peer_dialogs,
     encode_peer_chat,
@@ -173,6 +176,12 @@ class MTProtoSessionAdapter:
                 peer=request.fields["peer"],
                 offset_id=int(request.fields["offset_id"]),
                 limit=int(request.fields["limit"]),
+            )
+        if request.name == "messages_create_chat":
+            return self._handle_messages_create_chat(
+                message,
+                inputs=request.fields["users"],
+                title=str(request.fields["title"]),
             )
         if request.name == "messages_send_message":
             return self._handle_messages_send_message(
@@ -332,6 +341,32 @@ class MTProtoSessionAdapter:
             for user_id, user in sorted(users.items())
         ]
 
+    def _encode_chats(self, connection: object, *, chat_ids: set[int], self_user_id: int) -> list[bytes]:
+        if not chat_ids:
+            return []
+        placeholders = ",".join("?" for _ in chat_ids)
+        rows = connection.execute(
+            f"""
+            SELECT p.id, p.title, p.created_at, p.created_by_user_id, COUNT(pm.user_id) AS participants_count
+            FROM peers p
+            JOIN peer_memberships pm ON pm.peer_id = p.id AND pm.left_at IS NULL
+            WHERE p.kind = 'chat' AND p.id IN ({placeholders})
+            GROUP BY p.id, p.title, p.created_at, p.created_by_user_id
+            ORDER BY p.id
+            """,
+            sorted(chat_ids),
+        ).fetchall()
+        return [
+            encode_chat(
+                chat_id=int(row["id"]),
+                title=str(row["title"]),
+                participants_count=int(row["participants_count"]),
+                date=int(row["created_at"]),
+                creator=int(row["created_by_user_id"] or 0) == self_user_id,
+            )
+            for row in rows
+        ]
+
     def _handle_users_get_users(self, message: EncryptedMessage, inputs: list[dict[str, object]]) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -390,14 +425,17 @@ class MTProtoSessionAdapter:
         *,
         self_user_id: int,
         dialogs: list[dict[str, object]],
-    ) -> tuple[list[bytes], list[bytes], list[bytes]]:
+    ) -> tuple[list[bytes], list[bytes], list[bytes], list[bytes]]:
         encoded_dialogs: list[bytes] = []
         encoded_messages: list[bytes] = []
         user_ids: set[int] = {self_user_id}
+        chat_ids: set[int] = set()
         for dialog in dialogs:
             peer = self._encode_peer(dialog)
             if dialog.get("direct_user_id") is not None:
                 user_ids.add(int(dialog["direct_user_id"]))
+            elif str(dialog.get("kind")) == "chat":
+                chat_ids.add(int(dialog["peer_id"]))
             top_message_id = int(dialog["top_message_id"] or 0)
             encoded_dialogs.append(
                 encode_dialog(
@@ -428,7 +466,12 @@ class MTProtoSessionAdapter:
                         )
                     )
         users = self._load_users(connection, user_ids)
-        return encoded_dialogs, encoded_messages, self._encode_users(users, self_user_id=self_user_id)
+        return (
+            encoded_dialogs,
+            encoded_messages,
+            self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
+            self._encode_users(users, self_user_id=self_user_id),
+        )
 
     def _handle_messages_get_dialogs(self, message: EncryptedMessage, *, limit: int) -> bytes:
         authenticated = self._require_authenticated(message)
@@ -438,14 +481,14 @@ class MTProtoSessionAdapter:
         try:
             with database.transaction() as connection:
                 dialogs = get_dialogs(connection, user_id=self_user_id, offset=0, limit=min(max(limit, 1), 100))
-                encoded_dialogs, encoded_messages, encoded_users = self._dialog_payloads(
+                encoded_dialogs, encoded_messages, encoded_chats, encoded_users = self._dialog_payloads(
                     connection, self_user_id=self_user_id, dialogs=dialogs,
                 )
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(
             message,
-            encode_messages_dialogs(dialogs=encoded_dialogs, messages=encoded_messages, chats=[], users=encoded_users),
+            encode_messages_dialogs(dialogs=encoded_dialogs, messages=encoded_messages, chats=encoded_chats, users=encoded_users),
         )
 
     def _handle_messages_get_peer_dialogs(self, message: EncryptedMessage, peers: list[dict[str, object]]) -> bytes:
@@ -459,7 +502,7 @@ class MTProtoSessionAdapter:
                 all_dialogs = get_dialogs(connection, user_id=self_user_id, offset=0, limit=100)
                 wanted_peer_ids = {int(summary["peer_id"]) for summary in summaries}
                 dialogs = [dialog for dialog in all_dialogs if int(dialog["peer_id"]) in wanted_peer_ids]
-                encoded_dialogs, encoded_messages, encoded_users = self._dialog_payloads(
+                encoded_dialogs, encoded_messages, encoded_chats, encoded_users = self._dialog_payloads(
                     connection, self_user_id=self_user_id, dialogs=dialogs,
                 )
                 state = get_state(connection, self_user_id)
@@ -470,7 +513,7 @@ class MTProtoSessionAdapter:
             encode_messages_peer_dialogs(
                 dialogs=encoded_dialogs,
                 messages=encoded_messages,
-                chats=[],
+                chats=encoded_chats,
                 users=encoded_users,
                 pts=state["pts"],
                 qts=state["qts"],
@@ -502,6 +545,11 @@ class MTProtoSessionAdapter:
                 if summary.get("direct_user_id") is not None:
                     user_ids.add(int(summary["direct_user_id"]))
                 users = self._load_users(connection, user_ids)
+                encoded_chats = self._encode_chats(
+                    connection,
+                    chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) == "chat" else set(),
+                    self_user_id=self_user_id,
+                )
                 encoded_messages = [
                     encode_message(
                         message=stored,
@@ -516,9 +564,70 @@ class MTProtoSessionAdapter:
             message,
             encode_messages_messages(
                 messages=encoded_messages,
-                chats=[],
+                chats=encoded_chats,
                 users=self._encode_users(users, self_user_id=self_user_id),
             ),
+        )
+
+    def _handle_messages_create_chat(
+        self, message: EncryptedMessage, *, inputs: list[dict[str, object]], title: str,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            member_ids: list[int] = []
+            for input_user in inputs:
+                kind = input_user.get("kind")
+                if kind == "self":
+                    member_ids.append(self_user_id)
+                elif kind == "user":
+                    member_ids.append(int(input_user["user_id"]))
+                else:
+                    raise MessagingError("USER_ID_INVALID")
+            invited_ids = sorted({user_id for user_id in member_ids if user_id != self_user_id})
+            if not invited_ids:
+                raise MessagingError("USERS_TOO_FEW")
+            with database.transaction(immediate=True) as connection:
+                chat_id, emitted = create_group(
+                    connection,
+                    owner_user_id=self_user_id,
+                    title=title,
+                    member_user_ids=invited_ids,
+                )
+                chat = connection.execute(
+                    "SELECT id, title, created_at FROM peers WHERE id = ? AND kind = 'chat'", (chat_id,)
+                ).fetchone()
+                members = connection.execute(
+                    "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL ORDER BY user_id",
+                    (chat_id,),
+                ).fetchall()
+                if chat is None:
+                    raise RuntimeError("Created chat disappeared")
+                users = self._load_users(connection, {int(row["user_id"]) for row in members})
+                owner_update = next((update for update in emitted if update.user_id == self_user_id), None)
+                if owner_update is None:
+                    raise RuntimeError("Group creator update was not emitted")
+                encoded_chat = encode_chat(
+                    chat_id=chat_id,
+                    title=str(chat["title"]),
+                    participants_count=len(members),
+                    date=int(chat["created_at"]),
+                    creator=True,
+                )
+                updates = encode_updates(
+                    updates=[],
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=[encoded_chat],
+                    date=owner_update.date,
+                    seq=owner_update.seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_messages_invited_users(updates=updates),
         )
 
     def _handle_messages_send_message(
@@ -547,6 +656,11 @@ class MTProtoSessionAdapter:
                     user_ids.add(int(summary["direct_user_id"]))
                 users = self._load_users(connection, user_ids)
                 encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
+                encoded_chats = self._encode_chats(
+                    connection,
+                    chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) == "chat" else set(),
+                    self_user_id=self_user_id,
+                )
                 updates = [
                     encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
                     encode_update_new_message(
@@ -562,7 +676,7 @@ class MTProtoSessionAdapter:
             encode_updates(
                 updates=updates,
                 users=self._encode_users(users, self_user_id=self_user_id),
-                chats=[],
+                chats=encoded_chats,
                 date=sender_update.date,
                 seq=sender_update.seq,
             ),
