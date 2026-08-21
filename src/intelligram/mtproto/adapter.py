@@ -28,12 +28,15 @@ from intelligram.services.messaging import (
     add_chat_user,
     create_group,
     delete_chat_user,
+    delete_messages,
+    edit_message,
     edit_chat_about,
     edit_chat_title,
     get_dialogs,
     get_history,
     get_or_create_direct_peer,
     get_peer,
+    forward_messages,
     read_history,
     send_message,
 )
@@ -79,6 +82,8 @@ from intelligram.mtproto.tl import (
     encode_update_new_message,
     encode_update_read_history_inbox,
     encode_update_chat_participants,
+    encode_update_delete_messages,
+    encode_update_edit_message,
     encode_user,
     encode_users_user_full,
     encode_pong,
@@ -224,6 +229,27 @@ class MTProtoSessionAdapter:
             return self._handle_messages_edit_chat_about(
                 message, peer=request.fields["peer"], about=str(request.fields["about"])
             )
+        if request.name == "messages_edit_message":
+            return self._handle_messages_edit_message(
+                message,
+                peer=request.fields["peer"],
+                message_id=int(request.fields["message_id"]),
+                body=str(request.fields["body"]),
+            )
+        if request.name == "messages_delete_messages":
+            return self._handle_messages_delete_messages(
+                message,
+                message_ids=[int(message_id) for message_id in request.fields["message_ids"]],
+                revoke=bool(request.fields["revoke"]),
+            )
+        if request.name == "messages_forward_messages":
+            return self._handle_messages_forward_messages(
+                message,
+                from_peer=request.fields["from_peer"],
+                to_peer=request.fields["to_peer"],
+                message_ids=[int(message_id) for message_id in request.fields["message_ids"]],
+                random_ids=[int(random_id) for random_id in request.fields["random_ids"]],
+            )
         if request.name == "messages_read_history":
             return self._handle_messages_read_history(
                 message, peer=request.fields["peer"], max_id=int(request.fields["max_id"])
@@ -329,6 +355,38 @@ class MTProtoSessionAdapter:
                                 chat_ids.add(int(summary["peer_id"]))
                         elif envelope.kind == "updateNewChat":
                             chat_ids.add(int(envelope.payload["chat_id"]))
+                        elif envelope.kind == "updateEditMessage":
+                            stored = envelope.payload.get("message")
+                            if not isinstance(stored, dict):
+                                continue
+                            summary = get_peer(
+                                connection,
+                                peer_id=int(stored["peer_id"]),
+                                user_id=self_user_id,
+                            )
+                            encoded = encode_message(
+                                message=stored,
+                                recipient_peer=self._encode_peer(summary),
+                                outgoing=bool(envelope.payload.get("is_outgoing")),
+                            )
+                            other_updates.append(
+                                encode_update_edit_message(
+                                    message=encoded, pts=envelope.pts, pts_count=envelope.pts_count
+                                )
+                            )
+                            user_ids.add(int(stored["sender_user_id"]))
+                            if summary.get("direct_user_id") is not None:
+                                user_ids.add(int(summary["direct_user_id"]))
+                            elif str(summary.get("kind")) == "chat":
+                                chat_ids.add(int(summary["peer_id"]))
+                        elif envelope.kind == "updateDeleteMessages":
+                            other_updates.append(
+                                encode_update_delete_messages(
+                                    message_ids=[int(message_id) for message_id in envelope.payload["message_ids"]],
+                                    pts=envelope.pts,
+                                    pts_count=envelope.pts_count,
+                                )
+                            )
                         elif envelope.kind == "updateChatParticipants":
                             chat_id = int(envelope.payload["chat_id"])
                             chat_ids.add(chat_id)
@@ -911,6 +969,146 @@ class MTProtoSessionAdapter:
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(message, updates)
+
+    def _handle_messages_edit_message(
+        self, message: EncryptedMessage, *, peer: dict[str, object], message_id: int, body: str
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                stored, emitted = edit_message(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    message_id=message_id,
+                    actor_user_id=self_user_id,
+                    body=body,
+                )
+                actor_update = next((item for item in emitted if item.user_id == self_user_id), None)
+                if actor_update is None:
+                    raise RuntimeError("Message edit produced no actor update")
+                encoded_message = encode_message(
+                    message=stored,
+                    recipient_peer=self._encode_peer(summary),
+                    outgoing=True,
+                )
+                user_ids = {self_user_id, int(stored["sender_user_id"])}
+                chat_ids: set[int] = set()
+                if summary.get("direct_user_id") is not None:
+                    user_ids.add(int(summary["direct_user_id"]))
+                elif str(summary["kind"]) == "chat":
+                    chat_ids.add(int(summary["peer_id"]))
+                users = self._load_users(connection, user_ids)
+                updates = encode_updates(
+                    updates=[
+                        encode_update_edit_message(
+                            message=encoded_message, pts=actor_update.pts, pts_count=actor_update.pts_count
+                        )
+                    ],
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
+                    date=actor_update.date,
+                    seq=actor_update.seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, updates)
+
+    def _handle_messages_forward_messages(
+        self,
+        message: EncryptedMessage,
+        *,
+        from_peer: dict[str, object],
+        to_peer: dict[str, object],
+        message_ids: list[int],
+        random_ids: list[int],
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                source_summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=from_peer)
+                destination_summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=to_peer)
+                forwarded, emitted = forward_messages(
+                    connection,
+                    source_peer_id=int(source_summary["peer_id"]),
+                    destination_peer_id=int(destination_summary["peer_id"]),
+                    actor_user_id=self_user_id,
+                    message_ids=message_ids,
+                    random_ids=random_ids,
+                )
+                sender_updates = [
+                    next(
+                        (
+                            item for item in emitted
+                            if item.user_id == self_user_id
+                            and int(item.payload.get("message", {}).get("id", -1)) == int(stored["id"])
+                        ),
+                        None,
+                    )
+                    for stored in forwarded
+                ]
+                if any(item is None for item in sender_updates):
+                    raise RuntimeError("Forwarding produced no sender update")
+                encoded_peer = self._encode_peer(destination_summary)
+                updates: list[bytes] = []
+                for stored, random_id, sender_update in zip(forwarded, random_ids, sender_updates, strict=True):
+                    assert sender_update is not None
+                    encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
+                    updates.extend([
+                        encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
+                        encode_update_new_message(
+                            message=encoded_message, pts=sender_update.pts, pts_count=sender_update.pts_count
+                        ),
+                    ])
+                user_ids = {self_user_id}
+                chat_ids: set[int] = set()
+                if destination_summary.get("direct_user_id") is not None:
+                    user_ids.add(int(destination_summary["direct_user_id"]))
+                elif str(destination_summary["kind"]) == "chat":
+                    chat_ids.add(int(destination_summary["peer_id"]))
+                users = self._load_users(connection, user_ids)
+                final_sender_update = sender_updates[-1]
+                assert final_sender_update is not None
+                result = encode_updates(
+                    updates=updates,
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
+                    date=final_sender_update.date,
+                    seq=final_sender_update.seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_delete_messages(
+        self, message: EncryptedMessage, *, message_ids: list[int], revoke: bool
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                deleted, emitted = delete_messages(
+                    connection, message_ids=message_ids, actor_user_id=self_user_id, revoke=revoke
+                )
+                state = get_state(connection, self_user_id)
+                actor_updates = [item for item in emitted if item.user_id == self_user_id]
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_messages_affected_messages(
+                pts=state["pts"],
+                pts_count=sum(item.pts_count for item in actor_updates) if deleted else 0,
+            ),
+        )
 
     def _handle_messages_edit_chat_about(self, message: EncryptedMessage, *, peer: dict[str, object], about: str) -> bytes:
         authenticated = self._require_authenticated(message)

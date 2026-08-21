@@ -1378,3 +1378,198 @@ def test_web_k_updates_get_difference_replays_group_participant_change(tmp_path)
     assert reader.uint32() == CHAT_PARTICIPANTS_CONSTRUCTOR
     assert reader.int64() == chat_id
     assert reader.vector_count() == 2
+
+
+def test_web_k_message_edit_and_revoke_delete_are_durable_and_replayable(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR,
+        MESSAGES_DELETE_MESSAGES_CONSTRUCTOR,
+        MESSAGES_EDIT_MESSAGE_CONSTRUCTOR,
+        PEER_USER_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATE_DELETE_MESSAGES_CONSTRUCTOR,
+        UPDATE_EDIT_MESSAGE_CONSTRUCTOR,
+        UPDATES_CONSTRUCTOR,
+        UPDATES_DIFFERENCE_CONSTRUCTOR,
+        UPDATES_GET_DIFFERENCE_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector_ints,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 925, 200
+    database = Database(tmp_path / "message-lifecycle.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000231", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000232", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        peer_id = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        stored, _ = send_message(
+            connection, peer_id=peer_id, sender_user_id=alice.user_id, body="Before edit", client_random_id="lifecycle-1",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    input_bob = encode_uint32(INPUT_PEER_USER_CONSTRUCTOR) + encode_int64(bob.user_id) + encode_int64(user_access_hash(bob.user_id))
+    message_id = (int(time.time()) << 32) + 4
+    edit_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=(
+            encode_uint32(MESSAGES_EDIT_MESSAGE_CONSTRUCTOR)
+            + encode_uint32(1 << 11)
+            + input_bob
+            + encode_int32(int(stored["id"]))
+            + encode_tl_string("After edit")
+        ),
+    ))
+    assert edit_response is not None
+    _, _, _, _, edit_body = _decrypt_server(auth_key, edit_response)
+    reader = TLReader(edit_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        row = connection.execute("SELECT body, edited_at FROM messages WHERE id = ?", (int(stored["id"]),)).fetchone()
+        assert row is not None and row["body"] == "After edit" and row["edited_at"] is not None
+
+    edit_difference = (
+        encode_uint32(UPDATES_GET_DIFFERENCE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(1)
+        + encode_int32(0)
+        + encode_int32(0)
+    )
+    difference_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=edit_difference,
+    ))
+    assert difference_response is not None
+    _, _, _, _, difference_body = _decrypt_server(auth_key, difference_response)
+    reader = TLReader(difference_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 1
+    assert reader.uint32() == UPDATE_EDIT_MESSAGE_CONSTRUCTOR
+
+    delete_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 8,
+        seq_no=5,
+        body=encode_uint32(MESSAGES_DELETE_MESSAGES_CONSTRUCTOR) + encode_uint32(1) + encode_vector_ints([int(stored["id"])]) ,
+    ))
+    assert delete_response is not None
+    _, _, _, _, delete_body = _decrypt_server(auth_key, delete_response)
+    reader = TLReader(delete_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 8
+    assert reader.uint32() == MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR
+    assert reader.int32() > 0
+    assert reader.int32() == 1
+    with database.transaction() as connection:
+        row = connection.execute("SELECT deleted_at FROM messages WHERE id = ?", (int(stored["id"]),)).fetchone()
+        assert row is not None and row["deleted_at"] is not None
+
+    delete_difference = (
+        encode_uint32(UPDATES_GET_DIFFERENCE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(2)
+        + encode_int32(0)
+        + encode_int32(0)
+    )
+    deleted_difference_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 12, seq_no=7, body=delete_difference,
+    ))
+    assert deleted_difference_response is not None
+    _, _, _, _, deleted_difference_body = _decrypt_server(auth_key, deleted_difference_response)
+    reader = TLReader(deleted_difference_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 12
+    assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 0
+    assert reader.vector_count() == 1
+    assert reader.uint32() == UPDATE_DELETE_MESSAGES_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.int32() == int(stored["id"])
+
+
+def test_web_k_forwards_text_message_into_saved_messages(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_SELF_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_int64,
+        encode_uint32,
+        encode_vector_ints,
+        encode_vector_longs,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 926, 201
+    database = Database(tmp_path / "forward-message.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000241", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000242", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        source_peer = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        stored, _ = send_message(
+            connection, peer_id=source_peer, sender_user_id=bob.user_id, body="Forwardable", client_random_id="forward-source",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    request = (
+        encode_uint32(MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_vector_ints([int(stored["id"])])
+        + encode_vector_longs([987_654_321])
+        + encode_uint32(INPUT_PEER_SELF_CONSTRUCTOR)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=request,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        saved_peer = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=alice.user_id)
+        forwarded = connection.execute(
+            "SELECT body, sender_user_id FROM messages WHERE peer_id = ? ORDER BY id DESC LIMIT 1", (saved_peer,)
+        ).fetchone()
+        assert forwarded is not None
+        assert (forwarded["body"], int(forwarded["sender_user_id"])) == ("Forwardable", alice.user_id)

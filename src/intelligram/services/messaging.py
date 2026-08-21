@@ -361,6 +361,146 @@ def send_message(
     return message, emitted
 
 
+def forward_messages(
+    connection: sqlite3.Connection,
+    *,
+    source_peer_id: int,
+    destination_peer_id: int,
+    actor_user_id: int,
+    message_ids: list[int],
+    random_ids: list[int],
+) -> tuple[list[dict[str, Any]], list[UpdateEnvelope]]:
+    _require_active_membership(connection, source_peer_id, actor_user_id)
+    _require_active_membership(connection, destination_peer_id, actor_user_id)
+    if not message_ids or len(message_ids) != len(random_ids):
+        raise MessagingError("INPUT_REQUEST_INVALID")
+    source_rows = connection.execute(
+        f"""
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        FROM messages WHERE peer_id = ? AND id IN ({','.join('?' for _ in message_ids)}) AND deleted_at IS NULL
+        """,
+        (source_peer_id, *message_ids),
+    ).fetchall()
+    messages_by_id = {int(row["id"]): _message_row(row) for row in source_rows}
+    if len(messages_by_id) != len(set(message_ids)):
+        raise MessagingError("MESSAGE_ID_INVALID")
+    forwarded: list[dict[str, Any]] = []
+    emitted: list[UpdateEnvelope] = []
+    for message_id, random_id in zip(message_ids, random_ids, strict=True):
+        source = messages_by_id[message_id]
+        stored, updates = send_message(
+            connection,
+            peer_id=destination_peer_id,
+            sender_user_id=actor_user_id,
+            body=str(source["body"]),
+            client_random_id=f"forward:{random_id}",
+        )
+        forwarded.append(stored)
+        emitted.extend(updates)
+    return forwarded, emitted
+
+
+def edit_message(
+    connection: sqlite3.Connection, *, peer_id: int, message_id: int, actor_user_id: int, body: str
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    _require_active_membership(connection, peer_id, actor_user_id)
+    body = body.strip()
+    if not body:
+        raise MessagingError("MESSAGE_EMPTY")
+    if len(body) > 4096:
+        raise MessagingError("MESSAGE_TOO_LONG")
+    row = connection.execute(
+        """
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        FROM messages WHERE id = ? AND peer_id = ? AND deleted_at IS NULL
+        """,
+        (message_id, peer_id),
+    ).fetchone()
+    if row is None:
+        raise MessagingError("MESSAGE_ID_INVALID")
+    if int(row["sender_user_id"]) != actor_user_id:
+        raise MessagingError("MESSAGE_AUTHOR_REQUIRED")
+    now = now_unix()
+    connection.execute("UPDATE messages SET body = ?, edited_at = ? WHERE id = ?", (body, now, message_id))
+    updated = connection.execute(
+        """
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        FROM messages WHERE id = ?
+        """,
+        (message_id,),
+    ).fetchone()
+    if updated is None:
+        raise RuntimeError("Edited message disappeared")
+    message = _message_row(updated)
+    emitted = [
+        append_update(
+            connection,
+            user_id=member_id,
+            kind="updateEditMessage",
+            payload={"message": message, "is_outgoing": member_id == actor_user_id},
+        )
+        for member_id in _active_member_ids(connection, peer_id=peer_id)
+    ]
+    return message, emitted
+
+
+def delete_messages(
+    connection: sqlite3.Connection, *, message_ids: list[int], actor_user_id: int, revoke: bool
+) -> tuple[list[int], list[UpdateEnvelope]]:
+    if not message_ids:
+        raise MessagingError("MESSAGE_IDS_EMPTY")
+    unique_ids = sorted({message_id for message_id in message_ids if message_id > 0})
+    if not unique_ids:
+        raise MessagingError("MESSAGE_IDS_EMPTY")
+    rows = connection.execute(
+        f"""
+        SELECT id, peer_id, sender_user_id, deleted_at
+        FROM messages WHERE id IN ({','.join('?' for _ in unique_ids)})
+        """,
+        unique_ids,
+    ).fetchall()
+    deleted: list[int] = []
+    emitted: list[UpdateEnvelope] = []
+    now = now_unix()
+    for row in rows:
+        message_id = int(row["id"])
+        peer_id = int(row["peer_id"])
+        if row["deleted_at"] is not None:
+            continue
+        membership = _require_active_membership(connection, peer_id, actor_user_id)
+        authorized = int(row["sender_user_id"]) == actor_user_id
+        if str(membership["kind"]) == "chat":
+            role = connection.execute(
+                "SELECT role FROM peer_memberships WHERE peer_id = ? AND user_id = ? AND left_at IS NULL",
+                (peer_id, actor_user_id),
+            ).fetchone()
+            authorized = authorized or (role is not None and str(role["role"]) in {"owner", "admin"})
+        if not authorized:
+            raise MessagingError("MESSAGE_DELETE_FORBIDDEN")
+        connection.execute("UPDATE messages SET deleted_at = ? WHERE id = ?", (now, message_id))
+        deleted.append(message_id)
+        recipients = _active_member_ids(connection, peer_id=peer_id) if revoke else [actor_user_id]
+        for member_id in recipients:
+            emitted.append(
+                append_update(
+                    connection,
+                    user_id=member_id,
+                    kind="updateDeleteMessages",
+                    payload={"message_ids": [message_id]},
+                )
+            )
+    return deleted, emitted
+
+
+def _active_member_ids(connection: sqlite3.Connection, *, peer_id: int) -> list[int]:
+    return [
+        int(row["user_id"])
+        for row in connection.execute(
+            "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL", (peer_id,)
+        ).fetchall()
+    ]
+
+
 def read_history(connection: sqlite3.Connection, *, peer_id: int, user_id: int, max_id: int) -> UpdateEnvelope | None:
     """Advance a member's inbox cursor and return its durable update, if changed."""
 

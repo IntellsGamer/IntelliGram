@@ -121,6 +121,11 @@ MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR = 0x73783FFD
 MESSAGES_ADD_CHAT_USER_CONSTRUCTOR = 0xCBC6D107
 MESSAGES_DELETE_CHAT_USER_CONSTRUCTOR = 0xA2185CAB
 MESSAGES_EDIT_CHAT_ABOUT_CONSTRUCTOR = 0xDEF60797
+MESSAGES_DELETE_MESSAGES_CONSTRUCTOR = 0xE58E95D2
+MESSAGES_EDIT_MESSAGE_CONSTRUCTOR = 0xB107A14C
+MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR = 0x13704A7C
+UPDATE_DELETE_MESSAGES_CONSTRUCTOR = 0xA20DB0E5
+UPDATE_EDIT_MESSAGE_CONSTRUCTOR = 0xE40370A3
 
 
 class TLDecodeError(ValueError):
@@ -235,6 +240,11 @@ def encode_tl_string(value: str) -> bytes:
 def encode_vector_longs(values: Iterable[int]) -> bytes:
     sequence = list(values)
     return encode_uint32(VECTOR_CONSTRUCTOR) + encode_int32(len(sequence)) + b"".join(encode_int64(value) for value in sequence)
+
+
+def encode_vector_ints(values: Iterable[int]) -> bytes:
+    sequence = list(values)
+    return encode_uint32(VECTOR_CONSTRUCTOR) + encode_int32(len(sequence)) + b"".join(encode_int32(value) for value in sequence)
 
 
 def unwrap_client_query(data: bytes) -> bytes:
@@ -486,6 +496,40 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_edit_chat_about", {
             "peer": _read_input_peer(reader),
             "about": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == MESSAGES_DELETE_MESSAGES_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~1:
+            raise TLDecodeError("Unsupported messages.deleteMessages optional fields")
+        request = TLRequest(constructor_id, "messages_delete_messages", {
+            "revoke": bool(flags & 1),
+            "message_ids": [reader.int32() for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == MESSAGES_EDIT_MESSAGE_CONSTRUCTOR:
+        flags = reader.uint32()
+        supported_flags = (1 << 1) | (1 << 11) | (1 << 16)
+        if flags & ~supported_flags:
+            raise TLDecodeError("Unsupported messages.editMessage optional fields")
+        peer = _read_input_peer(reader)
+        message_id = reader.int32()
+        body = reader.bytes().decode("utf-8") if flags & (1 << 11) else None
+        if body is None:
+            raise TLDecodeError("messages.editMessage requires a text message")
+        request = TLRequest(constructor_id, "messages_edit_message", {
+            "peer": peer,
+            "message_id": message_id,
+            "body": body,
+        })
+    elif constructor_id == MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR:
+        flags = reader.uint32()
+        supported_flags = (1 << 5) | (1 << 6) | (1 << 8) | (1 << 11) | (1 << 12) | (1 << 14) | (1 << 19)
+        if flags & ~supported_flags:
+            raise TLDecodeError("Unsupported messages.forwardMessages optional fields")
+        request = TLRequest(constructor_id, "messages_forward_messages", {
+            "from_peer": _read_input_peer(reader),
+            "message_ids": [reader.int32() for _ in range(reader.vector_count())],
+            "random_ids": [reader.int64() for _ in range(reader.vector_count())],
+            "to_peer": _read_input_peer(reader),
         })
     elif constructor_id == MESSAGES_READ_HISTORY_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_read_history", {
@@ -958,6 +1002,14 @@ def encode_update_new_message(*, message: bytes, pts: int, pts_count: int) -> by
 
 def encode_update_chat_participants(*, participants: bytes) -> bytes:
     return encode_uint32(UPDATE_CHAT_PARTICIPANTS_CONSTRUCTOR) + participants
+
+
+def encode_update_edit_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
+    return encode_uint32(UPDATE_EDIT_MESSAGE_CONSTRUCTOR) + message + encode_int32(pts) + encode_int32(pts_count)
+
+
+def encode_update_delete_messages(*, message_ids: Iterable[int], pts: int, pts_count: int) -> bytes:
+    return encode_uint32(UPDATE_DELETE_MESSAGES_CONSTRUCTOR) + encode_vector_ints(message_ids) + encode_int32(pts) + encode_int32(pts_count)
 
 
 def encode_update_read_history_inbox(
