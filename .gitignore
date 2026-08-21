@@ -23,3 +23,6 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Local gateway and Web K preview logs
+*.log

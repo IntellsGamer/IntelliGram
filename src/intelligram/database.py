@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +48,8 @@ class Database:
                     auth_key_id TEXT PRIMARY KEY,
                     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                     key_fingerprint TEXT NOT NULL UNIQUE,
+                    key_material BLOB,
+                    server_salt TEXT,
                     created_at INTEGER NOT NULL,
                     revoked_at INTEGER,
                     expires_at INTEGER
@@ -64,12 +66,37 @@ class Database:
                     expires_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS login_challenges (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    requested_device_label TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    approved_at INTEGER,
+                    completed_at INTEGER,
+                    denied_at INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
+                );
+
+                CREATE INDEX IF NOT EXISTS login_challenges_user_active_idx
+                    ON login_challenges(user_id, expires_at DESC)
+                    WHERE completed_at IS NULL AND denied_at IS NULL;
+
                 CREATE TABLE IF NOT EXISTS peers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind TEXT NOT NULL CHECK(kind IN ('user', 'chat', 'channel')),
                     title TEXT NOT NULL,
                     created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS direct_peer_users (
+                    peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
+                    user_low_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    user_high_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    CHECK(user_low_id <= user_high_id),
+                    UNIQUE(user_low_id, user_high_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS peer_memberships (
@@ -142,9 +169,18 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
+            auth_key_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(auth_keys)").fetchall()
+            }
+            if "key_material" not in auth_key_columns:
+                connection.execute("ALTER TABLE auth_keys ADD COLUMN key_material BLOB")
+            if "server_salt" not in auth_key_columns:
+                connection.execute("ALTER TABLE auth_keys ADD COLUMN server_salt TEXT")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:

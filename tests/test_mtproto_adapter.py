@@ -68,3 +68,373 @@ def test_msgs_ack_has_no_response_and_replayed_message_is_rejected() -> None:
     assert adapter.handle_encrypted(encrypted) is None
     with pytest.raises(MTProtoSecurityError, match="MESSAGE_REPLAY"):
         adapter.handle_encrypted(encrypted)
+
+
+def _tl_bytes(value: bytes) -> bytes:
+    encoded = bytes([len(value)]) + value
+    return encoded + b"\x00" * (-len(encoded) % 4)
+
+
+def _wrapped_query(query: bytes) -> bytes:
+    from intelligram.mtproto.tl import INIT_CONNECTION_CONSTRUCTOR, INVOKE_WITH_LAYER_CONSTRUCTOR
+
+    metadata = b"".join(_tl_bytes(value) for value in [
+        b"IntelliGram Web", b"Linux", b"0.1.0", b"en", b"", b"en",
+    ])
+    init_connection = (
+        struct.pack("<IIi", INIT_CONNECTION_CONSTRUCTOR, 0, 1)
+        + metadata
+        + query
+    )
+    return struct.pack("<Ii", INVOKE_WITH_LAYER_CONSTRUCTOR, 220) + init_connection
+
+
+def test_wrapped_get_config_and_qr_token_are_served_after_authorization() -> None:
+    from intelligram.mtproto.tl import (
+        AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR,
+        AUTH_LOGIN_TOKEN_CONSTRUCTOR,
+        CONFIG_CONSTRUCTOR,
+        HELP_GET_CONFIG_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        VECTOR_CONSTRUCTOR,
+    )
+
+    auth_key = bytes(range(256))
+    salt, session_id = 91, 17
+    first_message_id = (int(time.time()) << 32) + 4
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, dc_host="127.0.0.1", dc_port=8080)
+
+    config_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=first_message_id,
+        seq_no=1,
+        body=_wrapped_query(struct.pack("<I", HELP_GET_CONFIG_CONSTRUCTOR)),
+    ))
+    assert config_response is not None
+    _, _, _, _, config_body = _decrypt_server(auth_key, config_response)
+    config_reader = TLReader(config_body)
+    assert config_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert config_reader.int64() == first_message_id
+    assert config_reader.uint32() == CONFIG_CONSTRUCTOR
+
+    token_message_id = first_message_id + 4
+    export_query = (
+        struct.pack("<Ii", AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR, 1)
+        + _tl_bytes(b"intelligram-self-hosted")
+        + struct.pack("<Ii", VECTOR_CONSTRUCTOR, 0)
+    )
+    token_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=token_message_id,
+        seq_no=3,
+        body=_wrapped_query(export_query),
+    ))
+    assert token_response is not None
+    _, _, _, _, token_body = _decrypt_server(auth_key, token_response)
+    token_reader = TLReader(token_body)
+    assert token_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert token_reader.int64() == token_message_id
+    assert token_reader.uint32() == AUTH_LOGIN_TOKEN_CONSTRUCTOR
+    assert token_reader.int32() > int(time.time())
+    assert len(token_reader.bytes()) == 32
+
+
+def test_web_k_sms_free_sign_up_creates_password_backed_account(tmp_path) -> None:
+    import base64
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        AUTH_AUTHORIZATION_CONSTRUCTOR,
+        AUTH_SEND_CODE_CONSTRUCTOR,
+        AUTH_SENT_CODE_SUCCESS_CONSTRUCTOR,
+        AUTH_SIGN_UP_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+    )
+
+    # Keep the generated-client constructor explicit: codeSettings#AD253D78?
+    # The adapter only requires a constructor word plus zero optional flags.
+    code_settings_constructor = 0xAD253D78
+    auth_key = bytes(range(256))
+    salt, session_id = 91, 17
+    database = Database(tmp_path / "account.sqlite3")
+    database.initialize()
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database)
+    message_id = (int(time.time()) << 32) + 4
+    phone = "+15551230000"
+
+    send_code = (
+        struct.pack("<I", AUTH_SEND_CODE_CONSTRUCTOR)
+        + _tl_bytes(phone.encode())
+        + struct.pack("<i", 1)
+        + _tl_bytes(b"intelligram-self-hosted")
+        + struct.pack("<II", code_settings_constructor, 0)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=send_code
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == AUTH_SENT_CODE_SUCCESS_CONSTRUCTOR
+
+    password = "correct-horse-battery-staple"
+    signup = (
+        struct.pack("<II", AUTH_SIGN_UP_CONSTRUCTOR, 0)
+        + _tl_bytes(phone.encode())
+        + _tl_bytes(f"intelligram-register:{base64.b64encode(password.encode()).decode()}".encode())
+        + _tl_bytes(b"Ilya")
+        + _tl_bytes(b"Researcher")
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=signup
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == AUTH_AUTHORIZATION_CONSTRUCTOR
+
+    from intelligram.mtproto.crypto import auth_key_id
+
+    with database.transaction() as connection:
+        user = connection.execute("SELECT id, phone, password_hash FROM users WHERE phone = ?", (phone,)).fetchone()
+        binding = connection.execute(
+            "SELECT user_id FROM auth_keys WHERE auth_key_id = ?", (str(auth_key_id(auth_key)),)
+        ).fetchone()
+    assert user is not None
+    assert user["password_hash"] is not None
+    assert binding is not None
+    assert int(binding["user_id"]) == int(user["id"])
+
+
+def test_web_k_existing_session_login_uses_durable_in_app_code(tmp_path) -> None:
+    import json
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        AUTH_AUTHORIZATION_CONSTRUCTOR,
+        AUTH_SEND_CODE_CONSTRUCTOR,
+        AUTH_SENT_CODE_CONSTRUCTOR,
+        AUTH_SENT_CODE_TYPE_APP_CONSTRUCTOR,
+        AUTH_SIGN_IN_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    code_settings_constructor = 0xAD253D78
+    auth_key = bytes(range(256))
+    salt, session_id = 91, 17
+    database = Database(tmp_path / "existing-session.sqlite3")
+    database.initialize()
+    phone = "+15551230002"
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone=phone,
+            password="correct-horse-battery-staple",
+            first_name="Existing",
+            device_label="Primary IntelliGram device",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database)
+    message_id = (int(time.time()) << 32) + 4
+
+    send_code = (
+        struct.pack("<I", AUTH_SEND_CODE_CONSTRUCTOR)
+        + _tl_bytes(phone.encode())
+        + struct.pack("<i", 1)
+        + _tl_bytes(b"intelligram-self-hosted")
+        + struct.pack("<II", code_settings_constructor, 0)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=send_code
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == AUTH_SENT_CODE_CONSTRUCTOR
+    assert reader.uint32() == 0
+    assert reader.uint32() == AUTH_SENT_CODE_TYPE_APP_CONSTRUCTOR
+    assert reader.int32() == 6
+    challenge_id = reader.bytes().decode()
+
+    with database.transaction() as connection:
+        update = connection.execute(
+            "SELECT payload_json FROM updates WHERE user_id = ? ORDER BY id DESC LIMIT 1", (issued.user_id,)
+        ).fetchone()
+    assert update is not None
+    payload = json.loads(str(update["payload_json"]))
+    assert payload["challenge_id"] == challenge_id
+    code = payload["code"]
+
+    sign_in = (
+        struct.pack("<II", AUTH_SIGN_IN_CONSTRUCTOR, 1)
+        + _tl_bytes(phone.encode())
+        + _tl_bytes(challenge_id.encode())
+        + _tl_bytes(code.encode())
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=sign_in
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == AUTH_AUTHORIZATION_CONSTRUCTOR
+
+
+def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_GET_PRIVACY_CONSTRUCTOR,
+        ACCOUNT_PRIVACY_RULES_CONSTRUCTOR,
+        ACCOUNT_UPDATE_STATUS_CONSTRUCTOR,
+        BOOL_FALSE_CONSTRUCTOR,
+        BOOL_TRUE_CONSTRUCTOR,
+        CONTACTS_CONTACTS_CONSTRUCTOR,
+        CONTACTS_GET_CONTACTS_CONSTRUCTOR,
+        DIALOG_CONSTRUCTOR,
+        INPUT_PEER_EMPTY_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        INPUT_USER_SELF_CONSTRUCTOR,
+        MESSAGES_DIALOGS_CONSTRUCTOR,
+        MESSAGES_GET_DIALOGS_CONSTRUCTOR,
+        MESSAGES_GET_HISTORY_CONSTRUCTOR,
+        MESSAGES_MESSAGES_CONSTRUCTOR,
+        MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATE_MESSAGE_ID_CONSTRUCTOR,
+        UPDATE_NEW_MESSAGE_CONSTRUCTOR,
+        UPDATES_CONSTRUCTOR,
+        USER_CONSTRUCTOR,
+        USERS_GET_FULL_USER_CONSTRUCTOR,
+        USERS_GET_USERS_CONSTRUCTOR,
+        USERS_USER_FULL_CONSTRUCTOR,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 123, 456
+    database = Database(tmp_path / "signed-in-rpcs.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection,
+            phone="+15550000101",
+            password="correct-horse-battery-staple",
+            first_name="Alice",
+            device_label="Alice primary",
+        )
+        bob = register_password_account(
+            connection,
+            phone="+15550000102",
+            password="correct-horse-battery-staple",
+            first_name="Bob",
+            device_label="Bob primary",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+
+    def invoke(query: bytes) -> TLReader:
+        nonlocal message_id
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=message_id,
+            seq_no=((message_id - ((int(time.time()) << 32) + 4)) // 2) | 1,
+            body=query,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == message_id
+        message_id += 4
+        return reader
+
+    users_reader = invoke(
+        encode_uint32(USERS_GET_USERS_CONSTRUCTOR)
+        + encode_vector([encode_uint32(INPUT_USER_SELF_CONSTRUCTOR)])
+    )
+    assert users_reader.uint32() == 0x1CB5C415
+    assert users_reader.int32() == 1
+    assert users_reader.uint32() == USER_CONSTRUCTOR
+    flags = users_reader.uint32()
+    assert flags & (1 << 10)
+    assert users_reader.uint32() == 0
+    assert users_reader.int64() == alice.user_id
+
+    full_reader = invoke(encode_uint32(USERS_GET_FULL_USER_CONSTRUCTOR) + encode_uint32(INPUT_USER_SELF_CONSTRUCTOR))
+    assert full_reader.uint32() == USERS_USER_FULL_CONSTRUCTOR
+
+    send_reader = invoke(
+        encode_uint32(MESSAGES_SEND_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_tl_string("IntelliGram native MTProto test")
+        + encode_int64(901)
+    )
+    assert send_reader.uint32() == UPDATES_CONSTRUCTOR
+    assert send_reader.uint32() == 0x1CB5C415
+    assert send_reader.int32() == 2
+    assert send_reader.uint32() == UPDATE_MESSAGE_ID_CONSTRUCTOR
+    assert send_reader.int32() == 1
+    assert send_reader.int64() == 901
+    assert send_reader.uint32() == UPDATE_NEW_MESSAGE_CONSTRUCTOR
+
+    dialogs_reader = invoke(
+        encode_uint32(MESSAGES_GET_DIALOGS_CONSTRUCTOR)
+        + encode_uint32(0)
+        + struct.pack("<ii", 0, 0)
+        + encode_uint32(INPUT_PEER_EMPTY_CONSTRUCTOR)
+        + struct.pack("<i", 30)
+        + encode_int64(0)
+    )
+    assert dialogs_reader.uint32() == MESSAGES_DIALOGS_CONSTRUCTOR
+    assert dialogs_reader.uint32() == 0x1CB5C415
+    assert dialogs_reader.int32() == 1
+    assert dialogs_reader.uint32() == DIALOG_CONSTRUCTOR
+
+    history_reader = invoke(
+        encode_uint32(MESSAGES_GET_HISTORY_CONSTRUCTOR)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + struct.pack("<iiiiii", 0, 0, 0, 30, 0, 0)
+        + encode_int64(0)
+    )
+    assert history_reader.uint32() == MESSAGES_MESSAGES_CONSTRUCTOR
+    assert history_reader.uint32() == 0x1CB5C415
+    assert history_reader.int32() == 1
+
+    contacts_reader = invoke(encode_uint32(CONTACTS_GET_CONTACTS_CONSTRUCTOR) + encode_int64(0))
+    assert contacts_reader.uint32() == CONTACTS_CONTACTS_CONSTRUCTOR
+    assert contacts_reader.uint32() == 0x1CB5C415
+    assert contacts_reader.int32() == 1
+
+    status_reader = invoke(encode_uint32(ACCOUNT_UPDATE_STATUS_CONSTRUCTOR) + encode_uint32(BOOL_FALSE_CONSTRUCTOR))
+    assert status_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    privacy_reader = invoke(encode_uint32(ACCOUNT_GET_PRIVACY_CONSTRUCTOR) + encode_uint32(0xBC2EAB30))
+    assert privacy_reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR

@@ -41,8 +41,8 @@ DH_PRIME = int(
     "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f"
     "48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c37"
     "20fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f64"
-    "2477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4fa9060bee7cf9a4a4"
-    "a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754"
+    "2477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a"
+    "4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754"
     "fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae"
     "4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851"
     "f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b",
@@ -167,7 +167,7 @@ class AuthorizationHandshake:
         auth_key_int = pow(g_b, state.exponent_a, DH_PRIME)
         auth_key = auth_key_int.to_bytes(256, "big")
         key_id = auth_key_id(auth_key)
-        server_salt = int.from_bytes(bytes(a ^ b for a, b in zip(state.new_nonce[:8], server_nonce[:8], strict=True)), "little", signed=True)
+        server_salt = int.from_bytes(bytes(a ^ b for a, b in zip(state.new_nonce[:8], server_nonce[:8], strict=True)), "little", signed=False)
         completed = CompletedAuthKey(key_id=key_id, auth_key=auth_key, server_salt=server_salt)
         if key_id in self.completed_keys:
             # Collisions are exceptionally unlikely; forcing a retry avoids

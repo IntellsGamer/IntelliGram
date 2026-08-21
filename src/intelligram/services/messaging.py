@@ -48,6 +48,87 @@ def create_user(connection: sqlite3.Connection, *, phone: str, first_name: str, 
     return user_id
 
 
+def get_or_create_direct_peer(connection: sqlite3.Connection, *, user_id: int, other_user_id: int) -> int:
+    """Return the durable peer shared by two IntelliGram users.
+
+    A same-user pair is the account's Saved Messages peer. A two-user pair is
+    shared in both directions, letting `PeerUser` history and dialogs remain
+    stable even when message requests arrive from different devices.
+    """
+
+    user_ids = sorted({user_id, other_user_id})
+    users = connection.execute(
+        f"SELECT id, first_name, last_name FROM users WHERE id IN ({','.join('?' for _ in user_ids)})",
+        user_ids,
+    ).fetchall()
+    if len(users) != len(user_ids):
+        raise MessagingError("USER_ID_INVALID")
+    low_user_id = min(user_id, other_user_id)
+    high_user_id = max(user_id, other_user_id)
+    existing = connection.execute(
+        """
+        SELECT peer_id FROM direct_peer_users
+        WHERE user_low_id = ? AND user_high_id = ?
+        """,
+        (low_user_id, high_user_id),
+    ).fetchone()
+    if existing is not None:
+        return int(existing["peer_id"])
+
+    names = {int(row["id"]): f"{str(row['first_name'])} {str(row['last_name'])}".strip() for row in users}
+    title = "Saved Messages" if user_id == other_user_id else names[other_user_id]
+    now = now_unix()
+    cursor = connection.execute(
+        "INSERT INTO peers(kind, title, created_by_user_id, created_at) VALUES ('user', ?, ?, ?)",
+        (title, user_id, now),
+    )
+    peer_id = int(cursor.lastrowid)
+    connection.execute(
+        "INSERT INTO direct_peer_users(peer_id, user_low_id, user_high_id) VALUES (?, ?, ?)",
+        (peer_id, low_user_id, high_user_id),
+    )
+    for member_id in user_ids:
+        connection.execute(
+            """
+            INSERT INTO peer_memberships(peer_id, user_id, role, joined_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (peer_id, member_id, "owner" if member_id == user_id else "member", now),
+        )
+    return peer_id
+
+
+def resolve_direct_peer(connection: sqlite3.Connection, *, user_id: int, other_user_id: int) -> int | None:
+    low_user_id = min(user_id, other_user_id)
+    high_user_id = max(user_id, other_user_id)
+    row = connection.execute(
+        """
+        SELECT peer_id FROM direct_peer_users
+        WHERE user_low_id = ? AND user_high_id = ?
+        """,
+        (low_user_id, high_user_id),
+    ).fetchone()
+    return int(row["peer_id"]) if row is not None else None
+
+
+def get_peer(connection: sqlite3.Connection, *, peer_id: int, user_id: int) -> dict[str, Any]:
+    row = _require_active_membership(connection, peer_id, user_id)
+    direct = connection.execute(
+        "SELECT user_low_id, user_high_id FROM direct_peer_users WHERE peer_id = ?",
+        (peer_id,),
+    ).fetchone()
+    result: dict[str, Any] = {
+        "peer_id": int(row["id"]),
+        "kind": str(row["kind"]),
+        "title": str(row["title"]),
+    }
+    if direct is not None:
+        low_user_id = int(direct["user_low_id"])
+        high_user_id = int(direct["user_high_id"])
+        result["direct_user_id"] = high_user_id if low_user_id == user_id else low_user_id
+    return result
+
+
 def _ensure_dialog(connection: sqlite3.Connection, user_id: int, peer_id: int, message_id: int | None, unread_delta: int) -> None:
     now = now_unix()
     connection.execute(
@@ -192,10 +273,12 @@ def get_dialogs(connection: sqlite3.Connection, *, user_id: int, offset: int, li
         raise MessagingError("OFFSET_OR_LIMIT_INVALID")
     rows = connection.execute(
         """
-        SELECT d.peer_id, d.top_message_id, d.unread_count, d.pinned_order, d.draft_text, d.updated_at,
-               p.kind, p.title
+        SELECT d.peer_id, d.top_message_id, d.read_inbox_max_id, d.read_outbox_max_id,
+               d.unread_count, d.pinned_order, d.draft_text, d.updated_at, p.kind, p.title,
+               dpu.user_low_id, dpu.user_high_id
         FROM dialogs d
         JOIN peers p ON p.id = d.peer_id
+        LEFT JOIN direct_peer_users dpu ON dpu.peer_id = d.peer_id
         WHERE d.user_id = ?
         ORDER BY d.pinned_order IS NULL ASC, d.pinned_order ASC, d.updated_at DESC, d.peer_id DESC
         LIMIT ? OFFSET ?
@@ -208,7 +291,16 @@ def get_dialogs(connection: sqlite3.Connection, *, user_id: int, offset: int, li
             "kind": str(row["kind"]),
             "title": str(row["title"]),
             "top_message_id": int(row["top_message_id"]) if row["top_message_id"] is not None else None,
+            "read_inbox_max_id": int(row["read_inbox_max_id"]),
+            "read_outbox_max_id": int(row["read_outbox_max_id"]),
             "unread_count": int(row["unread_count"]),
+            "direct_user_id": (
+                int(row["user_high_id"])
+                if row["user_low_id"] is not None and int(row["user_low_id"]) == user_id
+                else int(row["user_low_id"])
+                if row["user_low_id"] is not None
+                else None
+            ),
             "draft_text": row["draft_text"],
             "updated_at": int(row["updated_at"]),
         }

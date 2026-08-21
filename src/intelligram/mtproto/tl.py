@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
-from typing import Iterable
+from typing import Any, Iterable
 
 
 VECTOR_CONSTRUCTOR = 0x1CB5C415
@@ -20,6 +20,63 @@ PING_CONSTRUCTOR = 0x7ABE77EC
 MSGS_ACK_CONSTRUCTOR = 0x62D6B459
 NEW_SESSION_CREATED_CONSTRUCTOR = 0x9EC20908
 BAD_SERVER_SALT_CONSTRUCTOR = 0xEDAB447B
+BOOL_TRUE_CONSTRUCTOR = 0x997275B5
+BOOL_FALSE_CONSTRUCTOR = 0xBC799737
+INVOKE_WITH_LAYER_CONSTRUCTOR = 0xDA9B0D0D
+INIT_CONNECTION_CONSTRUCTOR = 0xC1CD5EA9
+HELP_GET_CONFIG_CONSTRUCTOR = 0xC4F9186B
+CONFIG_CONSTRUCTOR = 0xCC1A241E
+DC_OPTION_CONSTRUCTOR = 0x18B7A10D
+AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR = 0xB7E085FE
+AUTH_IMPORT_LOGIN_TOKEN_CONSTRUCTOR = 0x95AC5CE4
+AUTH_LOGIN_TOKEN_CONSTRUCTOR = 0x629F1980
+UPDATES_GET_STATE_CONSTRUCTOR = 0xEDD4882A
+UPDATES_STATE_CONSTRUCTOR = 0xA56C2A3E
+AUTH_SEND_CODE_CONSTRUCTOR = 0xA677244F
+AUTH_SIGN_IN_CONSTRUCTOR = 0x8D52A951
+AUTH_SIGN_UP_CONSTRUCTOR = 0xAAC7B717
+AUTH_SENT_CODE_CONSTRUCTOR = 0x5E002502
+AUTH_SENT_CODE_SUCCESS_CONSTRUCTOR = 0x2390FE44
+AUTH_SENT_CODE_TYPE_APP_CONSTRUCTOR = 0x3DBB5986
+AUTH_AUTHORIZATION_SIGN_UP_REQUIRED_CONSTRUCTOR = 0x44747E9A
+AUTH_AUTHORIZATION_CONSTRUCTOR = 0x2EA2C0D4
+USER_EMPTY_CONSTRUCTOR = 0xD3BC4B7A
+USER_CONSTRUCTOR = 0xB1B8CC83
+USER_STATUS_EMPTY_CONSTRUCTOR = 0x09D05049
+PEER_USER_CONSTRUCTOR = 0x59511722
+PEER_CHAT_CONSTRUCTOR = 0x36C6019A
+INPUT_PEER_EMPTY_CONSTRUCTOR = 0x7F3B18EA
+INPUT_PEER_SELF_CONSTRUCTOR = 0x7DA07EC9
+INPUT_PEER_USER_CONSTRUCTOR = 0xDDE8A54C
+INPUT_PEER_CHAT_CONSTRUCTOR = 0x35A95CB9
+INPUT_USER_SELF_CONSTRUCTOR = 0xF7C1B13F
+INPUT_USER_CONSTRUCTOR = 0xF210AAE0
+INPUT_DIALOG_PEER_CONSTRUCTOR = 0xFCAAFEB7
+MESSAGE_CONSTRUCTOR = 0x75F3F635
+DIALOG_CONSTRUCTOR = 0xFC89F7F3
+PEER_NOTIFY_SETTINGS_CONSTRUCTOR = 0x99622C0C
+PEER_SETTINGS_CONSTRUCTOR = 0xF47741F7
+CONTACT_CONSTRUCTOR = 0x145ADE0B
+CONTACTS_CONTACTS_CONSTRUCTOR = 0xEAE87E42
+MESSAGES_DIALOGS_CONSTRUCTOR = 0x15BA6C40
+MESSAGES_MESSAGES_CONSTRUCTOR = 0x1D73E7EA
+MESSAGES_PEER_DIALOGS_CONSTRUCTOR = 0x3371C354
+USER_FULL_CONSTRUCTOR = 0x06CBC1E5
+USERS_USER_FULL_CONSTRUCTOR = 0x3B6D152E
+UPDATE_NEW_MESSAGE_CONSTRUCTOR = 0x1F2B0AFD
+UPDATE_MESSAGE_ID_CONSTRUCTOR = 0x4E90BFD6
+UPDATES_CONSTRUCTOR = 0x74AE4240
+USERS_GET_USERS_CONSTRUCTOR = 0x0D91A548
+USERS_GET_FULL_USER_CONSTRUCTOR = 0xB60F5918
+CONTACTS_GET_CONTACTS_CONSTRUCTOR = 0x5DD69E12
+MESSAGES_GET_DIALOGS_CONSTRUCTOR = 0xA0F4CB4F
+MESSAGES_GET_HISTORY_CONSTRUCTOR = 0x4423E6C5
+MESSAGES_SEND_MESSAGE_CONSTRUCTOR = 0xFEF48F62
+MESSAGES_GET_PEER_DIALOGS_CONSTRUCTOR = 0xE470BCFD
+ACCOUNT_UPDATE_STATUS_CONSTRUCTOR = 0x6628562C
+ACCOUNT_GET_PRIVACY_CONSTRUCTOR = 0xDADBC950
+PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR = 0x65427B82
+ACCOUNT_PRIVACY_RULES_CONSTRUCTOR = 0x50A04E45
 
 
 class TLDecodeError(ValueError):
@@ -30,7 +87,7 @@ class TLDecodeError(ValueError):
 class TLRequest:
     constructor_id: int
     name: str
-    fields: dict[str, int | list[int]]
+    fields: dict[str, Any]
 
 
 class TLReader:
@@ -89,12 +146,15 @@ class TLReader:
         return value
 
     def vector_longs(self) -> list[int]:
+        return [self.int64() for _ in range(self.vector_count())]
+
+    def vector_count(self) -> int:
         if self.uint32() != VECTOR_CONSTRUCTOR:
             raise TLDecodeError("Expected a Vector constructor")
         count = self.int32()
         if count < 0 or count > 8192:
             raise TLDecodeError("Vector length is invalid")
-        return [self.int64() for _ in range(count)]
+        return count
 
     def _require(self, length: int) -> None:
         if length < 0 or self.remaining < length:
@@ -133,6 +193,65 @@ def encode_vector_longs(values: Iterable[int]) -> bytes:
     return encode_uint32(VECTOR_CONSTRUCTOR) + encode_int32(len(sequence)) + b"".join(encode_int64(value) for value in sequence)
 
 
+def unwrap_client_query(data: bytes) -> bytes:
+    """Strip Telegram Web A's standard invokeWithLayer/initConnection wrappers."""
+    reader = TLReader(data)
+    constructor_id = reader.uint32()
+    if constructor_id == INVOKE_WITH_LAYER_CONSTRUCTOR:
+        reader.int32()  # layer
+        return unwrap_client_query(reader.raw_bytes(reader.remaining))
+    if constructor_id == INIT_CONNECTION_CONSTRUCTOR:
+        flags = reader.uint32()
+        reader.int32()  # api_id
+        for _ in range(6):
+            reader.bytes()  # device/app/language metadata
+        if flags:
+            # The imported client currently supplies no proxy or JSON params.
+            # Refuse unknown optional wrapper values rather than desynchronizing.
+            raise TLDecodeError("Unsupported initConnection optional fields")
+        return unwrap_client_query(reader.raw_bytes(reader.remaining))
+    return data
+
+
+def _read_input_peer(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_PEER_EMPTY_CONSTRUCTOR:
+        return {"kind": "empty"}
+    if constructor_id == INPUT_PEER_SELF_CONSTRUCTOR:
+        return {"kind": "self"}
+    if constructor_id == INPUT_PEER_USER_CONSTRUCTOR:
+        return {
+            "kind": "user",
+            "user_id": reader.int64(),
+            "access_hash": reader.int64(),
+        }
+    if constructor_id == INPUT_PEER_CHAT_CONSTRUCTOR:
+        return {"kind": "chat", "chat_id": reader.int64()}
+    raise TLDecodeError(f"Unsupported InputPeer constructor: 0x{constructor_id:08x}")
+
+
+def _read_input_user(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_USER_SELF_CONSTRUCTOR:
+        return {"kind": "self"}
+    if constructor_id == INPUT_USER_CONSTRUCTOR:
+        return {
+            "kind": "user",
+            "user_id": reader.int64(),
+            "access_hash": reader.int64(),
+        }
+    raise TLDecodeError(f"Unsupported InputUser constructor: 0x{constructor_id:08x}")
+
+
+def _read_bool(reader: TLReader) -> bool:
+    constructor_id = reader.uint32()
+    if constructor_id == BOOL_TRUE_CONSTRUCTOR:
+        return True
+    if constructor_id == BOOL_FALSE_CONSTRUCTOR:
+        return False
+    raise TLDecodeError("Expected a Bool constructor")
+
+
 def parse_request(data: bytes) -> TLRequest:
     reader = TLReader(data)
     constructor_id = reader.uint32()
@@ -140,6 +259,108 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "ping", {"ping_id": reader.int64()})
     elif constructor_id == MSGS_ACK_CONSTRUCTOR:
         request = TLRequest(constructor_id, "msgs_ack", {"msg_ids": reader.vector_longs()})
+    elif constructor_id == HELP_GET_CONFIG_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "help_get_config", {})
+    elif constructor_id == AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "auth_export_login_token", {
+            "api_id": reader.int32(),
+            "api_hash": reader.bytes().decode("utf-8"),
+            "except_ids": reader.vector_longs(),
+        })
+    elif constructor_id == AUTH_IMPORT_LOGIN_TOKEN_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "auth_import_login_token", {"token": reader.bytes()})
+    elif constructor_id == UPDATES_GET_STATE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "updates_get_state", {})
+    elif constructor_id == AUTH_SEND_CODE_CONSTRUCTOR:
+        phone_number = reader.bytes().decode("utf-8")
+        api_id = reader.int32()
+        api_hash = reader.bytes().decode("utf-8")
+        reader.uint32()  # codeSettings constructor
+        settings_flags = reader.uint32()
+        if settings_flags:
+            raise TLDecodeError("Unsupported codeSettings optional fields")
+        request = TLRequest(constructor_id, "auth_send_code", {
+            "phone_number": phone_number,
+            "api_id": api_id,
+            "api_hash": api_hash,
+        })
+    elif constructor_id == AUTH_SIGN_IN_CONSTRUCTOR:
+        flags = reader.uint32()
+        phone_number = reader.bytes().decode("utf-8")
+        phone_code_hash = reader.bytes().decode("utf-8")
+        phone_code = reader.bytes().decode("utf-8") if flags & 1 else ""
+        if flags & ~1:
+            raise TLDecodeError("Unsupported auth.signIn optional fields")
+        request = TLRequest(constructor_id, "auth_sign_in", {
+            "phone_number": phone_number,
+            "phone_code_hash": phone_code_hash,
+            "phone_code": phone_code,
+        })
+    elif constructor_id == AUTH_SIGN_UP_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~1:
+            raise TLDecodeError("Unsupported auth.signUp optional fields")
+        request = TLRequest(constructor_id, "auth_sign_up", {
+            "phone_number": reader.bytes().decode("utf-8"),
+            "phone_code_hash": reader.bytes().decode("utf-8"),
+            "first_name": reader.bytes().decode("utf-8"),
+            "last_name": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == USERS_GET_USERS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "users_get_users", {
+            "users": [_read_input_user(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == USERS_GET_FULL_USER_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "users_get_full_user", {"user": _read_input_user(reader)})
+    elif constructor_id == CONTACTS_GET_CONTACTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "contacts_get_contacts", {"hash": reader.int64()})
+    elif constructor_id == MESSAGES_GET_DIALOGS_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b11:
+            raise TLDecodeError("Unsupported messages.getDialogs optional fields")
+        request = TLRequest(constructor_id, "messages_get_dialogs", {
+            "exclude_pinned": bool(flags & 1),
+            "folder_id": reader.int32() if flags & 2 else None,
+            "offset_date": reader.int32(),
+            "offset_id": reader.int32(),
+            "offset_peer": _read_input_peer(reader),
+            "limit": reader.int32(),
+            "hash": reader.int64(),
+        })
+    elif constructor_id == MESSAGES_GET_HISTORY_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_history", {
+            "peer": _read_input_peer(reader),
+            "offset_id": reader.int32(),
+            "offset_date": reader.int32(),
+            "add_offset": reader.int32(),
+            "limit": reader.int32(),
+            "max_id": reader.int32(),
+            "min_id": reader.int32(),
+            "hash": reader.int64(),
+        })
+    elif constructor_id == MESSAGES_SEND_MESSAGE_CONSTRUCTOR:
+        flags = reader.uint32()
+        supported_boolean_flags = (1 << 1) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 19)
+        if flags & ~supported_boolean_flags:
+            raise TLDecodeError("Unsupported messages.sendMessage optional fields")
+        request = TLRequest(constructor_id, "messages_send_message", {
+            "peer": _read_input_peer(reader),
+            "message": reader.bytes().decode("utf-8"),
+            "random_id": reader.int64(),
+            "silent": bool(flags & (1 << 5)),
+        })
+    elif constructor_id == MESSAGES_GET_PEER_DIALOGS_CONSTRUCTOR:
+        peers: list[dict[str, Any]] = []
+        for _ in range(reader.vector_count()):
+            if reader.uint32() != INPUT_DIALOG_PEER_CONSTRUCTOR:
+                raise TLDecodeError("Expected an inputDialogPeer constructor")
+            peers.append(_read_input_peer(reader))
+        request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
+    elif constructor_id == ACCOUNT_UPDATE_STATUS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "account_update_status", {"offline": _read_bool(reader)})
+    elif constructor_id == ACCOUNT_GET_PRIVACY_CONSTRUCTOR:
+        reader.uint32()  # InputPrivacyKey constructor; all current variants have no fields.
+        request = TLRequest(constructor_id, "account_get_privacy", {})
     else:
         raise TLDecodeError(f"Unsupported TL constructor: 0x{constructor_id:08x}")
     if reader.remaining:
@@ -149,6 +370,288 @@ def parse_request(data: bytes) -> TLRequest:
 
 def encode_pong(*, message_id: int, ping_id: int) -> bytes:
     return encode_uint32(PONG_CONSTRUCTOR) + encode_int64(message_id) + encode_int64(ping_id)
+
+
+def encode_bool(value: bool) -> bytes:
+    return encode_uint32(BOOL_TRUE_CONSTRUCTOR if value else BOOL_FALSE_CONSTRUCTOR)
+
+
+def encode_vector(values: Iterable[bytes]) -> bytes:
+    sequence = list(values)
+    return encode_uint32(VECTOR_CONSTRUCTOR) + encode_int32(len(sequence)) + b"".join(sequence)
+
+
+def encode_dc_option(*, dc_id: int, host: str, port: int) -> bytes:
+    return (
+        encode_uint32(DC_OPTION_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(dc_id)
+        + encode_tl_string(host)
+        + encode_int32(port)
+    )
+
+
+def encode_config(*, dc_id: int, host: str, port: int, date: int, expires: int) -> bytes:
+    # `config` has many mandatory scalar fields. These conservative self-hosted
+    # limits deliberately disable Telegram-specific optional capabilities.
+    scalar_limits = [
+        200, 200_000, 100, 30_000, 5_000, 30_000, 60_000, 1_000, 1_000,
+        60_000, 100, 172_800, 172_800, 172_800, 2_416_000, 20, 86_400,
+    ]
+    call_timeouts = [15_000, 15_000, 20_000, 15_000]
+    return (
+        encode_uint32(CONFIG_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(date)
+        + encode_int32(expires)
+        + encode_bool(False)
+        + encode_int32(dc_id)
+        + encode_vector([encode_dc_option(dc_id=dc_id, host=host, port=port)])
+        + encode_tl_string("")
+        + b"".join(encode_int32(value) for value in scalar_limits)
+        + b"".join(encode_int32(value) for value in call_timeouts)
+        + encode_tl_string("")
+        + encode_int32(1_024)
+        + encode_int32(4_096)
+        + encode_int32(dc_id)
+    )
+
+
+def encode_auth_login_token(*, expires: int, token: bytes) -> bytes:
+    return encode_uint32(AUTH_LOGIN_TOKEN_CONSTRUCTOR) + encode_int32(expires) + encode_tl_bytes(token)
+
+
+def encode_auth_sent_code(*, phone_code_hash: str, length: int = 6) -> bytes:
+    return (
+        encode_uint32(AUTH_SENT_CODE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(AUTH_SENT_CODE_TYPE_APP_CONSTRUCTOR)
+        + encode_int32(length)
+        + encode_tl_string(phone_code_hash)
+    )
+
+
+def encode_auth_authorization_sign_up_required() -> bytes:
+    return encode_uint32(AUTH_AUTHORIZATION_SIGN_UP_REQUIRED_CONSTRUCTOR) + encode_uint32(0)
+
+
+def encode_auth_sent_code_success_for_sign_up() -> bytes:
+    return encode_uint32(AUTH_SENT_CODE_SUCCESS_CONSTRUCTOR) + encode_auth_authorization_sign_up_required()
+
+
+def user_access_hash(user_id: int) -> int:
+    """Return a deterministic non-zero access hash for a self-hosted user."""
+
+    return (user_id << 32) | 1
+
+
+def encode_user_empty(*, user_id: int) -> bytes:
+    return encode_uint32(USER_EMPTY_CONSTRUCTOR) + encode_int64(user_id)
+
+
+def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contact: bool = False) -> bytes:
+    user_id = int(user["id"])
+    first_name = str(user.get("first_name") or "")
+    last_name = str(user.get("last_name") or "")
+    username = user.get("username")
+    phone = user.get("phone")
+    flags = 1  # access_hash
+    if first_name:
+        flags |= 1 << 1
+    if last_name:
+        flags |= 1 << 2
+    if username:
+        flags |= 1 << 3
+    if phone:
+        flags |= 1 << 4
+    if self_user_id == user_id:
+        flags |= 1 << 10
+    elif contact:
+        flags |= 1 << 11
+    result = (
+        encode_uint32(USER_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_uint32(0)  # flags2
+        + encode_int64(user_id)
+        + encode_int64(user_access_hash(user_id))
+    )
+    if flags & (1 << 1):
+        result += encode_tl_string(first_name)
+    if flags & (1 << 2):
+        result += encode_tl_string(last_name)
+    if flags & (1 << 3):
+        result += encode_tl_string(str(username))
+    if flags & (1 << 4):
+        result += encode_tl_string(str(phone))
+    return result
+
+
+def encode_peer_user(*, user_id: int) -> bytes:
+    return encode_uint32(PEER_USER_CONSTRUCTOR) + encode_int64(user_id)
+
+
+def encode_peer_chat(*, chat_id: int) -> bytes:
+    return encode_uint32(PEER_CHAT_CONSTRUCTOR) + encode_int64(chat_id)
+
+
+def encode_peer_notify_settings() -> bytes:
+    return encode_uint32(PEER_NOTIFY_SETTINGS_CONSTRUCTOR) + encode_uint32(0)
+
+
+def encode_peer_settings() -> bytes:
+    return encode_uint32(PEER_SETTINGS_CONSTRUCTOR) + encode_uint32(0)
+
+
+def encode_dialog(
+    *,
+    peer: bytes,
+    top_message_id: int,
+    read_inbox_max_id: int = 0,
+    read_outbox_max_id: int = 0,
+    unread_count: int = 0,
+    pinned: bool = False,
+) -> bytes:
+    flags = 1 << 2 if pinned else 0
+    return (
+        encode_uint32(DIALOG_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + peer
+        + encode_int32(top_message_id)
+        + encode_int32(read_inbox_max_id)
+        + encode_int32(read_outbox_max_id)
+        + encode_int32(unread_count)
+        + encode_int32(0)  # unread_mentions_count
+        + encode_int32(0)  # unread_reactions_count
+        + encode_int32(0)  # unread_poll_votes_count
+        + encode_peer_notify_settings()
+    )
+
+
+def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: bool) -> bytes:
+    flags = (1 << 8) | ((1 << 1) if outgoing else 0)
+    return (
+        encode_uint32(MESSAGE_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_uint32(0)  # flags2
+        + encode_int32(int(message["id"]))
+        + encode_peer_user(user_id=int(message["sender_user_id"]))
+        + recipient_peer
+        + encode_int32(int(message["sent_at"]))
+        + encode_tl_string(str(message["body"]))
+    )
+
+
+def encode_contact(*, user_id: int, mutual: bool = False) -> bytes:
+    return encode_uint32(CONTACT_CONSTRUCTOR) + encode_int64(user_id) + encode_bool(mutual)
+
+
+def encode_contacts_contacts(*, contacts: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return (
+        encode_uint32(CONTACTS_CONTACTS_CONSTRUCTOR)
+        + encode_vector(contacts)
+        + encode_int32(0)
+        + encode_vector(users)
+    )
+
+
+def encode_messages_dialogs(*, dialogs: Iterable[bytes], messages: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return (
+        encode_uint32(MESSAGES_DIALOGS_CONSTRUCTOR)
+        + encode_vector(dialogs)
+        + encode_vector(messages)
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
+
+
+def encode_messages_messages(*, messages: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+    return (
+        encode_uint32(MESSAGES_MESSAGES_CONSTRUCTOR)
+        + encode_vector(messages)
+        + encode_vector([])  # topics
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
+
+
+def encode_messages_peer_dialogs(
+    *, dialogs: Iterable[bytes], messages: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes],
+    pts: int, qts: int, date: int, seq: int, unread_count: int,
+) -> bytes:
+    return (
+        encode_uint32(MESSAGES_PEER_DIALOGS_CONSTRUCTOR)
+        + encode_vector(dialogs)
+        + encode_vector(messages)
+        + encode_vector(chats)
+        + encode_vector(users)
+        + encode_updates_state(pts=pts, qts=qts, date=date, seq=seq, unread_count=unread_count)
+    )
+
+
+def encode_users_user_full(*, user: dict[str, Any], self_user_id: int | None = None) -> bytes:
+    user_id = int(user["id"])
+    full_user = (
+        encode_uint32(USER_FULL_CONSTRUCTOR)
+        + encode_uint32(0)  # flags
+        + encode_uint32(0)  # flags2
+        + encode_int64(user_id)
+        + encode_peer_settings()
+        + encode_peer_notify_settings()
+        + encode_int32(0)  # common_chats_count
+    )
+    return (
+        encode_uint32(USERS_USER_FULL_CONSTRUCTOR)
+        + full_user
+        + encode_vector([])
+        + encode_vector([encode_user(user=user, self_user_id=self_user_id)])
+    )
+
+
+def encode_update_new_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
+    return encode_uint32(UPDATE_NEW_MESSAGE_CONSTRUCTOR) + message + encode_int32(pts) + encode_int32(pts_count)
+
+
+def encode_update_message_id(*, message_id: int, random_id: int) -> bytes:
+    return encode_uint32(UPDATE_MESSAGE_ID_CONSTRUCTOR) + encode_int32(message_id) + encode_int64(random_id)
+
+
+def encode_updates(*, updates: Iterable[bytes], users: Iterable[bytes], chats: Iterable[bytes], date: int, seq: int) -> bytes:
+    return (
+        encode_uint32(UPDATES_CONSTRUCTOR)
+        + encode_vector(updates)
+        + encode_vector(users)
+        + encode_vector(chats)
+        + encode_int32(date)
+        + encode_int32(seq)
+    )
+
+
+def encode_account_privacy_rules() -> bytes:
+    return (
+        encode_uint32(ACCOUNT_PRIVACY_RULES_CONSTRUCTOR)
+        + encode_vector([encode_uint32(PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR)])
+        + encode_vector([])
+        + encode_vector([])
+    )
+
+
+def encode_auth_authorization(*, user: dict[str, Any]) -> bytes:
+    return (
+        encode_uint32(AUTH_AUTHORIZATION_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_user(user=user, self_user_id=int(user["id"]))
+    )
+
+
+def encode_updates_state(*, pts: int, qts: int, date: int, seq: int, unread_count: int) -> bytes:
+    return (
+        encode_uint32(UPDATES_STATE_CONSTRUCTOR)
+        + encode_int32(pts)
+        + encode_int32(qts)
+        + encode_int32(date)
+        + encode_int32(seq)
+        + encode_int32(unread_count)
+    )
 
 
 def encode_rpc_error(*, code: int, message: str) -> bytes:
