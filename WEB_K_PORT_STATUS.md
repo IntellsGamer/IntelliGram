@@ -61,3 +61,7 @@ The clean browser completed the normal imported Web K interaction sequence: phon
 The next validation step is to inspect the live gateway’s request log for the authenticated Web K bootstrap methods and use it to prioritize the next compatibility handlers.
 
 The authenticated browser console shows no post-login TL parsing or runtime exception after the initial storage-reset messages, and the live Web K view remains stably mounted in the IntelliGram messaging shell. Gateway telemetry confirms the live client invoked `users.getFullUser`, `messages.getDialogs`, and `updates.getState`; the newly implemented handlers served those requests without a `METHOD_INVALID` response. The blank dialog list is expected for the just-created account.
+
+## Fresh environment regression check
+
+With the ignored client `.env` temporarily removed, the updated Web K client completed state loading and logged `Will mount auth page: authStateSignQr` rather than throwing `compareVersion(...).split` on an undefined version. The browser view was captured immediately after navigation while still visually white; a follow-up render check is required before declaring the fresh-start fix complete.
