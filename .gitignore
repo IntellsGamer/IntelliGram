@@ -16,7 +16,7 @@ htmlcov/
 
 # Node / Telegram Web A build outputs
 node_modules/
-dist/
+/dist/
 .cache/
 
 # Editor and OS metadata
