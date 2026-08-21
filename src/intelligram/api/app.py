@@ -80,6 +80,49 @@ class SendMessageRequest(BaseModel):
 
 
 @dataclass
+class MTProtoConnectionHub:
+    connections: dict[int, dict[WebSocket, MTProtoSessionAdapter]]
+    lock: asyncio.Lock
+
+    @classmethod
+    def create(cls) -> "MTProtoConnectionHub":
+        return cls(connections={}, lock=asyncio.Lock())
+
+    async def add(self, user_id: int, websocket: WebSocket, adapter: MTProtoSessionAdapter) -> None:
+        async with self.lock:
+            sessions = self.connections.setdefault(user_id, {})
+            sessions[websocket] = adapter
+
+    async def remove(self, websocket: WebSocket) -> None:
+        async with self.lock:
+            empty_users: list[int] = []
+            for user_id, sessions in self.connections.items():
+                retained = {candidate: adapter for candidate, adapter in sessions.items() if candidate is not websocket}
+                if retained:
+                    self.connections[user_id] = retained
+                else:
+                    empty_users.append(user_id)
+            for user_id in empty_users:
+                self.connections.pop(user_id, None)
+
+    async def publish(self, envelopes: list[UpdateEnvelope], *, exclude: WebSocket | None = None) -> None:
+        target_user_ids = {envelope.user_id for envelope in envelopes}
+        for user_id in target_user_ids:
+            async with self.lock:
+                sessions = list(self.connections.get(user_id, {}).items())
+            stale: list[WebSocket] = []
+            for websocket, adapter in sessions:
+                if websocket is exclude or adapter.user_id != user_id:
+                    continue
+                try:
+                    await websocket.send_bytes(encode_abridged_packet(adapter.encrypt_updates_too_long()))
+                except Exception:
+                    stale.append(websocket)
+            for websocket in stale:
+                await self.remove(websocket)
+
+
+@dataclass
 class ConnectionHub:
     connections: dict[int, set[WebSocket]]
     lock: asyncio.Lock
@@ -149,6 +192,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.mtproto_rsa_public_key_path,
     )
     hub = ConnectionHub.create()
+    mtproto_hub = MTProtoConnectionHub.create()
 
     app = FastAPI(
         title="IntelliGram Server",
@@ -168,6 +212,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.server_key_pair = server_key_pair
     app.state.hub = hub
+    app.state.mtproto_hub = mtproto_hub
     app.state.mtproto_auth_keys: dict[int, CompletedAuthKey] = restored_mtproto_auth_keys
 
     def current_user_id(authorization: str | None = Header(default=None)) -> int:
@@ -381,6 +426,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if settings.development_mode:
                     LOGGER.info("MTProto WebSocket received %d bytes", len(data))
                 for packet in frame_buffer.feed(data):
+                    pending_updates: list[object] = []
                     auth_key_id = struct.unpack_from("<Q", packet, 0)[0] if len(packet) >= 8 else None
                     if auth_key_id == 0:
                         response = handshake.handle_packet(packet)
@@ -418,12 +464,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             if binding is not None:
                                 adapter.user_id = int(binding["user_id"])
                             encrypted_sessions[auth_key_id] = adapter
-                        response = encrypted_sessions[auth_key_id].handle_encrypted(packet)
+                        adapter = encrypted_sessions[auth_key_id]
+                        response = adapter.handle_encrypted(packet)
+                        pending_updates = adapter.drain_pending_update_envelopes()
                     if response is not None:
                         encoded_response = encode_abridged_packet(response)
                         if settings.development_mode:
                             LOGGER.info("MTProto WebSocket sent %d bytes", len(encoded_response))
                         await websocket.send_bytes(encoded_response)
+                    if auth_key_id is not None and auth_key_id in encrypted_sessions:
+                        adapter = encrypted_sessions[auth_key_id]
+                        if adapter.user_id is not None:
+                            await mtproto_hub.add(adapter.user_id, websocket, adapter)
+                    if auth_key_id is not None and auth_key_id in encrypted_sessions and pending_updates:
+                        await mtproto_hub.publish(pending_updates, exclude=websocket)
         except WebSocketDisconnect:
             pass
         except (PlainHandshakeError, MTProtoSecurityError, TransportError) as exc:
@@ -432,6 +486,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             LOGGER.exception("MTProto WebSocket unexpected failure")
             await websocket.close(code=1011)
+        finally:
+            await mtproto_hub.remove(websocket)
 
     @app.websocket("/v1/realtime")
     async def realtime(websocket: WebSocket, token: str = Query(...)) -> None:

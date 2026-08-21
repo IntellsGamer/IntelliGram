@@ -126,6 +126,7 @@ MESSAGES_EDIT_MESSAGE_CONSTRUCTOR = 0xB107A14C
 MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR = 0x13704A7C
 UPDATE_DELETE_MESSAGES_CONSTRUCTOR = 0xA20DB0E5
 UPDATE_EDIT_MESSAGE_CONSTRUCTOR = 0xE40370A3
+UPDATES_TOO_LONG_CONSTRUCTOR = 0xE317AF7E
 
 
 class TLDecodeError(ValueError):
@@ -1024,6 +1025,10 @@ def encode_update_read_history_inbox(
 
 def encode_update_message_id(*, message_id: int, random_id: int) -> bytes:
     return encode_uint32(UPDATE_MESSAGE_ID_CONSTRUCTOR) + encode_int32(message_id) + encode_int64(random_id)
+
+
+def encode_updates_too_long() -> bytes:
+    return encode_uint32(UPDATES_TOO_LONG_CONSTRUCTOR)
 
 
 def encode_updates(*, updates: Iterable[bytes], users: Iterable[bytes], chats: Iterable[bytes], date: int, seq: int) -> bytes:

@@ -90,6 +90,7 @@ from intelligram.mtproto.tl import (
     encode_rpc_error,
     encode_rpc_result,
     encode_updates_state,
+    encode_updates_too_long,
     encode_vector,
     parse_request,
     unwrap_client_query,
@@ -114,6 +115,12 @@ class MTProtoSessionAdapter:
     login_tokens: dict[bytes, int] = field(default_factory=dict)
     database: Database | None = None
     user_id: int | None = None
+    pending_update_envelopes: list[object] = field(default_factory=list)
+
+    def drain_pending_update_envelopes(self) -> list[object]:
+        envelopes = self.pending_update_envelopes
+        self.pending_update_envelopes = []
+        return envelopes
 
     def handle_encrypted(self, envelope: bytes) -> bytes | None:
         message = decrypt_client_message(auth_key=self.auth_key, envelope=envelope)
@@ -1465,6 +1472,7 @@ class MTProtoSessionAdapter:
                     body=body,
                     client_random_id=str(random_id),
                 )
+                self.pending_update_envelopes.extend(emitted)
                 sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
                 if sender_update is None:
                     raise RuntimeError("Sender update was not emitted")
@@ -1523,6 +1531,12 @@ class MTProtoSessionAdapter:
                 """,
                 (key_id, user_id, f"mtproto:{key_id}", self.auth_key, str(self.server_salt), now),
             )
+
+    def encrypt_updates_too_long(self) -> bytes:
+        """Build a server-initiated update signal for this authenticated session."""
+        if self.user_id is None:
+            raise MTProtoSecurityError("AUTH_KEY_UNREGISTERED")
+        return self._encrypt_response(encode_updates_too_long())
 
     def _encrypt_result(self, request: EncryptedMessage, result: bytes) -> bytes:
         response_body = encode_rpc_result(request_message_id=request.msg_id, result=result)
