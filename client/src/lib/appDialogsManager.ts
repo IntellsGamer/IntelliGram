@@ -1115,6 +1115,22 @@ export class AppDialogsManager {
         )
       ].filter(Boolean);
 
+      // Virtual-list key lookup can miss a visible row (string/number peer ids,
+      // community projection). Fall back to the rendered chatlist so the
+      // selected channel or group still highlights.
+      const chatList = this.xd?.sortedList?.list;
+      if(!dialogElements.length && chatList) {
+        const listEl = chatList.querySelector<HTMLElement>(
+          `${DIALOG_LIST_ELEMENT_TAG}[data-peer-id="${peerId}"]`
+        );
+        const fallback = (listEl as any)?.dialogElement as DialogElement | undefined;
+        if(fallback) {
+          dialogElements.push(fallback);
+        } else if(listEl) {
+          this.setDialogActive(listEl, true);
+        }
+      }
+
       dialogElements.forEach(dialogElement => {
         const element = dialogElement?.dom?.listEl;
         if(!element) return;

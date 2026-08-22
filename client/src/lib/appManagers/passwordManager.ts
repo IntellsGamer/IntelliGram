@@ -72,10 +72,9 @@ export class PasswordManager extends AppManager {
   }
 
   public check(password: string, state: AccountPassword, options: any = {}) {
-    return this.getInputCheckPassword(password, state).then((inputCheckPassword) => {
-      // console.log('SRP', inputCheckPassword);
+    const checkWith = (inputCheckPassword: InputCheckPasswordSRP.inputCheckPasswordSRP) => {
       return this.apiManager.invokeApi('auth.checkPassword', {
-        password: inputCheckPassword as InputCheckPasswordSRP.inputCheckPasswordSRP
+        password: inputCheckPassword
       }, options).then((auth) => {
         if(auth._ === 'auth.authorization') {
           this.apiManager.setUser(auth.user);
@@ -83,6 +82,22 @@ export class PasswordManager extends AppManager {
 
         return auth;
       });
+    };
+
+    // Scrypt-only IntelliGram accounts cannot issue SRP material. The server
+    // advertises srp_id=0 and accepts the UTF-8 password inside A.
+    if(!state.srp_id) {
+      const encoded = new TextEncoder().encode(password);
+      return checkWith({
+        _: 'inputCheckPasswordSRP',
+        srp_id: 0,
+        A: encoded,
+        M1: new Uint8Array(32)
+      });
+    }
+
+    return this.getInputCheckPassword(password, state).then((inputCheckPassword) => {
+      return checkWith(inputCheckPassword as InputCheckPasswordSRP.inputCheckPasswordSRP);
     });
   }
 

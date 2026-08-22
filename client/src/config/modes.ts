@@ -7,6 +7,9 @@
 
 import type {TransportType} from '@lib/mtproto/dcConfigurator';
 
+const insecureHttp = location.protocol === 'http:' &&
+  !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+
 const Modes = {
   test: location.search.indexOf('test=1') > 0/*  || true */,
   debug: location.search.indexOf('debug=1') > 0,
@@ -15,7 +18,8 @@ const Modes = {
   asServiceWorker: !!import.meta.env.VITE_MTPROTO_SW,
   transport: 'websocket' as TransportType,
   noSharedWorker: location.search.indexOf('noSharedWorker=1') > 0,
-  noServiceWorker: location.search.indexOf('noServiceWorker=1') > 0,
+  // Service Workers require a secure context. LAN HTTP would throw on register.
+  noServiceWorker: location.search.indexOf('noServiceWorker=1') > 0 || insecureHttp,
   noOffscreenCanvas: location.search.indexOf('noOffscreenCanvas=1') > 0,
   // Kill switch for the SHARED object-URL lifecycle: with it on, worker-minted
   // blob URLs are never evicted from the caches, never revoked, and pins are

@@ -20,6 +20,7 @@ from intelligram.services.accounts import (
     AccountAuthError,
     begin_password_login,
     complete_device_login,
+    complete_password_plaintext_login,
     complete_password_srp_login,
     get_password_srp_state,
     normalize_phone,
@@ -30,6 +31,7 @@ from intelligram.services.messaging import (
     MessagingError,
     add_chat_user,
     create_group,
+    create_channel,
     check_channel_username,
     deactivate_all_channel_usernames,
     delete_chat_user,
@@ -42,6 +44,7 @@ from intelligram.services.messaging import (
     edit_chat_title,
     edit_peer_default_banned_rights,
     export_chat_invite,
+    ensure_permanent_exported_invite,
     ensure_dialog_anchor_message,
     get_dialogs,
     get_channel_details,
@@ -49,6 +52,11 @@ from intelligram.services.messaging import (
     list_exported_chat_invites,
     get_or_create_direct_peer,
     get_peer,
+    invite_to_channel,
+    join_channel,
+    leave_channel,
+    delete_channel,
+    lookup_exported_invite,
     migrate_chat_to_channel,
     forward_messages,
     set_channel_noforwards,
@@ -118,13 +126,28 @@ from intelligram.mtproto.tl import (
     encode_updates_difference_empty,
     encode_upload_file,
     encode_update_message_id,
+    encode_emoji_keywords_difference,
+    encode_message_media,
+    encode_messages_all_stickers_not_modified,
+    encode_messages_emoji_groups_not_modified,
+    encode_messages_sticker_set_not_modified,
+    encode_update_new_channel_message,
     encode_update_new_message,
     encode_update_read_history_inbox,
     encode_update_channel,
     encode_update_chat_default_banned_rights,
     encode_update_chat_participants,
     encode_update_delete_messages,
+    encode_update_edit_channel_message,
     encode_update_edit_message,
+    encode_channel_participant,
+    encode_channels_channel_participant,
+    encode_channels_channel_participants,
+    encode_chat_invite,
+    encode_messages_chat_admins_with_invites,
+    encode_messages_chat_invite_importers,
+    encode_messages_chat_invite_join_result_ok,
+    encode_updates_channel_difference_empty,
     encode_user,
     encode_users_user_full,
     encode_pong,
@@ -244,6 +267,21 @@ class MTProtoSessionAdapter:
                 client_A=bytes(request.fields["A"]),
                 client_M1=bytes(request.fields["M1"]),
             )
+        if request.name == "messages_send_media":
+            return self._handle_messages_send_media(
+                message,
+                peer=request.fields["peer"],
+                body=str(request.fields["message"]),
+                random_id=int(request.fields["random_id"]),
+                reply_to=request.fields["reply_to"],
+                media=request.fields["media"],
+            )
+        if request.name == "messages_upload_media":
+            return self._handle_messages_upload_media(
+                message,
+                peer=request.fields["peer"],
+                media=request.fields["media"],
+            )
         if request.name == "auth_sign_up":
             return self._handle_auth_sign_up(
                 message,
@@ -294,6 +332,57 @@ class MTProtoSessionAdapter:
             return self._handle_channels_get_channels(message, channels=request.fields["channels"])
         if request.name == "channels_get_full_channel":
             return self._handle_channels_get_full_channel(message, channel=request.fields["channel"])
+        if request.name == "channels_create_channel":
+            return self._handle_channels_create_channel(
+                message,
+                title=str(request.fields["title"]),
+                about=str(request.fields["about"]),
+                broadcast=bool(request.fields["broadcast"]),
+                megagroup=bool(request.fields["megagroup"]),
+            )
+        if request.name == "channels_invite_to_channel":
+            return self._handle_channels_invite_to_channel(
+                message, channel=request.fields["channel"], users=request.fields["users"]
+            )
+        if request.name == "channels_get_participants":
+            return self._handle_channels_get_participants(
+                message,
+                channel=request.fields["channel"],
+                offset=int(request.fields["offset"]),
+                limit=int(request.fields["limit"]),
+            )
+        if request.name == "channels_get_participant":
+            return self._handle_channels_get_participant(
+                message, channel=request.fields["channel"], participant=request.fields["participant"]
+            )
+        if request.name == "channels_edit_title":
+            return self._handle_channels_edit_title(
+                message, channel=request.fields["channel"], title=str(request.fields["title"])
+            )
+        if request.name == "channels_edit_photo":
+            return self._handle_channels_edit_photo(message, channel=request.fields["channel"])
+        if request.name == "channels_delete_channel":
+            return self._handle_channels_delete_channel(message, channel=request.fields["channel"])
+        if request.name == "channels_join_channel":
+            return self._handle_channels_join_channel(message, channel=request.fields["channel"])
+        if request.name == "channels_leave_channel":
+            return self._handle_channels_leave_channel(message, channel=request.fields["channel"])
+        if request.name == "updates_get_channel_difference":
+            return self._handle_updates_get_channel_difference(
+                message, channel=request.fields["channel"], pts=int(request.fields["pts"])
+            )
+        if request.name == "messages_get_exported_chat_invite":
+            return self._handle_messages_get_exported_chat_invite(
+                message, peer=request.fields["peer"], link=str(request.fields["link"])
+            )
+        if request.name == "messages_check_chat_invite":
+            return self._handle_messages_check_chat_invite(message, invite_hash=str(request.fields["hash"]))
+        if request.name == "messages_import_chat_invite":
+            return self._handle_messages_import_chat_invite(message, invite_hash=str(request.fields["hash"]))
+        if request.name == "messages_get_admins_with_invites":
+            return self._encrypt_result(message, encode_messages_chat_admins_with_invites())
+        if request.name == "messages_get_chat_invite_importers":
+            return self._encrypt_result(message, encode_messages_chat_invite_importers())
         if request.name == "channels_check_username":
             return self._handle_channels_check_username(
                 message, channel=request.fields["channel"], username=str(request.fields["username"])
@@ -426,6 +515,25 @@ class MTProtoSessionAdapter:
                 message,
                 encode_messages_available_reactions(hash_value=int(request.fields["hash"])),
             )
+        if request.name in {
+            "messages_get_emoji_groups",
+            "messages_get_emoji_status_groups",
+            "messages_get_emoji_profile_photo_groups",
+        }:
+            return self._encrypt_result(message, encode_messages_emoji_groups_not_modified())
+        if request.name in {"messages_get_all_stickers", "messages_get_emoji_stickers"}:
+            return self._encrypt_result(message, encode_messages_all_stickers_not_modified())
+        if request.name == "messages_get_sticker_set":
+            return self._encrypt_result(message, encode_messages_sticker_set_not_modified())
+        if request.name == "messages_get_emoji_keywords_difference":
+            return self._encrypt_result(
+                message,
+                encode_emoji_keywords_difference(
+                    lang_code=str(request.fields["lang_code"]),
+                    from_version=int(request.fields["from_version"]),
+                    version=int(request.fields["from_version"]),
+                ),
+            )
         if request.name == "communities_get_joined_communities":
             return self._encrypt_result(message, encode_messages_chats())
         if request.name == "auth_log_out":
@@ -550,11 +658,18 @@ class MTProtoSessionAdapter:
                                 recipient_peer=self._encode_peer(summary),
                                 outgoing=bool(envelope.payload.get("is_outgoing")),
                             )
-                            other_updates.append(
-                                encode_update_edit_message(
-                                    message=encoded, pts=envelope.pts, pts_count=envelope.pts_count
+                            if str(summary.get("kind")) == "channel":
+                                other_updates.append(
+                                    encode_update_edit_channel_message(
+                                        message=encoded, pts=envelope.pts, pts_count=envelope.pts_count
+                                    )
                                 )
-                            )
+                            else:
+                                other_updates.append(
+                                    encode_update_edit_message(
+                                        message=encoded, pts=envelope.pts, pts_count=envelope.pts_count
+                                    )
+                                )
                             user_ids.add(int(stored["sender_user_id"]))
                             if summary.get("direct_user_id") is not None:
                                 user_ids.add(int(summary["direct_user_id"]))
@@ -675,14 +790,26 @@ class MTProtoSessionAdapter:
         issued = None
         with self.database.transaction(immediate=True) as connection:
             try:
-                issued = complete_password_srp_login(
-                    connection,
-                    auth_key_id=str(auth_key_id(self.auth_key)),
-                    srp_id=srp_id,
-                    client_A=client_A,
-                    client_M1=client_M1,
-                    device_label="IntelliGram Web K MTProto password fallback",
-                )
+                if srp_id == 0:
+                    # PasswordCard fallback for scrypt-only accounts: A carries
+                    # the UTF-8 password inside the encrypted MTProto envelope.
+                    issued = complete_password_plaintext_login(
+                        connection,
+                        auth_key_id=str(auth_key_id(self.auth_key)),
+                        password=client_A.decode("utf-8"),
+                        device_label="IntelliGram Web K MTProto password fallback",
+                    )
+                else:
+                    issued = complete_password_srp_login(
+                        connection,
+                        auth_key_id=str(auth_key_id(self.auth_key)),
+                        srp_id=srp_id,
+                        client_A=client_A,
+                        client_M1=client_M1,
+                        device_label="IntelliGram Web K MTProto password fallback",
+                    )
+            except UnicodeDecodeError:
+                error = "PASSWORD_HASH_INVALID"
             except AccountAuthError as exc:
                 # Deliberately stay inside the transaction so failed-attempt
                 # accounting and one-time invalidation are committed.
@@ -776,14 +903,41 @@ class MTProtoSessionAdapter:
         return dict(row)
 
     @staticmethod
-    def _message_from_row(row: object) -> dict[str, object]:
+    def _load_row_media(connection: object, message_id: int) -> dict[str, object] | None:
+        row = connection.execute(
+            """
+            SELECT file_id, kind, filename, mime_type, size, created_at
+            FROM message_media WHERE message_id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return None
         return {
+            "kind": str(row["kind"]),
+            "file_id": int(row["file_id"]),
+            "filename": str(row["filename"]),
+            "mime_type": str(row["mime_type"]),
+            "size": int(row["size"]),
+            "date": int(row["created_at"]),
+        }
+
+    @staticmethod
+    def _message_from_row(row: object, connection: object | None = None) -> dict[str, object]:
+        message = {
             "id": int(row["id"]),
             "peer_id": int(row["peer_id"]),
             "sender_user_id": int(row["sender_user_id"]),
             "body": str(row["body"]),
             "sent_at": int(row["sent_at"]),
         }
+        if "edited_at" in row.keys() and row["edited_at"] is not None:
+            message["edited_at"] = int(row["edited_at"])
+        if connection is not None:
+            media = MTProtoSessionAdapter._load_row_media(connection, int(row["id"]))
+            if media is not None:
+                message["media"] = media
+        return message
 
     def _load_users(self, connection: object, user_ids: set[int]) -> dict[int, dict[str, object]]:
         if not user_ids:
@@ -839,13 +993,14 @@ class MTProtoSessionAdapter:
                    COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds,
                    COALESCE(cs.noforwards, 0) AS noforwards,
                    COALESCE(cs.join_request_enabled, 0) AS join_request_enabled,
+                   COALESCE(cs.is_broadcast, 0) AS is_broadcast,
                    pp.default_banned_rights_flags
             FROM peers p
             JOIN peer_memberships pm ON pm.peer_id = p.id AND pm.left_at IS NULL
             LEFT JOIN channel_settings cs ON cs.peer_id = p.id
             LEFT JOIN peer_permissions pp ON pp.peer_id = p.id
             WHERE p.kind IN ('chat', 'channel') AND p.id IN ({placeholders})
-            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, cs.join_request_enabled, pp.default_banned_rights_flags
+            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, cs.join_request_enabled, cs.is_broadcast, pp.default_banned_rights_flags
             ORDER BY p.id
             """,
             sorted(chat_ids),
@@ -861,6 +1016,7 @@ class MTProtoSessionAdapter:
                 slowmode_enabled=bool(int(row["slowmode_seconds"])),
                 noforwards=bool(int(row["noforwards"])),
                 join_request_enabled=bool(int(row["join_request_enabled"])),
+                broadcast=bool(int(row["is_broadcast"])),
                 default_banned_rights_flags=(
                     int(row["default_banned_rights_flags"])
                     if row["default_banned_rights_flags"] is not None else None
@@ -915,24 +1071,28 @@ class MTProtoSessionAdapter:
         if isinstance(authenticated, bytes):
             return authenticated
         database, _self_user_id = authenticated
-        if not isinstance(location, dict) or location.get("kind") != "photo":
+        if not isinstance(location, dict) or location.get("kind") not in {"photo", "document"}:
             return self._encrypt_rpc_error(message, "LOCATION_INVALID")
-        photo_id = int(location.get("photo_id", 0))
-        expected_access_hash = (photo_id << 32) | 1
-        if photo_id <= 0 or int(location.get("access_hash", 0)) != expected_access_hash:
+        file_id = int(location.get("photo_id") or location.get("document_id") or 0)
+        expected_access_hash = (file_id << 32) | 1
+        if file_id <= 0 or int(location.get("access_hash", 0)) != expected_access_hash:
             return self._encrypt_rpc_error(message, "FILE_REFERENCE_INVALID")
         if offset < 0 or limit <= 0 or limit > 1_048_576:
             return self._encrypt_rpc_error(message, "OFFSET_INVALID")
         with database.transaction() as connection:
-            photo = connection.execute(
-                "SELECT content, created_at FROM profile_photos WHERE id = ?", (photo_id,)
+            stored = connection.execute(
+                "SELECT content, created_at FROM profile_photos WHERE id = ?", (file_id,)
             ).fetchone()
-        if photo is None:
+            if stored is None:
+                stored = connection.execute(
+                    "SELECT content, created_at FROM stored_files WHERE id = ?", (file_id,)
+                ).fetchone()
+        if stored is None:
             return self._encrypt_rpc_error(message, "LOCATION_INVALID")
-        content = bytes(photo["content"])[offset:offset + limit]
+        content = bytes(stored["content"])[offset:offset + limit]
         return self._encrypt_result(
             message,
-            encode_upload_file(mtime=int(photo["created_at"]), content=content),
+            encode_upload_file(mtime=int(stored["created_at"]), content=content),
         )
 
     def _handle_upload_save_file_part(
@@ -1109,13 +1269,13 @@ class MTProtoSessionAdapter:
             if top_message_id:
                 row = connection.execute(
                     """
-                    SELECT id, peer_id, sender_user_id, body, sent_at
+                    SELECT id, peer_id, sender_user_id, body, sent_at, edited_at
                     FROM messages WHERE id = ? AND deleted_at IS NULL
                     """,
                     (top_message_id,),
                 ).fetchone()
                 if row is not None:
-                    stored = self._message_from_row(row)
+                    stored = self._message_from_row(row, connection)
                     user_ids.add(int(stored["sender_user_id"]))
                     encoded_messages.append(
                         encode_message(
@@ -1281,12 +1441,17 @@ class MTProtoSessionAdapter:
                 elif str(summary["kind"]) in {"chat", "channel"}:
                     chat_ids.add(int(summary["peer_id"]))
                 users = self._load_users(connection, user_ids)
+                edit_update = (
+                    encode_update_edit_channel_message(
+                        message=encoded_message, pts=actor_update.pts, pts_count=actor_update.pts_count
+                    )
+                    if str(summary["kind"]) == "channel"
+                    else encode_update_edit_message(
+                        message=encoded_message, pts=actor_update.pts, pts_count=actor_update.pts_count
+                    )
+                )
                 updates = encode_updates(
-                    updates=[
-                        encode_update_edit_message(
-                            message=encoded_message, pts=actor_update.pts, pts_count=actor_update.pts_count
-                        )
-                    ],
+                    updates=[edit_update],
                     users=self._encode_users(users, self_user_id=self_user_id),
                     chats=self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
                     date=actor_update.date,
@@ -1399,7 +1564,7 @@ class MTProtoSessionAdapter:
         try:
             with database.transaction(immediate=True) as connection:
                 summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
-                if str(summary["kind"]) != "chat":
+                if str(summary["kind"]) not in {"chat", "channel"}:
                     raise MessagingError("PEER_ID_INVALID")
                 edit_chat_about(
                     connection, chat_id=int(summary["peer_id"]), actor_user_id=self_user_id, about=about
@@ -1666,6 +1831,7 @@ class MTProtoSessionAdapter:
             slowmode_enabled=bool(int(channel["slowmode_seconds"])),
             noforwards=bool(int(channel["noforwards"])),
             join_request_enabled=bool(int(channel["join_request_enabled"])),
+            broadcast=bool(int(channel.get("is_broadcast") or 0)),
         )
         return encode_updates(
             updates=[encode_update_channel(channel_id=int(channel["id"]))],
@@ -1723,8 +1889,18 @@ class MTProtoSessionAdapter:
             channel_id = int(channel["channel_id"])
             if int(channel["access_hash"]) != channel_access_hash(channel_id):
                 raise MessagingError("CHANNEL_PRIVATE")
-            with database.transaction() as connection:
+            with database.transaction(immediate=True) as connection:
                 details = get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                if details.get("exported_invite") is None:
+                    try:
+                        details["exported_invite"] = ensure_permanent_exported_invite(
+                            connection,
+                            peer_id=channel_id,
+                            actor_user_id=self_user_id,
+                            public_link_base_url=self.public_link_base_url,
+                        )
+                    except MessagingError:
+                        details["exported_invite"] = None
                 member_ids = {
                     int(row["user_id"])
                     for row in connection.execute(
@@ -2200,6 +2376,380 @@ class MTProtoSessionAdapter:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(message, result)
 
+    def _encode_invite(self, invite: dict[str, object]) -> bytes:
+        return encode_exported_chat_invite(
+            link=str(invite["link"]),
+            admin_user_id=int(invite["admin_user_id"]),
+            created_at=int(invite["created_at"]),
+            expire_date=(int(invite["expire_date"]) if invite["expire_date"] is not None else None),
+            usage_limit=(int(invite["usage_limit"]) if invite["usage_limit"] is not None else None),
+            usage=int(invite["usage"]),
+            request_needed=bool(int(invite["request_needed"])),
+            permanent=bool(int(invite["permanent"])),
+            revoked=bool(int(invite["revoked"])),
+            title=(str(invite["title"]) if invite["title"] is not None else None),
+        )
+
+    def _handle_channels_create_channel(
+        self,
+        message: EncryptedMessage,
+        *,
+        title: str,
+        about: str,
+        broadcast: bool,
+        megagroup: bool,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                details, emitted = create_channel(
+                    connection,
+                    owner_user_id=self_user_id,
+                    title=title,
+                    about=about,
+                    broadcast=broadcast,
+                    megagroup=megagroup,
+                    public_link_base_url=self.public_link_base_url,
+                )
+                channel_id = int(details["id"])
+                anchor, anchor_updates = ensure_dialog_anchor_message(
+                    connection,
+                    peer_id=channel_id,
+                    user_id=self_user_id,
+                    body=f"{title} created",
+                    client_random_id=f"intelligram:channel-anchor:{channel_id}",
+                )
+                emitted.extend(anchor_updates)
+                self.pending_update_envelopes.extend(
+                    update for update in emitted if getattr(update, "user_id", None) != self_user_id
+                )
+                owner_update = next((update for update in emitted if update.user_id == self_user_id), None)
+                if owner_update is None:
+                    raise RuntimeError("Channel creator update was not emitted")
+                encoded_updates: list[bytes] = [encode_update_channel(channel_id=channel_id)]
+                if anchor is not None:
+                    encoded_updates.append(
+                        encode_update_new_channel_message(
+                            message=encode_message(
+                                message=anchor,
+                                recipient_peer=encode_peer_channel(channel_id=channel_id),
+                                outgoing=True,
+                            ),
+                            pts=owner_update.pts,
+                            pts_count=owner_update.pts_count,
+                        )
+                    )
+                result = encode_updates(
+                    updates=encoded_updates,
+                    users=self._encode_users(self._load_users(connection, {self_user_id}), self_user_id=self_user_id),
+                    chats=self._encode_chats(connection, chat_ids={channel_id}, self_user_id=self_user_id),
+                    date=owner_update.date,
+                    seq=owner_update.seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_invite_to_channel(
+        self, message: EncryptedMessage, *, channel: dict[str, object], users: list[dict[str, object]]
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            invited_ids: list[int] = []
+            for input_user in users:
+                kind = str(input_user.get("kind"))
+                if kind == "self":
+                    invited_ids.append(self_user_id)
+                elif kind == "user":
+                    invited_ids.append(int(input_user["user_id"]))
+            with database.transaction(immediate=True) as connection:
+                emitted = invite_to_channel(
+                    connection,
+                    channel_id=channel_id,
+                    actor_user_id=self_user_id,
+                    invited_user_ids=invited_ids,
+                )
+                details = get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                result = encode_messages_invited_users(
+                    updates=self._channel_updates_result(
+                        connection=connection, self_user_id=self_user_id, channel=details, emitted=emitted
+                    )
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_get_participants(
+        self, message: EncryptedMessage, *, channel: dict[str, object], offset: int, limit: int
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            bounded = min(max(limit, 1), 200)
+            with database.transaction() as connection:
+                get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                rows = connection.execute(
+                    """
+                    SELECT user_id, role, joined_at FROM peer_memberships
+                    WHERE peer_id = ? AND left_at IS NULL
+                    ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, joined_at, user_id
+                    LIMIT ? OFFSET ?
+                    """,
+                    (channel_id, bounded, max(offset, 0)),
+                ).fetchall()
+                count_row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL",
+                    (channel_id,),
+                ).fetchone()
+                user_ids = {self_user_id, *(int(row["user_id"]) for row in rows)}
+                users = self._load_users(connection, user_ids)
+                result = encode_channels_channel_participants(
+                    count=int(count_row["count"]) if count_row is not None else len(rows),
+                    participants=[
+                        encode_channel_participant(
+                            user_id=int(row["user_id"]),
+                            date=int(row["joined_at"]),
+                            role=str(row["role"]),
+                        )
+                        for row in rows
+                    ],
+                    chats=self._encode_chats(connection, chat_ids={channel_id}, self_user_id=self_user_id),
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_get_participant(
+        self, message: EncryptedMessage, *, channel: dict[str, object], participant: dict[str, object]
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            kind = str(participant.get("kind"))
+            if kind == "self":
+                target_id = self_user_id
+            elif kind == "user":
+                target_id = int(participant["user_id"])
+            else:
+                raise MessagingError("USER_ID_INVALID")
+            with database.transaction() as connection:
+                row = connection.execute(
+                    "SELECT user_id, role, joined_at FROM peer_memberships WHERE peer_id = ? AND user_id = ? AND left_at IS NULL",
+                    (channel_id, target_id),
+                ).fetchone()
+                if row is None:
+                    raise MessagingError("USER_NOT_PARTICIPANT")
+                users = self._load_users(connection, {self_user_id, target_id})
+                result = encode_channels_channel_participant(
+                    participant=encode_channel_participant(
+                        user_id=target_id, date=int(row["joined_at"]), role=str(row["role"])
+                    ),
+                    chats=self._encode_chats(connection, chat_ids={channel_id}, self_user_id=self_user_id),
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_edit_title(
+        self, message: EncryptedMessage, *, channel: dict[str, object], title: str
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            title = title.strip()
+            if not title:
+                raise MessagingError("CHAT_TITLE_EMPTY")
+            with database.transaction(immediate=True) as connection:
+                membership = connection.execute(
+                    "SELECT role FROM peer_memberships WHERE peer_id = ? AND user_id = ? AND left_at IS NULL",
+                    (channel_id, self_user_id),
+                ).fetchone()
+                if membership is None or str(membership["role"]) not in {"owner", "admin"}:
+                    raise MessagingError("CHAT_ADMIN_REQUIRED")
+                connection.execute("UPDATE peers SET title = ? WHERE id = ? AND kind = 'channel'", (title, channel_id))
+                details = get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                result = self._channel_updates_result(
+                    connection=connection, self_user_id=self_user_id, channel=details, emitted=[]
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_edit_photo(self, message: EncryptedMessage, *, channel: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction() as connection:
+                details = get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                result = self._channel_updates_result(
+                    connection=connection, self_user_id=self_user_id, channel=details, emitted=[]
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_delete_channel(self, message: EncryptedMessage, *, channel: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction(immediate=True) as connection:
+                emitted = delete_channel(connection, channel_id=channel_id, actor_user_id=self_user_id)
+                state = get_state(connection, self_user_id)
+                result = encode_updates(
+                    updates=[encode_update_channel(channel_id=channel_id)],
+                    users=[],
+                    chats=[],
+                    date=state["date"],
+                    seq=state["seq"],
+                )
+                self.pending_update_envelopes.extend(emitted)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_join_channel(self, message: EncryptedMessage, *, channel: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction(immediate=True) as connection:
+                emitted = join_channel(connection, channel_id=channel_id, user_id=self_user_id)
+                details = get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                updates = self._channel_updates_result(
+                    connection=connection, self_user_id=self_user_id, channel=details, emitted=emitted
+                )
+                result = encode_messages_chat_invite_join_result_ok(updates=updates)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_leave_channel(self, message: EncryptedMessage, *, channel: dict[str, object]) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction(immediate=True) as connection:
+                emitted = leave_channel(connection, channel_id=channel_id, user_id=self_user_id)
+                state = get_state(connection, self_user_id)
+                result = encode_updates(
+                    updates=[encode_update_channel(channel_id=channel_id)],
+                    users=[],
+                    chats=[],
+                    date=state["date"],
+                    seq=state["seq"],
+                )
+                self.pending_update_envelopes.extend(emitted)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_updates_get_channel_difference(
+        self, message: EncryptedMessage, *, channel: dict[str, object], pts: int
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction() as connection:
+                get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                state = get_state(connection, self_user_id)
+                result = encode_updates_channel_difference_empty(pts=max(int(pts), int(state["pts"])))
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_exported_chat_invite(
+        self, message: EncryptedMessage, *, peer: dict[str, object], link: str
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                invite = lookup_exported_invite(connection, link_or_hash=link)
+                if invite is None:
+                    raise MessagingError("INVITE_HASH_INVALID")
+                result = encode_messages_exported_chat_invite(invite=self._encode_invite(invite))
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_check_chat_invite(self, message: EncryptedMessage, *, invite_hash: str) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                invite = lookup_exported_invite(connection, link_or_hash=invite_hash)
+                if invite is None or bool(int(invite["revoked"])):
+                    raise MessagingError("INVITE_HASH_INVALID")
+                details = get_channel_details(
+                    connection, channel_id=int(invite["peer_id"]), user_id=int(invite["admin_user_id"])
+                )
+                result = encode_chat_invite(
+                    title=str(details["title"]),
+                    participants_count=int(details["participants_count"]),
+                    broadcast=bool(int(details.get("is_broadcast") or 0)),
+                    about=str(details.get("about") or ""),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_import_chat_invite(self, message: EncryptedMessage, *, invite_hash: str) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                invite = lookup_exported_invite(connection, link_or_hash=invite_hash)
+                if invite is None or bool(int(invite["revoked"])):
+                    raise MessagingError("INVITE_HASH_INVALID")
+                channel_id = int(invite["peer_id"])
+                emitted = join_channel(connection, channel_id=channel_id, user_id=self_user_id)
+                details = get_channel_details(connection, channel_id=channel_id, user_id=self_user_id)
+                updates = self._channel_updates_result(
+                    connection=connection, self_user_id=self_user_id, channel=details, emitted=emitted
+                )
+                result = encode_messages_chat_invite_join_result_ok(updates=updates)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
     def _handle_messages_get_full_chat(self, message: EncryptedMessage, *, chat_id: int) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -2475,41 +3025,226 @@ class MTProtoSessionAdapter:
                         if reply_to is not None else None
                     ),
                 )
-                self.pending_update_envelopes.extend(emitted)
-                sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
-                if sender_update is None:
-                    raise RuntimeError("Sender update was not emitted")
-                encoded_peer = self._encode_peer(summary)
-                user_ids = {self_user_id, int(stored["sender_user_id"])}
-                if summary.get("direct_user_id") is not None:
-                    user_ids.add(int(summary["direct_user_id"]))
-                users = self._load_users(connection, user_ids)
-                encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
-                encoded_chats = self._encode_chats(
-                    connection,
-                    chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) in {"chat", "channel"} else set(),
+                return self._finish_outgoing_message(
+                    message,
+                    connection=connection,
                     self_user_id=self_user_id,
+                    summary=summary,
+                    stored=stored,
+                    emitted=emitted,
+                    random_id=random_id,
                 )
-                updates = [
-                    encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
-                    encode_update_new_message(
-                        message=encoded_message,
-                        pts=sender_update.pts - sender_update.pts_count,
-                        pts_count=0,
-                    ),
-                ]
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
+
+    def _handle_messages_send_media(
+        self,
+        message: EncryptedMessage,
+        *,
+        peer: dict[str, object],
+        body: str,
+        random_id: int,
+        reply_to: dict[str, object] | None,
+        media: dict[str, object] | None,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                stored_media = self._materialize_input_media(
+                    connection, user_id=self_user_id, media=media
+                )
+                stored, emitted = send_message(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    sender_user_id=self_user_id,
+                    body=body,
+                    client_random_id=str(random_id),
+                    reply_to_message_id=(
+                        int(reply_to["reply_to_message_id"])
+                        if reply_to is not None else None
+                    ),
+                    media=stored_media,
+                )
+                return self._finish_outgoing_message(
+                    message,
+                    connection=connection,
+                    self_user_id=self_user_id,
+                    summary=summary,
+                    stored=stored,
+                    emitted=emitted,
+                    random_id=random_id,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+
+    def _handle_messages_upload_media(
+        self, message: EncryptedMessage, *, peer: dict[str, object], media: dict[str, object] | None
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                stored_media = self._materialize_input_media(
+                    connection, user_id=self_user_id, media=media
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        encoded = encode_message_media(stored_media)
+        if encoded is None:
+            return self._encrypt_rpc_error(message, "MEDIA_INVALID")
+        return self._encrypt_result(message, encoded)
+
+    def _finish_outgoing_message(
+        self,
+        message: EncryptedMessage,
+        *,
+        connection: object,
+        self_user_id: int,
+        summary: dict[str, object],
+        stored: dict[str, object],
+        emitted: list[object],
+        random_id: int,
+    ) -> bytes:
+        # Fan the durable update to other members. The sender already receives
+        # updateMessageID + updateNewMessage in this RPC result; re-publishing
+        # it via updatesTooLong / getDifference left the first outgoing bubble
+        # pending after a refresh.
+        self.pending_update_envelopes.extend(
+            update for update in emitted if getattr(update, "user_id", None) != self_user_id
+        )
+        sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
+        if sender_update is None:
+            raise RuntimeError("Sender update was not emitted")
+        encoded_peer = self._encode_peer(summary)
+        user_ids = {self_user_id, int(stored["sender_user_id"])}
+        if summary.get("direct_user_id") is not None:
+            user_ids.add(int(summary["direct_user_id"]))
+        users = self._load_users(connection, user_ids)
+        encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
+        encoded_chats = self._encode_chats(
+            connection,
+            chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) in {"chat", "channel"} else set(),
+            self_user_id=self_user_id,
+        )
+        new_message_update = (
+            encode_update_new_channel_message(
+                message=encoded_message,
+                pts=sender_update.pts,
+                pts_count=sender_update.pts_count,
+            )
+            if str(summary.get("kind")) == "channel"
+            else encode_update_new_message(
+                message=encoded_message,
+                pts=sender_update.pts,
+                pts_count=sender_update.pts_count,
+            )
+        )
         return self._encrypt_result(
             message,
             encode_updates(
-                updates=updates,
+                updates=[
+                    encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
+                    new_message_update,
+                ],
                 users=self._encode_users(users, self_user_id=self_user_id),
                 chats=encoded_chats,
                 date=sender_update.date,
                 seq=sender_update.seq,
             ),
         )
+
+    def _materialize_input_media(
+        self, connection: object, *, user_id: int, media: dict[str, object] | None
+    ) -> dict[str, object] | None:
+        if not media:
+            return None
+        kind = str(media.get("kind") or "")
+        if kind in {"empty", "webpage"}:
+            return None
+        if kind in {"uploaded_photo", "uploaded_document"}:
+            file = media.get("file")
+            if not isinstance(file, dict):
+                raise MessagingError("PHOTO_FILE_MISSING")
+            assembled = self._assemble_uploaded_file(connection, user_id=user_id, file=file)
+            filename = str(assembled["filename"])
+            for attribute in media.get("attributes") or []:
+                if isinstance(attribute, dict) and attribute.get("kind") == "filename" and attribute.get("file_name"):
+                    filename = str(attribute["file_name"])
+                    break
+            return {
+                "kind": "photo" if kind == "uploaded_photo" else "document",
+                "file_id": int(assembled["id"]),
+                "filename": filename,
+                "mime_type": str(media.get("mime_type") or assembled["mime_type"]),
+                "size": int(assembled["size"]),
+                "date": int(assembled["created_at"]),
+            }
+        if kind in {"photo", "document"}:
+            file_id = int(media.get("id") or 0)
+            stored = connection.execute(
+                "SELECT id, filename, mime_type, length(content) AS size, created_at FROM stored_files WHERE id = ?",
+                (file_id,),
+            ).fetchone()
+            if stored is None:
+                raise MessagingError("MEDIA_INVALID")
+            return {
+                "kind": kind,
+                "file_id": int(stored["id"]),
+                "filename": str(stored["filename"]),
+                "mime_type": str(stored["mime_type"]),
+                "size": int(stored["size"]),
+                "date": int(stored["created_at"]),
+            }
+        raise MessagingError("MEDIA_INVALID")
+
+    def _assemble_uploaded_file(
+        self, connection: object, *, user_id: int, file: dict[str, object]
+    ) -> dict[str, object]:
+        file_id = int(file.get("file_id", 0))
+        parts = int(file.get("parts", 0))
+        filename = str(file.get("name") or "attachment")
+        if parts < 1 or parts > 8_000 or not file_id:
+            raise MessagingError("FILE_PART_INVALID")
+        rows = connection.execute(
+            """
+            SELECT part_index, content FROM upload_parts
+            WHERE file_id = ? AND user_id = ?
+            ORDER BY part_index
+            """,
+            (file_id, user_id),
+        ).fetchall()
+        if len(rows) != parts or [int(row["part_index"]) for row in rows] != list(range(parts)):
+            raise MessagingError("FILE_PART_INVALID")
+        content = b"".join(bytes(row["content"]) for row in rows)
+        if not content or len(content) > 20 * 1024 * 1024:
+            raise MessagingError("FILE_TOO_BIG")
+        now = int(time.time())
+        mime_type = "application/octet-stream"
+        lowered = filename.lower()
+        if lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            mime_type = "image/jpeg" if lowered.endswith((".jpg", ".jpeg")) else f"image/{lowered.rsplit('.', 1)[-1]}"
+        stored = connection.execute(
+            """
+            INSERT INTO stored_files(owner_user_id, source_file_id, filename, mime_type, content, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, file_id, filename, mime_type, content, now),
+        )
+        connection.execute("DELETE FROM upload_parts WHERE file_id = ? AND user_id = ?", (file_id, user_id))
+        return {
+            "id": int(stored.lastrowid),
+            "filename": filename,
+            "mime_type": mime_type,
+            "size": len(content),
+            "created_at": now,
+        }
 
     def _associate_auth_key(self, user_id: int) -> None:
         if self.database is None:

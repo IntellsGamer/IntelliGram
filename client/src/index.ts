@@ -1,5 +1,9 @@
 /* @refresh reload */
 
+// Insecure HTTP has no Cache API / Service Worker. Install the memory fallback
+// before any module touches `caches`.
+import '@lib/httpCompat';
+
 // must run before any other module — under the preview flag the first swaps
 // every DOM timer for worker-driven ones (hidden tabs throttle/freeze timers)
 // and spoofs visibility, the second swaps requestAnimationFrame for a timer so

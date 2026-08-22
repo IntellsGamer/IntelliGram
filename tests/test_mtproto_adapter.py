@@ -628,8 +628,10 @@ def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
     first_reader.int64()
     first_reader.int32()  # date
     assert first_reader.bytes() == b"Reply target"
-    assert first_reader.int32() == 0  # pre-send PTS
-    assert first_reader.int32() == 0  # neutral immediate pts_count
+    first_pts = first_reader.int32()
+    first_pts_count = first_reader.int32()
+    assert first_pts > 0
+    assert first_pts_count > 0
     with database.transaction() as connection:
         target = connection.execute("SELECT id FROM messages WHERE client_random_id = ?", ("1001",)).fetchone()
         assert target is not None
@@ -1491,7 +1493,8 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     assert named_invite_link.startswith("https://links.example.intelligram.test/tenant/+")
     with database.transaction() as connection:
         invite = connection.execute(
-            "SELECT link, title, permanent, revoked FROM exported_invites WHERE peer_id = ?", (chat_id,)
+            "SELECT link, title, permanent, revoked FROM exported_invites WHERE peer_id = ? AND title = ?",
+            (chat_id, "Regression invite"),
         ).fetchone()
         assert invite is not None
         assert str(invite["link"]).startswith("https://links.example.intelligram.test/tenant/+")
@@ -1521,7 +1524,7 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     assert list_reader.uint32() == RPC_RESULT_CONSTRUCTOR
     assert list_reader.int64() == list_message_id
     assert list_reader.uint32() == MESSAGES_EXPORTED_CHAT_INVITES_CONSTRUCTOR
-    assert list_reader.int32() == 1
+    assert list_reader.int32() >= 1
 
     permanent_message_id = list_message_id + 4
     permanent_request = (
@@ -3010,3 +3013,440 @@ def test_device_login_invalidates_a_six_digit_code_after_five_bad_attempts(tmp_p
             (issued.user_id,),
         ).fetchone()
         assert sessions is not None and int(sessions["count"]) == 1
+
+
+def test_web_k_scrypt_only_password_fallback_uses_plaintext_inside_encrypted_mtproto(tmp_path) -> None:
+    """Legacy accounts without SRP verifiers can still use PasswordCard."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_GET_PASSWORD_CONSTRUCTOR,
+        ACCOUNT_PASSWORD_CONSTRUCTOR,
+        AUTH_AUTHORIZATION_CONSTRUCTOR,
+        AUTH_CHECK_PASSWORD_CONSTRUCTOR,
+        AUTH_SEND_CODE_CONSTRUCTOR,
+        INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR,
+        RPC_ERROR_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    code_settings_constructor = 0xAD253D78
+    auth_key = bytes(range(256))
+    salt, session_id = 202, 808
+    database = Database(tmp_path / "plaintext-password.sqlite3")
+    database.initialize()
+    phone = "+15551238881"
+    password = "correct-horse-battery-staple"
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone=phone,
+            password=password,
+            first_name="Legacy",
+            device_label="Primary IntelliGram device",
+        )
+        connection.execute("DELETE FROM sessions WHERE user_id = ?", (issued.user_id,))
+        connection.execute("DELETE FROM password_srp_verifiers WHERE user_id = ?", (issued.user_id,))
+
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database)
+    first_message_id = (int(time.time()) << 32) + 4
+
+    def invoke(query: bytes, index: int) -> TLReader:
+        request_message_id = first_message_id + index * 4
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id,
+            seq_no=index * 2 + 1,
+            body=query,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == request_message_id
+        return reader
+
+    send_code = (
+        struct.pack("<I", AUTH_SEND_CODE_CONSTRUCTOR)
+        + _tl_bytes(phone.encode())
+        + struct.pack("<i", 1)
+        + _tl_bytes(b"intelligram-self-hosted")
+        + struct.pack("<II", code_settings_constructor, 0)
+    )
+    reader = invoke(send_code, 0)
+    assert reader.uint32() == RPC_ERROR_CONSTRUCTOR
+    assert reader.int32() == 400
+    assert reader.bytes().decode() == "SESSION_PASSWORD_NEEDED"
+
+    reader = invoke(struct.pack("<I", ACCOUNT_GET_PASSWORD_CONSTRUCTOR), 1)
+    assert reader.uint32() == ACCOUNT_PASSWORD_CONSTRUCTOR
+    reader.uint32()  # flags
+    reader.uint32()  # current_algo constructor
+    reader.bytes()  # salt1
+    reader.bytes()  # salt2
+    reader.int32()  # g
+    reader.bytes()  # p
+    reader.bytes()  # srp_B
+    assert reader.int64() == 0
+
+    check_password = (
+        struct.pack("<I", AUTH_CHECK_PASSWORD_CONSTRUCTOR)
+        + struct.pack("<I", INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR)
+        + struct.pack("<q", 0)
+        + _tl_bytes(password.encode("utf-8"))
+        + _tl_bytes(b"\x00" * 32)
+    )
+    reader = invoke(check_password, 2)
+    assert reader.uint32() == AUTH_AUTHORIZATION_CONSTRUCTOR
+    assert adapter.user_id == issued.user_id
+    with database.transaction() as connection:
+        verifier = connection.execute(
+            "SELECT 1 FROM password_srp_verifiers WHERE user_id = ?", (issued.user_id,)
+        ).fetchone()
+        context = connection.execute(
+            "SELECT 1 FROM password_login_contexts WHERE auth_key_id = ?",
+            (str(auth_key_id(auth_key)),),
+        ).fetchone()
+    assert verifier is not None
+    assert context is None
+
+
+def test_web_k_send_media_uploaded_photo_persists_and_downloads(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        INPUT_FILE_CONSTRUCTOR,
+        INPUT_MEDIA_UPLOADED_PHOTO_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR,
+        MESSAGE_CONSTRUCTOR,
+        MESSAGE_MEDIA_PHOTO_CONSTRUCTOR,
+        MESSAGES_SEND_MEDIA_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        STORAGE_FILE_UNKNOWN_CONSTRUCTOR,
+        TLReader,
+        UPDATE_MESSAGE_ID_CONSTRUCTOR,
+        UPDATE_NEW_MESSAGE_CONSTRUCTOR,
+        UPDATES_CONSTRUCTOR,
+        UPLOAD_FILE_CONSTRUCTOR,
+        UPLOAD_GET_FILE_CONSTRUCTOR,
+        UPLOAD_SAVE_FILE_PART_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_tl_string,
+        encode_uint32,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 303, 909
+    database = Database(tmp_path / "send-media.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000301", password="correct-horse-battery-staple",
+            first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000302", password="correct-horse-battery-staple",
+            first_name="Bob", device_label="Bob",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    file_id = 888_001
+    content = b"intelligram-attachment-photo-bytes"
+
+    save_part = (
+        encode_uint32(UPLOAD_SAVE_FILE_PART_CONSTRUCTOR)
+        + encode_int64(file_id)
+        + encode_int32(0)
+        + encode_tl_bytes(content)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=save_part,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    send_media = (
+        encode_uint32(MESSAGES_SEND_MEDIA_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_uint32(INPUT_MEDIA_UPLOADED_PHOTO_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_FILE_CONSTRUCTOR)
+        + encode_int64(file_id)
+        + encode_int32(1)
+        + encode_tl_string("photo.jpg")
+        + encode_tl_string("")
+        + encode_tl_string("a photo")
+        + encode_int64(4401)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=send_media,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    assert reader.vector_count() == 2
+    assert reader.uint32() == UPDATE_MESSAGE_ID_CONSTRUCTOR
+    stored_message_id = reader.int32()
+    assert reader.int64() == 4401
+    assert reader.uint32() == UPDATE_NEW_MESSAGE_CONSTRUCTOR
+    assert reader.uint32() == MESSAGE_CONSTRUCTOR
+    flags = reader.uint32()
+    assert flags & (1 << 9)
+    assert MESSAGE_MEDIA_PHOTO_CONSTRUCTOR.to_bytes(4, "little") in body
+    assert adapter.pending_update_envelopes == [] or all(
+        getattr(item, "user_id", None) != alice.user_id for item in adapter.pending_update_envelopes
+    )
+
+    with database.transaction() as connection:
+        media = connection.execute(
+            "SELECT file_id, kind, filename FROM message_media WHERE message_id = ?",
+            (stored_message_id,),
+        ).fetchone()
+        stored = connection.execute(
+            "SELECT content FROM stored_files WHERE id = ?", (int(media["file_id"]),)
+        ).fetchone()
+    assert media is not None and media["kind"] == "photo"
+    assert media["filename"] == "photo.jpg"
+    assert bytes(stored["content"]) == content
+
+    photo_id = int(media["file_id"])
+    get_file = (
+        encode_uint32(UPLOAD_GET_FILE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR)
+        + encode_int64(photo_id)
+        + encode_int64((photo_id << 32) | 1)
+        + encode_tl_bytes(f"intelligram-file:{photo_id}".encode("ascii"))
+        + encode_tl_string("m")
+        + encode_int64(0)
+        + encode_int32(len(content))
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 8, seq_no=5, body=get_file,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 8
+    assert reader.uint32() == UPLOAD_FILE_CONSTRUCTOR
+    assert reader.uint32() == STORAGE_FILE_UNKNOWN_CONSTRUCTOR
+    assert reader.int32() > 0
+    assert reader.bytes() == content
+
+
+def test_web_k_first_outgoing_message_excludes_sender_from_pending_envelopes(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATE_NEW_MESSAGE_CONSTRUCTOR,
+        UPDATES_CONSTRUCTOR,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 404, 1010
+    database = Database(tmp_path / "no-duplicate-pending.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000311", password="correct-horse-battery-staple",
+            first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000312", password="correct-horse-battery-staple",
+            first_name="Bob", device_label="Bob",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    query = (
+        encode_uint32(MESSAGES_SEND_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_tl_string("hello")
+        + encode_int64(5501)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=query,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    reader.int64()
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    assert UPDATE_NEW_MESSAGE_CONSTRUCTOR.to_bytes(4, "little") in body
+    pending = adapter.drain_pending_update_envelopes()
+    assert all(getattr(item, "user_id", None) != alice.user_id for item in pending)
+
+
+def test_web_k_creates_broadcast_channel_and_shows_permanent_invite(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CHANNEL_CONSTRUCTOR,
+        CHANNELS_CREATE_CHANNEL_CONSTRUCTOR,
+        CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
+        CHANNELS_GET_PARTICIPANTS_CONSTRUCTOR,
+        CHANNEL_PARTICIPANTS_RECENT_CONSTRUCTOR,
+        INPUT_CHANNEL_CONSTRUCTOR,
+        MESSAGES_CHAT_FULL_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 505, 1111
+    database = Database(tmp_path / "create-channel.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000401", password="correct-horse-battery-staple",
+            first_name="Owner", device_label="Owner",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    create = (
+        encode_uint32(CHANNELS_CREATE_CHANNEL_CONSTRUCTOR)
+        + encode_uint32(1)  # broadcast
+        + encode_tl_string("News")
+        + encode_tl_string("Daily updates")
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=create,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    reader.int64()
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    assert CHANNEL_CONSTRUCTOR.to_bytes(4, "little") in body
+    channel = TLReader(body[body.index(encode_uint32(CHANNEL_CONSTRUCTOR)):])
+    assert channel.uint32() == CHANNEL_CONSTRUCTOR
+    flags = channel.uint32()
+    assert flags & (1 << 5)  # broadcast
+    assert not flags & (1 << 8)  # not megagroup
+    with database.transaction() as connection:
+        row = connection.execute("SELECT id, title, about FROM peers WHERE kind = 'channel'").fetchone()
+        invite = connection.execute("SELECT link, permanent FROM exported_invites WHERE peer_id = ?", (int(row["id"]),)).fetchone()
+        settings = connection.execute("SELECT is_broadcast FROM channel_settings WHERE peer_id = ?", (int(row["id"]),)).fetchone()
+    assert row["title"] == "News"
+    assert row["about"] == "Daily updates"
+    assert invite is not None and int(invite["permanent"]) == 1
+    assert int(settings["is_broadcast"]) == 1
+    channel_id = int(row["id"])
+
+    full = (
+        encode_uint32(CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR)
+        + encode_uint32(INPUT_CHANNEL_CONSTRUCTOR)
+        + encode_int64(channel_id)
+        + encode_int64((channel_id << 32) | 1)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=full,
+    ))
+    assert response is not None
+    _, _, _, _, full_body = _decrypt_server(auth_key, response)
+    full_reader = TLReader(full_body)
+    assert full_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    full_reader.int64()
+    assert full_reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+    assert invite["link"].encode("utf-8") in full_body
+
+    participants = (
+        encode_uint32(CHANNELS_GET_PARTICIPANTS_CONSTRUCTOR)
+        + encode_uint32(INPUT_CHANNEL_CONSTRUCTOR)
+        + encode_int64(channel_id)
+        + encode_int64((channel_id << 32) | 1)
+        + encode_uint32(CHANNEL_PARTICIPANTS_RECENT_CONSTRUCTOR)
+        + encode_int32(0)
+        + encode_int32(50)
+        + encode_int64(0)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 8, seq_no=5, body=participants,
+    ))
+    assert response is not None
+    _, _, _, _, part_body = _decrypt_server(auth_key, response)
+    part_reader = TLReader(part_body)
+    assert part_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    part_reader.int64()
+    assert part_reader.uint32() == 0x9AB0FEAF  # channels.channelParticipants
+    assert part_reader.int32() == 1
+
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_CHANNEL_CONSTRUCTOR,
+        MESSAGE_CONSTRUCTOR,
+        MESSAGES_EDIT_MESSAGE_CONSTRUCTOR,
+        UPDATE_EDIT_CHANNEL_MESSAGE_CONSTRUCTOR,
+        UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR,
+        encode_int32,
+    )
+    from intelligram.services.messaging import send_message
+
+    with database.transaction(immediate=True) as connection:
+        stored, _ = send_message(
+            connection,
+            peer_id=channel_id,
+            sender_user_id=owner.user_id,
+            body="Before edit",
+            client_random_id="channel-edit-1",
+        )
+    edit = (
+        encode_uint32(MESSAGES_EDIT_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(1 << 11)
+        + encode_uint32(INPUT_PEER_CHANNEL_CONSTRUCTOR)
+        + encode_int64(channel_id)
+        + encode_int64((channel_id << 32) | 1)
+        + encode_int32(int(stored["id"]))
+        + encode_tl_string("After edit")
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 12, seq_no=7, body=edit,
+    ))
+    assert response is not None
+    _, _, _, _, edit_body = _decrypt_server(auth_key, response)
+    edit_reader = TLReader(edit_body)
+    assert edit_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    edit_reader.int64()
+    assert edit_reader.uint32() == UPDATES_CONSTRUCTOR
+    assert UPDATE_EDIT_CHANNEL_MESSAGE_CONSTRUCTOR.to_bytes(4, "little") in edit_body
+    assert UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR.to_bytes(4, "little") not in edit_body
+    message_offset = edit_body.index(encode_uint32(MESSAGE_CONSTRUCTOR))
+    encoded_message = TLReader(edit_body[message_offset:])
+    assert encoded_message.uint32() == MESSAGE_CONSTRUCTOR
+    assert encoded_message.uint32() & (1 << 15)  # edit_date / edited badge

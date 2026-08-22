@@ -482,7 +482,7 @@ export default function wrapRichText(text: string, options: WrapRichTextOptions 
           //   insertPart(entity, '<span class="emoji">', '</span>');
           // } else {
           element = document.createElement('img');
-          (element as HTMLImageElement).src = `assets/img/emoji/${entity.unicode}.png`;
+          (element as HTMLImageElement).src = `/assets/img/emoji/${entity.unicode}.png`;
           property = 'alt';
           element.className = 'emoji emoji-image';
 

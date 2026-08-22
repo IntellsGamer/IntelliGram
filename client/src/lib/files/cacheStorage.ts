@@ -145,6 +145,10 @@ export default class CacheStorageController implements FileStorage {
   }
 
   private openDatabase(): Promise<Cache> {
+    if(typeof caches === 'undefined') {
+      this.useStorage = false;
+      return Promise.reject(makeError('STORAGE_OFFLINE'));
+    }
     return this.openDbPromise ?? (this.openDbPromise = caches.open(this.dbName));
   }
 

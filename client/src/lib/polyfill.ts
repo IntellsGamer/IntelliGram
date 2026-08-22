@@ -1,3 +1,4 @@
+import '@lib/httpCompat';
 import bufferConcats from '@helpers/bytes/bufferConcats';
 
 Uint8Array.prototype.concat = function(...args: Array<Uint8Array | ArrayBuffer | number[]>) {

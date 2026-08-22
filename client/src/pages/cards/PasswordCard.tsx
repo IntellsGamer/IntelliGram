@@ -138,7 +138,17 @@ export default function PasswordCard(_props: {spec: Spec}) {
       getStateInterval = window.setInterval(getState, 10e3);
     }
 
-    return !TEST && managers.passwordManager.getState().then(applyState);
+    return !TEST && managers.passwordManager.getState().then(applyState).catch((err: any) => {
+      if(err?.type === 'PASSWORD_FALLBACK_UNAVAILABLE') {
+        return applyState({
+          _: 'account.password',
+          pFlags: {has_password: true},
+          srp_id: 0
+        } as AccountPassword);
+      }
+      console.error(err);
+      return undefined;
+    });
   }
 
   function ensureState(): Promise<AccountPassword> {

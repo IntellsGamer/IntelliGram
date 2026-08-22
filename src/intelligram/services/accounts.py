@@ -325,9 +325,16 @@ def get_password_srp_state(
         (user_id,),
     ).fetchone()
     if verifier is None:
-        # Legacy scrypt-only accounts are not silently downgraded to plaintext.
-        # A successful REST password login will safely bootstrap an SRP verifier.
-        raise AccountAuthError("PASSWORD_FALLBACK_UNAVAILABLE")
+        # Legacy scrypt-only accounts cannot issue a real SRP challenge. Return
+        # srp_id=0 so PasswordCard can submit the UTF-8 password inside the
+        # existing encrypted MTProto envelope.
+        return PasswordSRPState(
+            user_id=user_id,
+            srp_id=0,
+            salt1=b"\x00" * 8,
+            salt2=b"\x00" * 8,
+            srp_B=b"\x00" * 256,
+        )
     challenge = make_challenge(
         salt1=bytes(verifier["salt1"]),
         salt2=bytes(verifier["salt2"]),
@@ -363,6 +370,44 @@ def get_password_srp_state(
         salt2=challenge.salt2,
         srp_B=challenge.srp_B,
     )
+
+
+def complete_password_plaintext_login(
+    connection: sqlite3.Connection,
+    *,
+    auth_key_id: str,
+    password: str,
+    device_label: str,
+) -> IssuedSession:
+    """Verify a scrypt-only account over encrypted MTProto and bootstrap SRP.
+
+    Web K's PasswordCard can reach this path when ``account.getPassword``
+    returns ``PASSWORD_FALLBACK_UNAVAILABLE`` because the account was created
+    before an SRP verifier existed. The password still travels inside the
+    existing MTProto envelope; it is never written to the database.
+    """
+
+    now = now_unix()
+    context = connection.execute(
+        """
+        SELECT user_id FROM password_login_contexts
+        WHERE auth_key_id = ? AND expires_at >= ?
+        """,
+        (auth_key_id, now),
+    ).fetchone()
+    if context is None:
+        raise AccountAuthError("SESSION_PASSWORD_NEEDED")
+    user_id = int(context["user_id"])
+    user = connection.execute(
+        "SELECT password_hash FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    stored_hash = user["password_hash"] if user is not None else None
+    if not isinstance(stored_hash, str) or not verify_password(password, stored_hash):
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+    _ensure_srp_verifier_from_password(connection, user_id=user_id, password=password)
+    connection.execute("DELETE FROM password_login_contexts WHERE auth_key_id = ?", (auth_key_id,))
+    return _issue_session(connection, user_id=user_id, device_label=device_label, now=now)
 
 
 def complete_password_srp_login(

@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +135,8 @@ class Database:
                     peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
                     slowmode_seconds INTEGER NOT NULL DEFAULT 0 CHECK(slowmode_seconds IN (0, 5, 10, 30, 60, 300, 900, 3600)),
                     noforwards INTEGER NOT NULL DEFAULT 0 CHECK(noforwards IN (0, 1)),
-                    join_request_enabled INTEGER NOT NULL DEFAULT 0 CHECK(join_request_enabled IN (0, 1))
+                    join_request_enabled INTEGER NOT NULL DEFAULT 0 CHECK(join_request_enabled IN (0, 1)),
+                    is_broadcast INTEGER NOT NULL DEFAULT 0 CHECK(is_broadcast IN (0, 1))
                 );
 
                 CREATE TABLE IF NOT EXISTS peer_permissions (
@@ -227,6 +228,26 @@ class Database:
                     created_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS stored_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    source_file_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS message_media (
+                    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES stored_files(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('photo', 'document')),
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS profile_photos_user_created_idx
                     ON profile_photos(user_id, created_at DESC);
 
@@ -276,7 +297,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '10')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '12')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
@@ -304,6 +325,8 @@ class Database:
                 connection.execute("ALTER TABLE channel_settings ADD COLUMN noforwards INTEGER NOT NULL DEFAULT 0")
             if "join_request_enabled" not in channel_settings_columns:
                 connection.execute("ALTER TABLE channel_settings ADD COLUMN join_request_enabled INTEGER NOT NULL DEFAULT 0")
+            if "is_broadcast" not in channel_settings_columns:
+                connection.execute("ALTER TABLE channel_settings ADD COLUMN is_broadcast INTEGER NOT NULL DEFAULT 0")
             peer_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(peers)").fetchall()
