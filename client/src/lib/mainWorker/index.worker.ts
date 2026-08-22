@@ -1,4 +1,5 @@
 // just to include
+import '@lib/httpCompat';
 import '@lib/polyfill';
 import '@helpers/peerIdPolyfill';
 

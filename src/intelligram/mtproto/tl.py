@@ -155,6 +155,47 @@ MESSAGES_GET_FULL_CHAT_CONSTRUCTOR = 0xAEB00B34
 MESSAGES_MIGRATE_CHAT_CONSTRUCTOR = 0xA2875319
 CHANNELS_GET_CHANNELS_CONSTRUCTOR = 0x0A7F6BBB
 CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR = 0x08736A09
+CHANNELS_CREATE_CHANNEL_CONSTRUCTOR = 0x91006707  # -1862244601
+CHANNELS_INVITE_TO_CHANNEL_CONSTRUCTOR = 0xC9E33D54  # -907854508
+CHANNELS_GET_PARTICIPANTS_CONSTRUCTOR = 0x77CED9D0  # 2010044880
+CHANNELS_GET_PARTICIPANT_CONSTRUCTOR = 0xA0AB6CC6  # -1599378234
+CHANNELS_EDIT_TITLE_CONSTRUCTOR = 0x566DECD0  # 1450044624
+CHANNELS_EDIT_PHOTO_CONSTRUCTOR = 0xF12E57C9  # -248621111
+CHANNELS_DELETE_CHANNEL_CONSTRUCTOR = 0xC0111FE3  # -1072619549
+CHANNELS_JOIN_CHANNEL_CONSTRUCTOR = 0x7F6A1E22  # 2137660962
+CHANNELS_LEAVE_CHANNEL_CONSTRUCTOR = 0xF836AA95  # -130635115
+UPDATES_GET_CHANNEL_DIFFERENCE_CONSTRUCTOR = 0x03173D78  # 51854712
+MESSAGES_GET_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0x73746F5C  # 1937010524
+MESSAGES_CHECK_CHAT_INVITE_CONSTRUCTOR = 0x3EADB1BB  # 1051570619
+MESSAGES_IMPORT_CHAT_INVITE_CONSTRUCTOR = 0xDE8C0C64  # -560905362
+MESSAGES_GET_ADMINS_WITH_INVITES_CONSTRUCTOR = 0x39224859  # 958457583
+MESSAGES_GET_CHAT_INVITE_IMPORTERS_CONSTRUCTOR = 0xDF04DD4E  # -553329330
+UPDATE_EDIT_CHANNEL_MESSAGE_CONSTRUCTOR = 0x1B3F4DF7  # 457133559
+CHANNEL_PARTICIPANT_CONSTRUCTOR = 0x1BD54456  # 466961494
+CHANNEL_PARTICIPANT_SELF_CONSTRUCTOR = 0xA9478A1A  # -1454929382
+CHANNEL_PARTICIPANT_CREATOR_CONSTRUCTOR = 0x2FE601D3  # 803602899
+CHANNEL_PARTICIPANTS_RECENT_CONSTRUCTOR = 0xDE3F3C79  # -566281095
+CHANNEL_PARTICIPANTS_ADMINS_CONSTRUCTOR = 0xB4608969  # -1268741783
+CHANNEL_PARTICIPANTS_SEARCH_CONSTRUCTOR = 0x0656AC4B  # 106343499
+CHANNEL_PARTICIPANTS_KICKED_CONSTRUCTOR = 0xA3B54985  # -1548400251
+CHANNEL_PARTICIPANTS_BANNED_CONSTRUCTOR = 0x1427A5E1  # 338142689
+CHANNELS_CHANNEL_PARTICIPANTS_CONSTRUCTOR = 0x9AB0FEAF  # -1699676497
+CHANNELS_CHANNEL_PARTICIPANT_CONSTRUCTOR = 0xDFB80317  # -541588713
+CHANNELS_CHANNEL_PARTICIPANTS_NOT_MODIFIED_CONSTRUCTOR = 0xF0173FE9  # -266911767
+CHAT_ADMIN_RIGHTS_CONSTRUCTOR = 0x5FB224D5  # 1605510357
+CHAT_INVITE_CONSTRUCTOR = 0x5C98615A  # 1553807106
+CHAT_INVITE_ALREADY_CONSTRUCTOR = 0x5A686D7C  # 1516793212
+MESSAGES_CHAT_INVITE_JOIN_RESULT_OK_CONSTRUCTOR = 0x445663A7  # 1146512295
+MESSAGES_CHAT_ADMINS_WITH_INVITES_CONSTRUCTOR = 0xB69B72D7  # -1231326505
+MESSAGES_CHAT_INVITE_IMPORTERS_CONSTRUCTOR = 0x81B6B00A  # -2118733814
+UPDATES_CHANNEL_DIFFERENCE_EMPTY_CONSTRUCTOR = 0x3E11AFFB  # 1041346555
+CHANNEL_MESSAGES_FILTER_EMPTY_CONSTRUCTOR = 0x94D42EE7  # -1798033689
+CHANNEL_MESSAGES_FILTER_CONSTRUCTOR = 0xCD77D957  # -847783593
+INPUT_CHANNEL_EMPTY_CONSTRUCTOR = 0xEE8C1E86  # -292807034
+INPUT_GEO_POINT_EMPTY_CONSTRUCTOR = 0xE4C123D6  # -457104426
+INPUT_CHAT_PHOTO_EMPTY_CONSTRUCTOR = 0x1CA48F57
+INPUT_CHAT_UPLOADED_PHOTO_CONSTRUCTOR = 0xBDCDAEC0  # -1110593856
+INPUT_CHAT_PHOTO_CONSTRUCTOR = 0x8953AD37  # -1991004873
 CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR = 0xEDD49EF0
 CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR = 0x0ECC2618
 MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR = 0xA5866B41
@@ -459,9 +500,74 @@ def _read_chat_banned_rights(reader: TLReader) -> dict[str, int]:
 
 
 def _read_input_channel(reader: TLReader) -> dict[str, Any]:
-    if reader.uint32() != INPUT_CHANNEL_CONSTRUCTOR:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_CHANNEL_EMPTY_CONSTRUCTOR:
+        return {"kind": "empty", "channel_id": 0, "access_hash": 0}
+    if constructor_id != INPUT_CHANNEL_CONSTRUCTOR:
         raise TLDecodeError("Expected an inputChannel constructor")
-    return {"channel_id": reader.int64(), "access_hash": reader.int64()}
+    return {"kind": "channel", "channel_id": reader.int64(), "access_hash": reader.int64()}
+
+
+def _read_input_geo_point(reader: TLReader) -> None:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_GEO_POINT_EMPTY_CONSTRUCTOR:
+        return
+    flags = reader.uint32()
+    reader.double()
+    reader.double()
+    if flags & 1:
+        reader.int32()
+
+
+def _read_input_chat_photo(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_CHAT_PHOTO_EMPTY_CONSTRUCTOR:
+        return {"kind": "empty"}
+    if constructor_id == INPUT_CHAT_UPLOADED_PHOTO_CONSTRUCTOR:
+        flags = reader.uint32()
+        media = {"kind": "uploaded"}
+        if flags & 1:
+            media["file"] = _read_input_file(reader)
+        if flags & 2:
+            media["video"] = _read_input_file(reader)
+        if flags & 4:
+            media["video_start_ts"] = reader.double()
+        if flags & 8:
+            raise TLDecodeError("Video emoji markup is not supported")
+        return media
+    if constructor_id == INPUT_CHAT_PHOTO_CONSTRUCTOR:
+        return {"kind": "photo", "photo": _read_input_photo(reader)}
+    raise TLDecodeError(f"Unsupported InputChatPhoto constructor: 0x{constructor_id:08x}")
+
+
+def _read_channel_participants_filter(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id in {
+        CHANNEL_PARTICIPANTS_RECENT_CONSTRUCTOR,
+        CHANNEL_PARTICIPANTS_ADMINS_CONSTRUCTOR,
+    }:
+        return {"kind": "recent" if constructor_id == CHANNEL_PARTICIPANTS_RECENT_CONSTRUCTOR else "admins"}
+    if constructor_id in {
+        CHANNEL_PARTICIPANTS_SEARCH_CONSTRUCTOR,
+        CHANNEL_PARTICIPANTS_KICKED_CONSTRUCTOR,
+        CHANNEL_PARTICIPANTS_BANNED_CONSTRUCTOR,
+    }:
+        return {"kind": "search", "q": reader.bytes().decode("utf-8")}
+    # Empty-bodied official filters (bots/contacts/mentions) are treated as recent.
+    return {"kind": "recent"}
+
+
+def _read_channel_messages_filter(reader: TLReader) -> None:
+    constructor_id = reader.uint32()
+    if constructor_id == CHANNEL_MESSAGES_FILTER_EMPTY_CONSTRUCTOR:
+        return
+    if constructor_id == CHANNEL_MESSAGES_FILTER_CONSTRUCTOR:
+        reader.uint32()
+        for _ in range(reader.vector_count()):
+            reader.int32()
+            reader.int32()
+        return
+    raise TLDecodeError(f"Unsupported ChannelMessagesFilter constructor: 0x{constructor_id:08x}")
 
 
 def _read_input_file(reader: TLReader) -> dict[str, Any]:
@@ -859,6 +965,91 @@ def parse_request(data: bytes) -> TLRequest:
         })
     elif constructor_id == CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR:
         request = TLRequest(constructor_id, "channels_get_full_channel", {"channel": _read_input_channel(reader)})
+    elif constructor_id == CHANNELS_CREATE_CHANNEL_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "channels_create_channel", {
+            "broadcast": bool(flags & 1),
+            "megagroup": bool(flags & 2),
+            "title": reader.bytes().decode("utf-8"),
+            "about": reader.bytes().decode("utf-8"),
+        })
+        if flags & 4:
+            _read_input_geo_point(reader)
+            reader.bytes()
+        if flags & 16:
+            reader.int32()
+    elif constructor_id == CHANNELS_INVITE_TO_CHANNEL_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_invite_to_channel", {
+            "channel": _read_input_channel(reader),
+            "users": [_read_input_user(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == CHANNELS_GET_PARTICIPANTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_get_participants", {
+            "channel": _read_input_channel(reader),
+            "filter": _read_channel_participants_filter(reader),
+            "offset": reader.int32(),
+            "limit": reader.int32(),
+            "hash": reader.int64(),
+        })
+    elif constructor_id == CHANNELS_GET_PARTICIPANT_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_get_participant", {
+            "channel": _read_input_channel(reader),
+            "participant": _read_input_peer(reader),
+        })
+    elif constructor_id == CHANNELS_EDIT_TITLE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_edit_title", {
+            "channel": _read_input_channel(reader),
+            "title": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == CHANNELS_EDIT_PHOTO_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_edit_photo", {
+            "channel": _read_input_channel(reader),
+            "photo": _read_input_chat_photo(reader),
+        })
+    elif constructor_id == CHANNELS_DELETE_CHANNEL_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_delete_channel", {"channel": _read_input_channel(reader)})
+    elif constructor_id == CHANNELS_JOIN_CHANNEL_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_join_channel", {"channel": _read_input_channel(reader)})
+    elif constructor_id == CHANNELS_LEAVE_CHANNEL_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_leave_channel", {"channel": _read_input_channel(reader)})
+    elif constructor_id == UPDATES_GET_CHANNEL_DIFFERENCE_CONSTRUCTOR:
+        flags = reader.uint32()
+        channel = _read_input_channel(reader)
+        _read_channel_messages_filter(reader)
+        request = TLRequest(constructor_id, "updates_get_channel_difference", {
+            "channel": channel,
+            "pts": reader.int32(),
+            "limit": reader.int32(),
+            "force": bool(flags & 1),
+        })
+    elif constructor_id == MESSAGES_GET_EXPORTED_CHAT_INVITE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_exported_chat_invite", {
+            "peer": _read_input_peer(reader),
+            "link": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == MESSAGES_CHECK_CHAT_INVITE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_check_chat_invite", {
+            "hash": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == MESSAGES_IMPORT_CHAT_INVITE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_import_chat_invite", {
+            "hash": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == MESSAGES_GET_ADMINS_WITH_INVITES_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_admins_with_invites", {
+            "peer": _read_input_peer(reader),
+        })
+    elif constructor_id == MESSAGES_GET_CHAT_INVITE_IMPORTERS_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_get_chat_invite_importers", {
+            "requested": bool(flags & 1),
+            "peer": _read_input_peer(reader),
+            "link": reader.bytes().decode("utf-8") if flags & 2 else None,
+            "q": reader.bytes().decode("utf-8") if flags & 4 else None,
+            "offset_date": reader.int32(),
+            "offset_user": _read_input_user(reader),
+            "limit": reader.int32(),
+        })
     elif constructor_id == CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR:
         request = TLRequest(constructor_id, "channels_toggle_slow_mode", {
             "channel": _read_input_channel(reader),
@@ -1568,8 +1759,13 @@ def encode_channel(
     noforwards: bool = False,
     join_request_enabled: bool = False,
     default_banned_rights_flags: int | None = None,
+    broadcast: bool = False,
 ) -> bytes:
-    flags = (1 << 8) | (1 << 13) | (1 << 17)
+    flags = (1 << 13) | (1 << 17)
+    if broadcast:
+        flags |= 1 << 5
+    else:
+        flags |= 1 << 8
     if creator:
         flags |= 1
     if username:
@@ -1610,7 +1806,7 @@ def encode_channel_full(
     exported_invite: bytes | None = None,
     pts: int = 0,
 ) -> bytes:
-    flags = (1 << 0) | (1 << 1)
+    flags = (1 << 0) | (1 << 1) | (1 << 3) | (1 << 6)
     if slowmode_seconds:
         flags |= 1 << 17
     if exported_invite is not None:
@@ -2057,4 +2253,110 @@ def encode_bad_server_salt(*, bad_message_id: int, bad_message_seq_no: int, new_
         + encode_int32(bad_message_seq_no)
         + encode_int32(48)
         + encode_int64(new_server_salt)
+    )
+
+
+def encode_update_edit_channel_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
+    return (
+        encode_uint32(UPDATE_EDIT_CHANNEL_MESSAGE_CONSTRUCTOR)
+        + message
+        + encode_int32(pts)
+        + encode_int32(pts_count)
+    )
+
+
+def encode_chat_admin_rights(*, flags: int = 0x7FFFF) -> bytes:
+    return encode_uint32(CHAT_ADMIN_RIGHTS_CONSTRUCTOR) + encode_uint32(flags)
+
+
+def encode_channel_participant(*, user_id: int, date: int, role: str = "member") -> bytes:
+    if role == "owner":
+        return (
+            encode_uint32(CHANNEL_PARTICIPANT_CREATOR_CONSTRUCTOR)
+            + encode_uint32(0)
+            + encode_int64(user_id)
+            + encode_chat_admin_rights()
+        )
+    return (
+        encode_uint32(CHANNEL_PARTICIPANT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int64(user_id)
+        + encode_int32(date)
+    )
+
+
+def encode_channels_channel_participants(
+    *, count: int, participants: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes]
+) -> bytes:
+    return (
+        encode_uint32(CHANNELS_CHANNEL_PARTICIPANTS_CONSTRUCTOR)
+        + encode_int32(count)
+        + encode_vector(participants)
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
+
+
+def encode_channels_channel_participant(
+    *, participant: bytes, chats: Iterable[bytes], users: Iterable[bytes]
+) -> bytes:
+    return (
+        encode_uint32(CHANNELS_CHANNEL_PARTICIPANT_CONSTRUCTOR)
+        + participant
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
+
+
+def encode_updates_channel_difference_empty(*, pts: int) -> bytes:
+    return (
+        encode_uint32(UPDATES_CHANNEL_DIFFERENCE_EMPTY_CONSTRUCTOR)
+        + encode_uint32(1)
+        + encode_int32(pts)
+    )
+
+
+def encode_chat_invite(
+    *,
+    title: str,
+    participants_count: int,
+    broadcast: bool,
+    about: str = "",
+) -> bytes:
+    flags = 1
+    if broadcast:
+        flags |= 1 << 1
+    else:
+        flags |= 1 << 3
+    if about:
+        flags |= 1 << 5
+    return (
+        encode_uint32(CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_tl_string(title)
+        + (encode_tl_string(about) if about else b"")
+        + encode_photo_empty()
+        + encode_int32(participants_count)
+        + encode_int32(0)
+    )
+
+
+def encode_messages_chat_invite_join_result_ok(*, updates: bytes) -> bytes:
+    return encode_uint32(MESSAGES_CHAT_INVITE_JOIN_RESULT_OK_CONSTRUCTOR) + updates
+
+
+def encode_messages_chat_admins_with_invites() -> bytes:
+    return (
+        encode_uint32(MESSAGES_CHAT_ADMINS_WITH_INVITES_CONSTRUCTOR)
+        + encode_vector([])
+        + encode_vector([])
+    )
+
+
+def encode_messages_chat_invite_importers() -> bytes:
+    return (
+        encode_uint32(MESSAGES_CHAT_INVITE_IMPORTERS_CONSTRUCTOR)
+        + encode_int32(0)
+        + encode_vector([])
+        + encode_vector([])
     )

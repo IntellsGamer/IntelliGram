@@ -268,10 +268,17 @@ def edit_chat_title(connection: sqlite3.Connection, *, chat_id: int, actor_user_
 
 
 def edit_chat_about(connection: sqlite3.Connection, *, chat_id: int, actor_user_id: int, about: str) -> None:
-    _require_chat_manager(connection, chat_id=chat_id, user_id=actor_user_id)
+    membership = _require_active_membership(connection, chat_id, actor_user_id)
+    if str(membership["kind"]) not in {"chat", "channel"}:
+        raise MessagingError("PEER_ID_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
     if len(about) > 255:
         raise MessagingError("CHAT_ABOUT_TOO_LONG")
-    connection.execute("UPDATE peers SET about = ? WHERE id = ? AND kind = 'chat'", (about, chat_id))
+    connection.execute(
+        "UPDATE peers SET about = ? WHERE id = ? AND kind IN ('chat', 'channel')",
+        (about, chat_id),
+    )
 
 
 def edit_peer_default_banned_rights(
@@ -347,6 +354,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
                COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds,
                COALESCE(cs.noforwards, 0) AS noforwards,
                COALESCE(cs.join_request_enabled, 0) AS join_request_enabled,
+               COALESCE(cs.is_broadcast, 0) AS is_broadcast,
                COALESCE(crs.mode, 'none') AS reaction_mode,
                COALESCE(crs.allow_custom, 0) AS reaction_allow_custom,
                COALESCE(crs.emoticons_json, '[]') AS reaction_emoticons_json
@@ -356,7 +364,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         LEFT JOIN channel_reaction_settings crs ON crs.peer_id = p.id
         WHERE p.id = ? AND p.kind = 'channel'
         GROUP BY p.id, p.title, p.about, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards,
-                 cs.join_request_enabled, crs.mode, crs.allow_custom, crs.emoticons_json
+                 cs.join_request_enabled, cs.is_broadcast, crs.mode, crs.allow_custom, crs.emoticons_json
         """,
         (channel_id,),
     ).fetchone()
@@ -365,7 +373,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
     details = {
         key: (
             int(row[key])
-            if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds", "noforwards", "join_request_enabled", "reaction_allow_custom"}
+            if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds", "noforwards", "join_request_enabled", "is_broadcast", "reaction_allow_custom"}
             else row[key]
         )
         for key in row.keys()
@@ -384,11 +392,10 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         """,
         (channel_id,),
     ).fetchone()
-    details["exported_invite"] = (
-        {key: exported_invite[key] for key in exported_invite.keys()}
-        if exported_invite is not None
-        else None
-    )
+    if exported_invite is not None:
+        details["exported_invite"] = {key: exported_invite[key] for key in exported_invite.keys()}
+    else:
+        details["exported_invite"] = None
     return details
 
 
@@ -827,6 +834,207 @@ def create_group(
             append_update(connection, user_id=user_id, kind="updateNewChat", payload={"chat_id": peer_id, "title": title})
         )
     return peer_id, emitted
+
+
+def ensure_permanent_exported_invite(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    actor_user_id: int,
+    public_link_base_url: str = "https://intelligram.local",
+) -> dict[str, Any]:
+    """Return the durable primary invite Web K shows in the invite-link tab."""
+
+    return export_chat_invite(
+        connection,
+        peer_id=peer_id,
+        actor_user_id=actor_user_id,
+        expire_date=None,
+        usage_limit=None,
+        request_needed=False,
+        title=None,
+        public_link_base_url=public_link_base_url,
+    )
+
+
+def create_channel(
+    connection: sqlite3.Connection,
+    *,
+    owner_user_id: int,
+    title: str,
+    about: str = "",
+    broadcast: bool = False,
+    megagroup: bool = False,
+    member_user_ids: list[int] | None = None,
+    public_link_base_url: str = "https://intelligram.local",
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    title = title.strip()
+    if not title:
+        raise MessagingError("CHAT_TITLE_EMPTY")
+    if len(about) > 255:
+        raise MessagingError("CHAT_ABOUT_TOO_LONG")
+    is_broadcast = bool(broadcast) and not megagroup
+    unique_members = sorted(set([owner_user_id, *(member_user_ids or [])]))
+    existing = connection.execute(
+        f"SELECT id FROM users WHERE id IN ({','.join('?' for _ in unique_members)})",
+        unique_members,
+    ).fetchall()
+    if len(existing) != len(unique_members):
+        raise MessagingError("USER_ID_INVALID")
+    now = now_unix()
+    cursor = connection.execute(
+        "INSERT INTO peers(kind, title, about, created_by_user_id, created_at) VALUES ('channel', ?, ?, ?, ?)",
+        (title, about, owner_user_id, now),
+    )
+    peer_id = int(cursor.lastrowid)
+    connection.execute(
+        "INSERT INTO channel_settings(peer_id, slowmode_seconds, is_broadcast) VALUES (?, 0, ?)",
+        (peer_id, int(is_broadcast)),
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO channel_reaction_settings(peer_id, mode, allow_custom, emoticons_json, updated_at) VALUES (?, 'none', 0, '[]', ?)",
+        (peer_id, now),
+    )
+    emitted: list[UpdateEnvelope] = []
+    for user_id in unique_members:
+        role = "owner" if user_id == owner_user_id else "member"
+        connection.execute(
+            "INSERT INTO peer_memberships(peer_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)",
+            (peer_id, user_id, role, now),
+        )
+        _ensure_dialog(connection, user_id, peer_id, None, 0)
+        emitted.append(
+            append_update(connection, user_id=user_id, kind="updateChannel", payload={"channel_id": peer_id})
+        )
+    ensure_permanent_exported_invite(
+        connection,
+        peer_id=peer_id,
+        actor_user_id=owner_user_id,
+        public_link_base_url=public_link_base_url,
+    )
+    details = get_channel_details(connection, channel_id=peer_id, user_id=owner_user_id)
+    return details, emitted
+
+
+def invite_to_channel(
+    connection: sqlite3.Connection,
+    *,
+    channel_id: int,
+    actor_user_id: int,
+    invited_user_ids: list[int],
+) -> list[UpdateEnvelope]:
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    emitted: list[UpdateEnvelope] = []
+    for invited_user_id in invited_user_ids:
+        user = connection.execute("SELECT id FROM users WHERE id = ?", (invited_user_id,)).fetchone()
+        if user is None:
+            raise MessagingError("USER_ID_INVALID")
+        existing = connection.execute(
+            "SELECT left_at FROM peer_memberships WHERE peer_id = ? AND user_id = ?",
+            (channel_id, invited_user_id),
+        ).fetchone()
+        now = now_unix()
+        if existing is not None and existing["left_at"] is None:
+            continue
+        if existing is None:
+            connection.execute(
+                "INSERT INTO peer_memberships(peer_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                (channel_id, invited_user_id, now),
+            )
+        else:
+            connection.execute(
+                "UPDATE peer_memberships SET role = 'member', joined_at = ?, left_at = NULL WHERE peer_id = ? AND user_id = ?",
+                (now, channel_id, invited_user_id),
+            )
+        _ensure_dialog(connection, invited_user_id, channel_id, None, 0)
+        emitted.append(
+            append_update(connection, user_id=invited_user_id, kind="updateChannel", payload={"channel_id": channel_id})
+        )
+    for member_id in _active_member_ids(connection, peer_id=channel_id):
+        emitted.append(
+            append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        )
+    return emitted
+
+
+def join_channel(connection: sqlite3.Connection, *, channel_id: int, user_id: int) -> list[UpdateEnvelope]:
+    peer = connection.execute("SELECT kind FROM peers WHERE id = ?", (channel_id,)).fetchone()
+    if peer is None or str(peer["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    existing = connection.execute(
+        "SELECT left_at FROM peer_memberships WHERE peer_id = ? AND user_id = ?",
+        (channel_id, user_id),
+    ).fetchone()
+    now = now_unix()
+    if existing is not None and existing["left_at"] is None:
+        return []
+    if existing is None:
+        connection.execute(
+            "INSERT INTO peer_memberships(peer_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+            (channel_id, user_id, now),
+        )
+    else:
+        connection.execute(
+            "UPDATE peer_memberships SET left_at = NULL, joined_at = ? WHERE peer_id = ? AND user_id = ?",
+            (now, channel_id, user_id),
+        )
+    _ensure_dialog(connection, user_id, channel_id, None, 0)
+    return [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in _active_member_ids(connection, peer_id=channel_id)
+    ]
+
+
+def leave_channel(connection: sqlite3.Connection, *, channel_id: int, user_id: int) -> list[UpdateEnvelope]:
+    membership = _require_active_membership(connection, channel_id, user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) == "owner":
+        raise MessagingError("USER_CREATOR")
+    connection.execute(
+        "UPDATE peer_memberships SET left_at = ? WHERE peer_id = ? AND user_id = ?",
+        (now_unix(), channel_id, user_id),
+    )
+    connection.execute("DELETE FROM dialogs WHERE user_id = ? AND peer_id = ?", (user_id, channel_id))
+    remaining = _active_member_ids(connection, peer_id=channel_id)
+    return [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in [*remaining, user_id]
+    ]
+
+
+def delete_channel(connection: sqlite3.Connection, *, channel_id: int, actor_user_id: int) -> list[UpdateEnvelope]:
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) != "owner":
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    member_ids = _active_member_ids(connection, peer_id=channel_id)
+    now = now_unix()
+    connection.execute("UPDATE peer_memberships SET left_at = ? WHERE peer_id = ? AND left_at IS NULL", (now, channel_id))
+    connection.execute("DELETE FROM dialogs WHERE peer_id = ?", (channel_id,))
+    return [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in member_ids
+    ]
+
+
+def lookup_exported_invite(connection: sqlite3.Connection, *, link_or_hash: str) -> dict[str, Any] | None:
+    token = link_or_hash.rsplit("+", 1)[-1].strip().lstrip("/")
+    row = connection.execute(
+        """
+        SELECT token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+               usage, request_needed, permanent, revoked
+        FROM exported_invites
+        WHERE token = ? OR link = ?
+        """,
+        (token, link_or_hash),
+    ).fetchone()
+    return {key: row[key] for key in row.keys()} if row is not None else None
 
 
 def send_message(
