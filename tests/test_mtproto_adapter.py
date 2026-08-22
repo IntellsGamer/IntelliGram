@@ -1566,6 +1566,86 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
         assert active_replacement is not None and int(active_replacement["count"]) == 1
 
 
+def test_web_k_persists_channel_content_protection_after_encrypted_toggle(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CHANNEL_CONSTRUCTOR,
+        CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
+        INPUT_CHANNEL_CONSTRUCTOR,
+        MESSAGES_CHAT_FULL_CONSTRUCTOR,
+        MESSAGES_TOGGLE_NO_FORWARDS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_bool,
+        encode_int64,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import create_group, migrate_chat_to_channel
+
+    auth_key = bytes(range(255, -1, -1))
+    salt, session_id = 947, 209
+    database = Database(tmp_path / "content-protection.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000183", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+        chat_id, _ = create_group(connection, owner_user_id=owner.user_id, title="Protected group", member_user_ids=[])
+        migrate_chat_to_channel(connection, chat_id=chat_id, actor_user_id=owner.user_id)
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    message_id = (int(time.time()) << 32) + 8
+    input_peer_channel = (
+        encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+    )
+    toggle_request = (
+        encode_uint32(MESSAGES_TOGGLE_NO_FORWARDS_CONSTRUCTOR)
+        + encode_uint32(0)
+        + input_peer_channel
+        + encode_bool(True)
+    )
+    toggle_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=toggle_request,
+    ))
+    assert toggle_response is not None
+    _, _, _, _, toggle_body = _decrypt_server(auth_key, toggle_response)
+    toggle_reader = TLReader(toggle_body)
+    assert toggle_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert toggle_reader.int64() == message_id
+    assert toggle_reader.uint32() == UPDATES_CONSTRUCTOR
+    channel_offset = toggle_body.index(encode_uint32(CHANNEL_CONSTRUCTOR))
+    encoded_channel = TLReader(toggle_body[channel_offset:])
+    assert encoded_channel.uint32() == CHANNEL_CONSTRUCTOR
+    assert encoded_channel.uint32() & (1 << 27)
+    with database.transaction() as connection:
+        settings = connection.execute("SELECT noforwards FROM channel_settings WHERE peer_id = ?", (chat_id,)).fetchone()
+        assert settings is not None and int(settings["noforwards"]) == 1
+
+    full_message_id = message_id + 4
+    input_channel = encode_uint32(INPUT_CHANNEL_CONSTRUCTOR) + encode_int64(chat_id) + encode_int64((chat_id << 32) | 1)
+    full_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=full_message_id,
+        seq_no=3,
+        body=encode_uint32(CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR) + input_channel,
+    ))
+    assert full_response is not None
+    _, _, _, _, full_body = _decrypt_server(auth_key, full_response)
+    full_reader = TLReader(full_body)
+    assert full_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert full_reader.int64() == full_message_id
+    assert full_reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+    full_channel_offset = full_body.index(encode_uint32(CHANNEL_CONSTRUCTOR))
+    full_channel = TLReader(full_body[full_channel_offset:])
+    assert full_channel.uint32() == CHANNEL_CONSTRUCTOR
+    assert full_channel.uint32() & (1 << 27)
+
+
 def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:
     from intelligram.mtproto.tl import (
         HELP_COUNTRIES_LIST_CONSTRUCTOR,

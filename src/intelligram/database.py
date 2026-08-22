@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +95,8 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS channel_settings (
                     peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
-                    slowmode_seconds INTEGER NOT NULL DEFAULT 0 CHECK(slowmode_seconds IN (0, 5, 10, 30, 60, 300, 900, 3600))
+                    slowmode_seconds INTEGER NOT NULL DEFAULT 0 CHECK(slowmode_seconds IN (0, 5, 10, 30, 60, 300, 900, 3600)),
+                    noforwards INTEGER NOT NULL DEFAULT 0 CHECK(noforwards IN (0, 1))
                 );
 
                 CREATE TABLE IF NOT EXISTS peer_permissions (
@@ -236,7 +237,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '7')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '8')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
@@ -256,6 +257,12 @@ class Database:
                 connection.execute("ALTER TABLE users ADD COLUMN about TEXT NOT NULL DEFAULT ''")
             if "profile_photo_id" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN profile_photo_id INTEGER")
+            channel_settings_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(channel_settings)").fetchall()
+            }
+            if "noforwards" not in channel_settings_columns:
+                connection.execute("ALTER TABLE channel_settings ADD COLUMN noforwards INTEGER NOT NULL DEFAULT 0")
             peer_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(peers)").fetchall()

@@ -128,6 +128,7 @@ MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR = 0xA455DE90
 MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xBDCA2F75
 MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0x56987BD5
 MESSAGES_DELETE_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xD464A42B
+MESSAGES_TOGGLE_NO_FORWARDS_CONSTRUCTOR = 0xB2081A35
 CHAT_INVITE_EXPORTED_CONSTRUCTOR = 0xA22CBD96
 MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0x1871BE50
 MESSAGES_EXPORTED_CHAT_INVITE_REPLACED_CONSTRUCTOR = 0x222600EF
@@ -647,6 +648,13 @@ def parse_request(data: bytes) -> TLRequest:
             "request_needed": _read_bool(reader) if flags & (1 << 3) else None,
             "title": reader.bytes().decode("utf-8") if flags & (1 << 4) else None,
             "title_provided": bool(flags & (1 << 4)),
+        })
+    elif constructor_id == MESSAGES_TOGGLE_NO_FORWARDS_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_toggle_no_forwards", {
+            "peer": _read_input_peer(reader),
+            "enabled": _read_bool(reader),
+            "request_msg_id": reader.int32() if flags & 1 else None,
         })
     elif constructor_id == MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_delete_revoked_exported_chat_invites", {
@@ -1237,6 +1245,7 @@ def encode_channel(
     date: int,
     creator: bool,
     slowmode_enabled: bool = False,
+    noforwards: bool = False,
     default_banned_rights_flags: int | None = None,
 ) -> bytes:
     flags = (1 << 8) | (1 << 13) | (1 << 17)
@@ -1244,6 +1253,8 @@ def encode_channel(
         flags |= 1
     if slowmode_enabled:
         flags |= 1 << 22
+    if noforwards:
+        flags |= 1 << 27
     if default_banned_rights_flags is not None:
         flags |= 1 << 18
     return (
