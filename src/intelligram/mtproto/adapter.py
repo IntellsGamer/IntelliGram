@@ -149,6 +149,7 @@ class MTProtoSessionAdapter:
     dc_port: int = 8080
     login_tokens: dict[bytes, int] = field(default_factory=dict)
     database: Database | None = None
+    public_link_base_url: str = "https://intelligram.local"
     user_id: int | None = None
     pending_update_envelopes: list[object] = field(default_factory=list)
 
@@ -1709,6 +1710,7 @@ class MTProtoSessionAdapter:
                     request_needed=request_needed,
                     title=title,
                     title_provided=title_provided,
+                    public_link_base_url=self.public_link_base_url,
                 )
 
                 def encode_invite(invite: dict[str, object]) -> bytes:
@@ -1862,6 +1864,7 @@ class MTProtoSessionAdapter:
                     usage_limit=usage_limit,
                     request_needed=request_needed,
                     title=title,
+                    public_link_base_url=self.public_link_base_url,
                 )
                 result = encode_exported_chat_invite(
                     link=str(invite["link"]),

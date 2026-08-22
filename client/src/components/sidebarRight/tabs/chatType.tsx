@@ -1,5 +1,6 @@
 import {Component} from 'solid-js';
 import {copyTextToClipboard} from '@helpers/clipboard';
+import App from '@config/app';
 import {randomLong} from '@helpers/random';
 import {Chat, ChatFull, ExportedChatInvite} from '@layer';
 import Button from '@components/button';
@@ -136,7 +137,7 @@ const ChatType: Component = () => {
     const inputWrapper = document.createElement('div');
     inputWrapper.classList.add('input-wrapper');
 
-    const placeholder = 't.me/';
+    const placeholder = App.publicLinkDisplayPrefix;
 
     let changedPrivacy: boolean, changedJoinToSend: boolean, changedJoinRequest: boolean;
     const onChange = () => {

@@ -438,6 +438,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                     auth_key=completed.auth_key,
                                     server_salt=completed.server_salt,
                                     database=database,
+                                    public_link_base_url=settings.public_link_base_url,
                                 ),
                             )
                     else:
@@ -451,6 +452,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 auth_key=completed.auth_key,
                                 server_salt=completed.server_salt,
                                 database=database,
+                                public_link_base_url=settings.public_link_base_url,
                             )
                             with database.transaction() as connection:
                                 binding = connection.execute(

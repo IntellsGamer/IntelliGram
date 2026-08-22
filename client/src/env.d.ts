@@ -3,6 +3,7 @@
 /// <reference types="vitest" />
 
 interface ImportMetaEnv {
+  readonly VITE_INTELLIGRAM_PUBLIC_LINK_BASE_URL?: string;
   readonly VITE_API_ID: string;
   readonly VITE_API_HASH: string;
   readonly VITE_VERSION: string;

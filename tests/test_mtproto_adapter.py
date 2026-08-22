@@ -1134,7 +1134,14 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
             connection, phone="+15550000182", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
         )
         chat_id, _ = create_group(connection, owner_user_id=owner.user_id, title="Migratable group", member_user_ids=[])
-    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    public_link_base_url = "https://links.example.intelligram.test/tenant/"
+    adapter = MTProtoSessionAdapter(
+        auth_key=auth_key,
+        server_salt=salt,
+        database=database,
+        public_link_base_url=public_link_base_url,
+        user_id=owner.user_id,
+    )
     message_id = (int(time.time()) << 32) + 4
 
     default_rights = (
@@ -1302,12 +1309,14 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     invite_flags = invite_reader.uint32()
     assert invite_flags & (1 << 8)
     named_invite_link = invite_reader.bytes().decode("utf-8")
-    assert named_invite_link.startswith("https://intelligram.local/+")
+    assert named_invite_link.startswith("https://links.example.intelligram.test/tenant/+")
     with database.transaction() as connection:
         invite = connection.execute(
-            "SELECT title, permanent, revoked FROM exported_invites WHERE peer_id = ?", (chat_id,)
+            "SELECT link, title, permanent, revoked FROM exported_invites WHERE peer_id = ?", (chat_id,)
         ).fetchone()
-        assert invite is not None and (invite["title"], int(invite["permanent"]), int(invite["revoked"])) == ("Regression invite", 0, 0)
+        assert invite is not None
+        assert str(invite["link"]).startswith("https://links.example.intelligram.test/tenant/+")
+        assert (invite["title"], int(invite["permanent"]), int(invite["revoked"])) == ("Regression invite", 0, 0)
 
     list_message_id = invite_message_id + 4
     list_request = (
@@ -1359,6 +1368,7 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     assert permanent_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
     assert permanent_reader.uint32() & (1 << 5)  # permanent
     permanent_invite_link = permanent_reader.bytes().decode("utf-8")
+    assert permanent_invite_link.startswith("https://links.example.intelligram.test/tenant/+")
 
     full_with_invite_message_id = permanent_message_id + 4
     full_with_invite_response = adapter.handle_encrypted(_encrypt_client(
@@ -1393,7 +1403,7 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     assert full_with_invite_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
     exported_flags = full_with_invite_reader.uint32()
     assert exported_flags & (1 << 5)  # permanent
-    assert full_with_invite_reader.bytes().decode("utf-8").startswith("https://intelligram.local/+")
+    assert full_with_invite_reader.bytes().decode("utf-8").startswith("https://links.example.intelligram.test/tenant/+")
 
     edit_invite_message_id = full_with_invite_message_id + 4
     edit_invite_request = (
@@ -1527,6 +1537,8 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     revoke_permanent_reader.int32()  # old invite date
     assert revoke_permanent_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
     assert revoke_permanent_reader.uint32() & (1 << 5)  # replacement permanent invite
+    replacement_invite_link = revoke_permanent_reader.bytes().decode("utf-8")
+    assert replacement_invite_link.startswith("https://links.example.intelligram.test/tenant/+")
     with database.transaction() as connection:
         active_permanent = connection.execute(
             "SELECT COUNT(*) AS count FROM exported_invites WHERE peer_id = ? AND permanent = 1 AND revoked = 0",

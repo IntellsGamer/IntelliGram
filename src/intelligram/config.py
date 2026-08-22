@@ -4,6 +4,20 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import secrets
+from urllib.parse import urlsplit
+
+
+DEFAULT_PUBLIC_LINK_BASE_URL = "https://intelligram.local"
+
+
+def _normalize_public_link_base_url(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError(
+            "INTELLIGRAM_PUBLIC_LINK_BASE_URL must be an absolute HTTP(S) URL without a query or fragment"
+        )
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +39,9 @@ class Settings:
     mtproto_port: int
     mtproto_rsa_private_key_path: Path
     mtproto_rsa_public_key_path: Path
+    # External, user-visible base for public usernames and server-generated invite links.
+    # This is intentionally separate from `public_base_url`, which identifies the HTTP API.
+    public_link_base_url: str = DEFAULT_PUBLIC_LINK_BASE_URL
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -59,6 +76,9 @@ class Settings:
             mtproto_rsa_public_key_path=Path(
                 os.getenv("INTELLIGRAM_MTPROTO_RSA_PUBLIC_KEY", str(data_dir / "mtproto_server_public.pem"))
             ).resolve(),
+            public_link_base_url=_normalize_public_link_base_url(
+                os.getenv("INTELLIGRAM_PUBLIC_LINK_BASE_URL", DEFAULT_PUBLIC_LINK_BASE_URL)
+            ),
         )
 
     def ensure_directories(self) -> None:

@@ -499,6 +499,7 @@ def export_chat_invite(
     usage_limit: int | None,
     request_needed: bool,
     title: str | None,
+    public_link_base_url: str = "https://intelligram.local",
 ) -> dict[str, Any]:
     expire_date = expire_date or None
     usage_limit = usage_limit or None
@@ -530,7 +531,7 @@ def export_chat_invite(
         if existing is not None:
             return {key: existing[key] for key in existing.keys()}
     token = secrets.token_urlsafe(18).replace("-", "").replace("_", "")
-    link = f"https://intelligram.local/+{token}"
+    link = f"{public_link_base_url.rstrip('/')}/+{token}"
     connection.execute(
         """
         INSERT INTO exported_invites(
@@ -623,6 +624,7 @@ def edit_exported_chat_invite(
     request_needed: bool | None,
     title: str | None,
     title_provided: bool,
+    public_link_base_url: str = "https://intelligram.local",
 ) -> dict[str, Any]:
     membership = _require_active_membership(connection, peer_id, actor_user_id)
     if str(membership["kind"]) not in {"chat", "channel"}:
@@ -655,6 +657,7 @@ def edit_exported_chat_invite(
                 usage_limit=None,
                 request_needed=False,
                 title=None,
+                public_link_base_url=public_link_base_url,
             )
     else:
         normalized_expire_date = expire_date or None

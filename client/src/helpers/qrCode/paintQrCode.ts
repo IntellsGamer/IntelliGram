@@ -1,4 +1,5 @@
 import pause from '@helpers/schedulers/pause';
+import App from '@config/app';
 
 /**
  * Builds a Telegram-styled QR canvas for `data` using the supplied palette.
@@ -99,10 +100,10 @@ export async function paintQrCode(options: PaintQrOptions) {
 }
 
 /**
- * Builds the public `t.me/<username>` link encoded in a user's QR code (the
+ * Builds the configured public `<base>/<username>` link encoded in a user's QR code (the
  * "My QR code" popup). Kept beside `paintQrCode` so the QR callers share one
  * place for the link shape.
  */
 export function buildTelegramUserQrUrl(username: string) {
-  return `https://t.me/${username}`;
+  return `${App.publicLinkBaseUrl}/${username}`;
 }

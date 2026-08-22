@@ -1,6 +1,7 @@
 import {batch, createContext, createEffect, createMemo, createResource, createSignal, For, JSX, on, onCleanup, Show, untrack, useContext} from 'solid-js';
 import {render} from 'solid-js/web';
 import Badge from '@components/badge';
+import App from '@config/app';
 import Section from '@components/section';
 import getLinkedCommunityId from '@appManagers/utils/communities/getLinkedCommunityId';
 import numberThousandSplitter from '@helpers/number/numberThousandSplitter';
@@ -979,14 +980,14 @@ PeerProfile.Link = () => {
   const context = useContext(PeerProfileContext);
   const {i18n, I18n, toast, showMyQrCodePopup} = useHotReloadGuard();
 
-  const toFill = createMemo<Partial<{url: string, also: JSX.Element}>>(() => {
+  const toFill = createMemo<Partial<{url: string, copyUrl: string, also: JSX.Element}>>(() => {
     if(context.peerId.isUser()) {
       return;
     }
 
     const usernames = getPeerActiveUsernames(context.peer as Chat.channel);
     if(context.isTopic) {
-      let url = 't.me/';
+      let url = App.publicLinkDisplayPrefix;
       const threadId = getServerMessageId(context.threadId);
       const username = usernames[0];
       if(username) {
@@ -995,12 +996,13 @@ PeerProfile.Link = () => {
         url += `c/${context.peerId.toChatId()}/${threadId}`;
       }
 
-      return {url};
+      return {url, copyUrl: `${App.publicLinkBaseUrl}/${url.slice(App.publicLinkDisplayPrefix.length)}`};
     }
 
     if(usernames.length) {
       return {
-        url: 't.me/' + usernames[0],
+        url: App.publicLinkDisplayPrefix + usernames[0],
+        copyUrl: `${App.publicLinkBaseUrl}/${usernames[0]}`,
         also: getUsernamesAlso(usernames)
       };
     }
@@ -1008,13 +1010,14 @@ PeerProfile.Link = () => {
     const exportedInvite = (context.fullPeer as ChatFull.channelFull)?.exported_invite;
     if(exportedInvite?._ === 'chatInviteExported') {
       return {
-        url: exportedInvite.link.slice(exportedInvite.link.indexOf('t.me/'))
+        url: exportedInvite.link.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ''),
+        copyUrl: exportedInvite.link
       };
     }
   });
 
   const onClick = () => {
-    const url = 'https://' + toFill().url;
+    const url = toFill().copyUrl;
     copyTextToClipboard(url);
     // Promise.resolve(appProfileManager.getChatFull(this.peerId.toChatId())).then((chatFull) => {
     // copyTextToClipboard(chatFull.exported_invite.link);

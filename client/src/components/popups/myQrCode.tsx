@@ -16,6 +16,7 @@ import {i18n} from '@lib/langPack';
 import rootScope from '@lib/rootScope';
 import themeController from '@helpers/themeController';
 import {paintQrCode, buildTelegramUserQrUrl} from '@helpers/qrCode/paintQrCode';
+import App from '@config/app';
 import {getWallPaperColors, darkenToMaxLuminance} from '@helpers/color';
 import roundRect from '@helpers/canvas/roundRect';
 import getPeerActiveUsernames from '@appManagers/utils/peers/getPeerActiveUsernames';
@@ -104,16 +105,16 @@ function createSharedState(self: User.user, peerId: PeerId = rootScope.myId, ove
   );
 
   // `overrideUrl` is for peers whose link isn't a public username — e.g. a private
-  // group's invite link, which PeerProfile.Link already resolved. Otherwise mirror
-  // Telegram-iOS' QR codeLink (ChatQrCodeScreen.swift L1740-1748): username →
-  // t.me/<username>; a user without one → t.me/+<phone>; a channel → t.me/c/<id>.
+  // group's invite link, which PeerProfile.Link already resolved. Otherwise encode
+  // the configured IntelliGram public base for usernames, user contact fallbacks,
+  // and channel fallback routes.
   const profileUrl = createMemo(() => {
     if(overrideUrl) return overrideUrl;
     const tokenUrl = contactTokenUrl();
     if(tokenUrl) return tokenUrl;
     if(username()) return buildTelegramUserQrUrl(username());
-    if(peerId.isUser()) return `https://t.me/+${(self as User.user).phone ?? ''}`;
-    return `https://t.me/c/${peerId.toChatId()}`;
+    if(peerId.isUser()) return `${App.publicLinkBaseUrl}/+${(self as User.user).phone ?? ''}`;
+    return `${App.publicLinkBaseUrl}/c/${peerId.toChatId()}`;
   });
 
   // The fallback brightness must stay reactive to a GLOBAL theme change while the

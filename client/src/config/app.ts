@@ -12,6 +12,10 @@ const threads = Math.min(4, navigator.hardwareConcurrency ?? 4);
 const configuredApiId = Number(import.meta.env.VITE_INTELLIGRAM_API_ID ?? 1);
 const configuredBuild = Number(import.meta.env.VITE_BUILD ?? 1);
 const configuredLangPackVersion = Number(import.meta.env.VITE_LANG_PACK_VERSION ?? 1);
+const publicLinkBaseUrl = (import.meta.env.VITE_INTELLIGRAM_PUBLIC_LINK_BASE_URL ?? 'https://intelligram.local')
+  .trim()
+  .replace(/\/+$/, '') || 'https://intelligram.local';
+const publicLinkDisplayPrefix = `${publicLinkBaseUrl.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')}/`;
 
 const App = {
   id: Number.isSafeInteger(configuredApiId) && configuredApiId > 0 ? configuredApiId : 1,
@@ -34,7 +38,11 @@ const App = {
   threads,
   lottieWorkers: threads,
   cryptoWorkers: threads,
-  interclientBroadcastChannel: 'intelligram'
+  interclientBroadcastChannel: 'intelligram',
+  // The server remains authoritative for invite URLs. This is the branded
+  // public-channel prefix rendered by Web K beside username-only input.
+  publicLinkBaseUrl,
+  publicLinkDisplayPrefix
 };
 
 export default App;
