@@ -29,8 +29,11 @@ from intelligram.services.messaging import (
     create_group,
     delete_chat_user,
     delete_messages,
+    delete_exported_chat_invite,
+    delete_revoked_exported_chat_invites,
     edit_message,
     edit_chat_about,
+    edit_exported_chat_invite,
     edit_chat_title,
     edit_peer_default_banned_rights,
     export_chat_invite,
@@ -83,6 +86,8 @@ from intelligram.mtproto.tl import (
     encode_messages_affected_messages,
     encode_messages_available_reactions,
     encode_messages_chat_full,
+    encode_messages_exported_chat_invite,
+    encode_messages_exported_chat_invite_replaced,
     encode_messages_exported_chat_invites,
     encode_messages_chats,
     encode_messages_peer_settings,
@@ -280,6 +285,32 @@ class MTProtoSessionAdapter:
                 usage_limit=request.fields["usage_limit"],
                 request_needed=bool(request.fields["request_needed"]),
                 title=request.fields["title"],
+            )
+        if request.name == "messages_edit_exported_chat_invite":
+            return self._handle_messages_edit_exported_chat_invite(
+                message,
+                peer=request.fields["peer"],
+                link=str(request.fields["link"]),
+                revoked=bool(request.fields["revoked"]),
+                expire_date=request.fields["expire_date"],
+                expire_date_provided=bool(request.fields["expire_date_provided"]),
+                usage_limit=request.fields["usage_limit"],
+                usage_limit_provided=bool(request.fields["usage_limit_provided"]),
+                request_needed=request.fields["request_needed"],
+                title=request.fields["title"],
+                title_provided=bool(request.fields["title_provided"]),
+            )
+        if request.name == "messages_delete_exported_chat_invite":
+            return self._handle_messages_delete_exported_chat_invite(
+                message,
+                peer=request.fields["peer"],
+                link=str(request.fields["link"]),
+            )
+        if request.name == "messages_delete_revoked_exported_chat_invites":
+            return self._handle_messages_delete_revoked_exported_chat_invites(
+                message,
+                peer=request.fields["peer"],
+                admin=request.fields["admin"],
             )
         if request.name == "messages_get_exported_chat_invites":
             return self._handle_messages_get_exported_chat_invites(
@@ -1612,6 +1643,122 @@ class MTProtoSessionAdapter:
                     chats=self._encode_chats(connection, chat_ids={channel_id}, self_user_id=self_user_id),
                     users=self._encode_users(self._load_users(connection, member_ids), self_user_id=self_user_id),
                 )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_edit_exported_chat_invite(
+        self,
+        message: EncryptedMessage,
+        *,
+        peer: dict[str, object],
+        link: str,
+        revoked: bool,
+        expire_date: int | None,
+        expire_date_provided: bool,
+        usage_limit: int | None,
+        usage_limit_provided: bool,
+        request_needed: bool | None,
+        title: str | None,
+        title_provided: bool,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                edited = edit_exported_chat_invite(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    actor_user_id=self_user_id,
+                    link=link,
+                    revoked=revoked,
+                    expire_date=expire_date,
+                    expire_date_provided=expire_date_provided,
+                    usage_limit=usage_limit,
+                    usage_limit_provided=usage_limit_provided,
+                    request_needed=request_needed,
+                    title=title,
+                    title_provided=title_provided,
+                )
+
+                def encode_invite(invite: dict[str, object]) -> bytes:
+                    return encode_exported_chat_invite(
+                        link=str(invite["link"]),
+                        admin_user_id=int(invite["admin_user_id"]),
+                        created_at=int(invite["created_at"]),
+                        expire_date=(int(invite["expire_date"]) if invite["expire_date"] is not None else None),
+                        usage_limit=(int(invite["usage_limit"]) if invite["usage_limit"] is not None else None),
+                        usage=int(invite["usage"]),
+                        request_needed=bool(int(invite["request_needed"])),
+                        permanent=bool(int(invite["permanent"])),
+                        revoked=bool(int(invite["revoked"])),
+                        title=(str(invite["title"]) if invite["title"] is not None else None),
+                    )
+
+                encoded_invite = encode_invite(edited["invite"])
+                replacement = edited["new_invite"]
+                result = (
+                    encode_messages_exported_chat_invite_replaced(
+                        invite=encoded_invite,
+                        new_invite=encode_invite(replacement),
+                    )
+                    if replacement is not None
+                    else encode_messages_exported_chat_invite(invite=encoded_invite)
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_delete_exported_chat_invite(
+        self,
+        message: EncryptedMessage,
+        *,
+        peer: dict[str, object],
+        link: str,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                delete_exported_chat_invite(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    actor_user_id=self_user_id,
+                    link=link,
+                )
+                result = encode_bool(True)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_delete_revoked_exported_chat_invites(
+        self,
+        message: EncryptedMessage,
+        *,
+        peer: dict[str, object],
+        admin: dict[str, object],
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                admin_user_id = self_user_id if str(admin["kind"]) == "self" else int(admin["user_id"])
+                delete_revoked_exported_chat_invites(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    actor_user_id=self_user_id,
+                    admin_user_id=admin_user_id,
+                )
+                result = encode_bool(True)
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(message, result)

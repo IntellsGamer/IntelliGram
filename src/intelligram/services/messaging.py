@@ -488,6 +488,143 @@ def export_chat_invite(
     }
 
 
+def delete_exported_chat_invite(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    actor_user_id: int,
+    link: str,
+) -> None:
+    membership = _require_active_membership(connection, peer_id, actor_user_id)
+    if str(membership["kind"]) not in {"chat", "channel"}:
+        raise MessagingError("PEER_ID_INVALID")
+    invite = connection.execute(
+        "SELECT token, admin_user_id, revoked FROM exported_invites WHERE peer_id = ? AND link = ?",
+        (peer_id, link),
+    ).fetchone()
+    if invite is None:
+        raise MessagingError("INVITE_HASH_INVALID")
+    if int(invite["admin_user_id"]) != actor_user_id and str(membership["role"]) != "owner":
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    if not bool(int(invite["revoked"])):
+        raise MessagingError("INVITE_HASH_INVALID")
+    connection.execute("DELETE FROM exported_invites WHERE token = ?", (str(invite["token"]),))
+
+
+def delete_revoked_exported_chat_invites(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    actor_user_id: int,
+    admin_user_id: int,
+) -> int:
+    membership = _require_active_membership(connection, peer_id, actor_user_id)
+    if str(membership["kind"]) not in {"chat", "channel"}:
+        raise MessagingError("PEER_ID_INVALID")
+    if actor_user_id != admin_user_id and str(membership["role"]) != "owner":
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    cursor = connection.execute(
+        "DELETE FROM exported_invites WHERE peer_id = ? AND admin_user_id = ? AND revoked = 1",
+        (peer_id, admin_user_id),
+    )
+    return int(cursor.rowcount)
+
+
+def edit_exported_chat_invite(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    actor_user_id: int,
+    link: str,
+    revoked: bool,
+    expire_date: int | None,
+    expire_date_provided: bool,
+    usage_limit: int | None,
+    usage_limit_provided: bool,
+    request_needed: bool | None,
+    title: str | None,
+    title_provided: bool,
+) -> dict[str, Any]:
+    membership = _require_active_membership(connection, peer_id, actor_user_id)
+    if str(membership["kind"]) not in {"chat", "channel"}:
+        raise MessagingError("PEER_ID_INVALID")
+    invite = connection.execute(
+        """
+        SELECT token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+               usage, request_needed, permanent, revoked
+        FROM exported_invites
+        WHERE peer_id = ? AND link = ?
+        """,
+        (peer_id, link),
+    ).fetchone()
+    if invite is None:
+        raise MessagingError("INVITE_HASH_INVALID")
+    if int(invite["admin_user_id"]) != actor_user_id and str(membership["role"]) != "owner":
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    if bool(int(invite["revoked"])):
+        raise MessagingError("INVITE_HASH_EXPIRED")
+
+    replacement: dict[str, Any] | None = None
+    if revoked:
+        connection.execute("UPDATE exported_invites SET revoked = 1 WHERE token = ?", (str(invite["token"]),))
+        if bool(int(invite["permanent"])):
+            replacement = export_chat_invite(
+                connection,
+                peer_id=peer_id,
+                actor_user_id=actor_user_id,
+                expire_date=None,
+                usage_limit=None,
+                request_needed=False,
+                title=None,
+            )
+    else:
+        normalized_expire_date = expire_date or None
+        normalized_usage_limit = usage_limit or None
+        if expire_date_provided and normalized_expire_date is not None and normalized_expire_date <= now_unix():
+            raise MessagingError("INVITE_EXPIRE_INVALID")
+        if usage_limit_provided and normalized_usage_limit is not None and not 0 < normalized_usage_limit <= 100000:
+            raise MessagingError("INVITE_USAGE_LIMIT_INVALID")
+        normalized_title = (title or "").strip() or None
+        if title_provided and normalized_title is not None and len(normalized_title) > 64:
+            raise MessagingError("INVITE_TITLE_INVALID")
+        assignments: list[str] = []
+        values: list[object] = []
+        if expire_date_provided:
+            assignments.append("expire_date = ?")
+            values.append(normalized_expire_date)
+        if usage_limit_provided:
+            assignments.append("usage_limit = ?")
+            values.append(normalized_usage_limit)
+        if request_needed is not None:
+            assignments.append("request_needed = ?")
+            values.append(int(request_needed))
+        if title_provided:
+            assignments.append("title = ?")
+            values.append(normalized_title)
+        if assignments:
+            values.append(str(invite["token"]))
+            connection.execute(
+                f"UPDATE exported_invites SET {', '.join(assignments)} WHERE token = ?",
+                values,
+            )
+
+    updated = connection.execute(
+        """
+        SELECT token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+               usage, request_needed, permanent, revoked
+        FROM exported_invites
+        WHERE token = ?
+        """,
+        (str(invite["token"]),),
+    ).fetchone()
+    if updated is None:
+        raise RuntimeError("Invite disappeared after update")
+    return {
+        "invite": {key: updated[key] for key in updated.keys()},
+        "new_invite": replacement,
+    }
+
+
 def list_exported_chat_invites(
     connection: sqlite3.Connection,
     *,

@@ -1089,6 +1089,7 @@ def test_web_k_messages_create_chat_permits_owner_only_group(tmp_path) -> None:
 def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) -> None:
     from intelligram.database import Database
     from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
         CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
         CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR,
         CHANNEL_FULL_CONSTRUCTOR,
@@ -1100,6 +1101,11 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
         INPUT_PEER_CHAT_CONSTRUCTOR,
         MESSAGES_CHAT_FULL_CONSTRUCTOR,
         MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR,
+        MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR,
+        MESSAGES_DELETE_EXPORTED_CHAT_INVITE_CONSTRUCTOR,
+        MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR,
+        MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR,
+        MESSAGES_EXPORTED_CHAT_INVITE_REPLACED_CONSTRUCTOR,
         MESSAGES_MIGRATE_CHAT_CONSTRUCTOR,
         MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR,
         PEER_NOTIFY_SETTINGS_CONSTRUCTOR,
@@ -1110,6 +1116,7 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
         UPDATES_CONSTRUCTOR,
+        encode_bool,
         encode_int32,
         encode_int64,
         encode_tl_string,
@@ -1294,7 +1301,8 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     assert invite_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
     invite_flags = invite_reader.uint32()
     assert invite_flags & (1 << 8)
-    assert invite_reader.bytes().decode("utf-8").startswith("https://intelligram.local/+")
+    named_invite_link = invite_reader.bytes().decode("utf-8")
+    assert named_invite_link.startswith("https://intelligram.local/+")
     with database.transaction() as connection:
         invite = connection.execute(
             "SELECT title, permanent, revoked FROM exported_invites WHERE peer_id = ?", (chat_id,)
@@ -1350,6 +1358,7 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     assert permanent_reader.int64() == permanent_message_id
     assert permanent_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
     assert permanent_reader.uint32() & (1 << 5)  # permanent
+    permanent_invite_link = permanent_reader.bytes().decode("utf-8")
 
     full_with_invite_message_id = permanent_message_id + 4
     full_with_invite_response = adapter.handle_encrypted(_encrypt_client(
@@ -1385,6 +1394,176 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     exported_flags = full_with_invite_reader.uint32()
     assert exported_flags & (1 << 5)  # permanent
     assert full_with_invite_reader.bytes().decode("utf-8").startswith("https://intelligram.local/+")
+
+    edit_invite_message_id = full_with_invite_message_id + 4
+    edit_invite_request = (
+        encode_uint32(MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32((1 << 0) | (1 << 1) | (1 << 3) | (1 << 4))
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_tl_string(named_invite_link)
+        + encode_int32(0)  # explicit unlimited expiry
+        + encode_int32(10)
+        + encode_bool(False)
+        + encode_tl_string("Edited regression invite")
+    )
+    edit_invite_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=edit_invite_message_id,
+        seq_no=19,
+        body=edit_invite_request,
+    ))
+    assert edit_invite_response is not None
+    _, _, _, _, edit_invite_body = _decrypt_server(auth_key, edit_invite_response)
+    edit_invite_reader = TLReader(edit_invite_body)
+    assert edit_invite_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert edit_invite_reader.int64() == edit_invite_message_id
+    assert edit_invite_reader.uint32() == MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR
+    assert edit_invite_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    edited_flags = edit_invite_reader.uint32()
+    assert edited_flags & (1 << 2)  # usage_limit
+    assert edited_flags & (1 << 3)  # usage
+    assert edited_flags & (1 << 8)  # title
+    assert edit_invite_reader.bytes().decode("utf-8") == named_invite_link
+    with database.transaction() as connection:
+        edited_invite = connection.execute(
+            "SELECT title, expire_date, usage_limit, request_needed, revoked FROM exported_invites WHERE link = ?",
+            (named_invite_link,),
+        ).fetchone()
+        assert edited_invite is not None
+        assert (
+            edited_invite["title"],
+            edited_invite["expire_date"],
+            int(edited_invite["usage_limit"]),
+            int(edited_invite["request_needed"]),
+            int(edited_invite["revoked"]),
+        ) == ("Edited regression invite", None, 10, 0, 0)
+
+    revoke_named_message_id = edit_invite_message_id + 4
+    revoke_named_request = (
+        encode_uint32(MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32(1 << 2)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_tl_string(named_invite_link)
+    )
+    revoke_named_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=revoke_named_message_id,
+        seq_no=21,
+        body=revoke_named_request,
+    ))
+    assert revoke_named_response is not None
+    _, _, _, _, revoke_named_body = _decrypt_server(auth_key, revoke_named_response)
+    revoke_named_reader = TLReader(revoke_named_body)
+    assert revoke_named_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert revoke_named_reader.int64() == revoke_named_message_id
+    assert revoke_named_reader.uint32() == MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR
+    assert revoke_named_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    assert revoke_named_reader.uint32() & 1  # revoked
+    with database.transaction() as connection:
+        revoked_named = connection.execute("SELECT revoked FROM exported_invites WHERE link = ?", (named_invite_link,)).fetchone()
+        assert revoked_named is not None and int(revoked_named["revoked"]) == 1
+
+    delete_revoked_message_id = revoke_named_message_id + 4
+    delete_revoked_request = (
+        encode_uint32(MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_uint32(INPUT_USER_SELF_CONSTRUCTOR)
+    )
+    delete_revoked_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=delete_revoked_message_id,
+        seq_no=23,
+        body=delete_revoked_request,
+    ))
+    assert delete_revoked_response is not None
+    _, _, _, _, delete_revoked_body = _decrypt_server(auth_key, delete_revoked_response)
+    delete_revoked_reader = TLReader(delete_revoked_body)
+    assert delete_revoked_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert delete_revoked_reader.int64() == delete_revoked_message_id
+    assert delete_revoked_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    with database.transaction() as connection:
+        deleted_revoked = connection.execute("SELECT COUNT(*) AS count FROM exported_invites WHERE link = ?", (named_invite_link,)).fetchone()
+        assert deleted_revoked is not None and int(deleted_revoked["count"]) == 0
+
+    revoke_permanent_message_id = delete_revoked_message_id + 4
+    revoke_permanent_request = (
+        encode_uint32(MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32(1 << 2)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_tl_string(permanent_invite_link)
+    )
+    revoke_permanent_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=revoke_permanent_message_id,
+        seq_no=25,
+        body=revoke_permanent_request,
+    ))
+    assert revoke_permanent_response is not None
+    _, _, _, _, revoke_permanent_body = _decrypt_server(auth_key, revoke_permanent_response)
+    revoke_permanent_reader = TLReader(revoke_permanent_body)
+    assert revoke_permanent_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert revoke_permanent_reader.int64() == revoke_permanent_message_id
+    assert revoke_permanent_reader.uint32() == MESSAGES_EXPORTED_CHAT_INVITE_REPLACED_CONSTRUCTOR
+    assert revoke_permanent_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    assert revoke_permanent_reader.uint32() & 1  # revoked old permanent invite
+    assert revoke_permanent_reader.bytes().decode("utf-8") == permanent_invite_link
+    revoke_permanent_reader.int64()  # old invite admin_id
+    revoke_permanent_reader.int32()  # old invite date
+    assert revoke_permanent_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    assert revoke_permanent_reader.uint32() & (1 << 5)  # replacement permanent invite
+    with database.transaction() as connection:
+        active_permanent = connection.execute(
+            "SELECT COUNT(*) AS count FROM exported_invites WHERE peer_id = ? AND permanent = 1 AND revoked = 0",
+            (chat_id,),
+        ).fetchone()
+        assert active_permanent is not None and int(active_permanent["count"]) == 1
+
+    delete_single_message_id = revoke_permanent_message_id + 4
+    delete_single_request = (
+        encode_uint32(MESSAGES_DELETE_EXPORTED_CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_tl_string(permanent_invite_link)
+    )
+    delete_single_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=delete_single_message_id,
+        seq_no=27,
+        body=delete_single_request,
+    ))
+    assert delete_single_response is not None
+    _, _, _, _, delete_single_body = _decrypt_server(auth_key, delete_single_response)
+    delete_single_reader = TLReader(delete_single_body)
+    assert delete_single_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert delete_single_reader.int64() == delete_single_message_id
+    assert delete_single_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    with database.transaction() as connection:
+        deleted_single = connection.execute("SELECT COUNT(*) AS count FROM exported_invites WHERE link = ?", (permanent_invite_link,)).fetchone()
+        assert deleted_single is not None and int(deleted_single["count"]) == 0
+        active_replacement = connection.execute(
+            "SELECT COUNT(*) AS count FROM exported_invites WHERE peer_id = ? AND permanent = 1 AND revoked = 0",
+            (chat_id,),
+        ).fetchone()
+        assert active_replacement is not None and int(active_replacement["count"]) == 1
 
 
 def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:

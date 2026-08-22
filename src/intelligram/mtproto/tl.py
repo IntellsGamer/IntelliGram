@@ -125,7 +125,12 @@ CHAT_REACTIONS_ALL_CONSTRUCTOR = 0x52928BCA
 CHAT_REACTIONS_SOME_CONSTRUCTOR = 0x661D4037
 REACTION_EMOJI_CONSTRUCTOR = 0x1B2286B8
 MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR = 0xA455DE90
+MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xBDCA2F75
+MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0x56987BD5
+MESSAGES_DELETE_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xD464A42B
 CHAT_INVITE_EXPORTED_CONSTRUCTOR = 0xA22CBD96
+MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0x1871BE50
+MESSAGES_EXPORTED_CHAT_INVITE_REPLACED_CONSTRUCTOR = 0x222600EF
 MESSAGES_GET_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0xA2B5A3F6
 MESSAGES_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0xBDC62DCC
 CHAT_FULL_CONSTRUCTOR = 0x2633421B
@@ -628,6 +633,30 @@ def parse_request(data: bytes) -> TLRequest:
             "subscription_pricing": None if not flags & (1 << 5) else (_ for _ in ()).throw(
                 TLDecodeError("Paid invite subscriptions are not supported")
             ),
+        })
+    elif constructor_id == MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_edit_exported_chat_invite", {
+            "revoked": bool(flags & (1 << 2)),
+            "peer": _read_input_peer(reader),
+            "link": reader.bytes().decode("utf-8"),
+            "expire_date": reader.int32() if flags & 1 else None,
+            "expire_date_provided": bool(flags & 1),
+            "usage_limit": reader.int32() if flags & (1 << 1) else None,
+            "usage_limit_provided": bool(flags & (1 << 1)),
+            "request_needed": _read_bool(reader) if flags & (1 << 3) else None,
+            "title": reader.bytes().decode("utf-8") if flags & (1 << 4) else None,
+            "title_provided": bool(flags & (1 << 4)),
+        })
+    elif constructor_id == MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_delete_revoked_exported_chat_invites", {
+            "peer": _read_input_peer(reader),
+            "admin": _read_input_user(reader),
+        })
+    elif constructor_id == MESSAGES_DELETE_EXPORTED_CHAT_INVITE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_delete_exported_chat_invite", {
+            "peer": _read_input_peer(reader),
+            "link": reader.bytes().decode("utf-8"),
         })
     elif constructor_id == MESSAGES_GET_EXPORTED_CHAT_INVITES_CONSTRUCTOR:
         flags = reader.uint32()
@@ -1144,6 +1173,21 @@ def encode_exported_chat_invite(
         + (encode_int32(usage_limit) if usage_limit is not None else b"")
         + (encode_int32(usage) if usage_limit is not None else b"")
         + (encode_tl_string(title) if title is not None else b"")
+    )
+
+
+def encode_messages_exported_chat_invite(*, invite: bytes, users: Iterable[bytes] = ()) -> bytes:
+    return encode_uint32(MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR) + invite + encode_vector(users)
+
+
+def encode_messages_exported_chat_invite_replaced(
+    *, invite: bytes, new_invite: bytes, users: Iterable[bytes] = ()
+) -> bytes:
+    return (
+        encode_uint32(MESSAGES_EXPORTED_CHAT_INVITE_REPLACED_CONSTRUCTOR)
+        + invite
+        + new_invite
+        + encode_vector(users)
     )
 
 
