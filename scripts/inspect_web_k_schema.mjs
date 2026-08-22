@@ -12,6 +12,17 @@ if (assertion < 0) {
   throw new Error('Generated schema type assertion was not found');
 }
 const schema = JSON.parse(exportValue.slice(0, assertion + 1));
+if(process.env.PRINT_SCHEMA_TABLES === '1') {
+  console.log(JSON.stringify(Object.fromEntries(Object.entries(schema).map(([key, value]) => [key, value && typeof value === 'object' ? Object.keys(value) : typeof value]))));
+  process.exit(0);
+}
+const lookupConstructorIds = new Set(
+  (process.env.LOOKUP_CONSTRUCTOR_IDS || '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase().replace(/^0x/, ''))
+    .filter(Boolean)
+);
+const onlyLookupConstructorIds = process.env.ONLY_LOOKUP_CONSTRUCTOR_IDS === '1';
 const wanted = new Set([
   'user',
   'userEmpty',
@@ -90,7 +101,18 @@ const wanted = new Set([
   'peerUser',
   'peerChat',
   'account.authorizations',
+  'account.contentSettings',
+  'help.appConfig',
+  'jsonObject',
+  'pong',
 ]);
+const lookupMethodIds = new Set(
+  (process.env.LOOKUP_METHOD_IDS || '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase().replace(/^0x/, ''))
+    .filter(Boolean)
+);
+const onlyLookupMethodIds = process.env.ONLY_LOOKUP_METHOD_IDS === '1';
 const wantedMethods = new Set([
   'users.getUsers',
   'users.getFullUser',
@@ -128,9 +150,17 @@ const wantedMethods = new Set([
   'account.getAuthorizations',
   'account.resetAuthorization',
 ]);
-for (const entry of schema.API.constructors.filter((item) => wanted.has(item.predicate))) {
+const allConstructors = [...schema.API.constructors, ...schema.MTProto.constructors];
+const allMethods = [...schema.API.methods, ...schema.MTProto.methods];
+for (const entry of allConstructors.filter((item) => {
+  const unsignedId = (item.id >>> 0).toString(16).padStart(8, '0');
+  return (!onlyLookupConstructorIds && wanted.has(item.predicate)) || lookupConstructorIds.has(unsignedId);
+})) {
   console.log(JSON.stringify({kind: 'constructor', ...entry}, null, 2));
 }
-for (const entry of schema.API.methods.filter((item) => wantedMethods.has(item.method))) {
+for (const entry of allMethods.filter((item) => {
+  const unsignedId = (item.id >>> 0).toString(16).padStart(8, '0');
+  return (!onlyLookupMethodIds && wantedMethods.has(item.method)) || lookupMethodIds.has(unsignedId);
+})) {
   console.log(JSON.stringify({kind: 'method', ...entry}, null, 2));
 }

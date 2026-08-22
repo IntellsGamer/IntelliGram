@@ -44,6 +44,7 @@ from intelligram.services.messaging import (
 from intelligram.services.updates import get_difference, get_state
 from intelligram.mtproto.tl import (
     TLDecodeError,
+    encode_account_content_settings,
     encode_account_privacy_rules,
     encode_chat,
     encode_chat_full,
@@ -57,6 +58,7 @@ from intelligram.mtproto.tl import (
     encode_auth_sent_code,
     encode_auth_sent_code_success_for_sign_up,
     encode_config,
+    encode_help_app_config,
     encode_help_countries_list,
     encode_lang_pack_difference,
     encode_contacts_contacts,
@@ -140,13 +142,13 @@ class MTProtoSessionAdapter:
             raise MTProtoSecurityError("BAD_SERVER_SALT")
         try:
             request = parse_request(unwrap_client_query(message.body))
-        except TLDecodeError as exc:
+        except TLDecodeError:
             return self._encrypt_rpc_error(message, "CONSTRUCTOR_INVALID")
 
         LOGGER.warning("MTProto encrypted request: %s (0x%08x)", request.name, request.constructor_id)
         if request.name == "msgs_ack":
             return None
-        if request.name == "ping":
+        if request.name in {"ping", "ping_delay_disconnect"}:
             result = encode_pong(message_id=message.msg_id, ping_id=int(request.fields["ping_id"]))
             return self._encrypt_result(message, result)
         if request.name == "help_get_config":
@@ -159,6 +161,8 @@ class MTProtoSessionAdapter:
                 expires=now + 3_600,
             )
             return self._encrypt_result(message, result)
+        if request.name == "help_get_app_config":
+            return self._encrypt_result(message, encode_help_app_config(config_hash=int(request.fields["hash"])))
         if request.name == "langpack_get_lang_pack":
             # IntelliGram ships the Web K UI language bundle locally. Returning
             # an empty version-zero difference acknowledges the remote request
@@ -278,6 +282,8 @@ class MTProtoSessionAdapter:
             return self._handle_messages_set_typing(message, peer=request.fields["peer"])
         if request.name == "messages_get_peer_settings":
             return self._handle_messages_get_peer_settings(message, peer=request.fields["peer"])
+        if request.name == "messages_get_paid_reaction_privacy":
+            return self._encrypt_result(message, encode_updates_too_long())
         if request.name == "auth_log_out":
             return self._handle_auth_log_out(message)
         if request.name == "messages_get_dialogs":
@@ -331,6 +337,8 @@ class MTProtoSessionAdapter:
             return self._encrypt_result(message, b"\xb5\x75\x72\x99")
         if request.name == "account_get_privacy":
             return self._encrypt_result(message, encode_account_privacy_rules())
+        if request.name == "account_get_content_settings":
+            return self._encrypt_result(message, encode_account_content_settings())
         if request.name == "account_get_authorizations":
             return self._handle_account_get_authorizations(message)
         if request.name == "account_reset_authorization":

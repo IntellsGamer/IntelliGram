@@ -17,6 +17,7 @@ RPC_RESULT_CONSTRUCTOR = 0xF35C6D01
 RPC_ERROR_CONSTRUCTOR = 0x2144CA19
 PONG_CONSTRUCTOR = 0x347773C5
 PING_CONSTRUCTOR = 0x7ABE77EC
+PING_DELAY_DISCONNECT_CONSTRUCTOR = 0xF3427B8C
 MSGS_ACK_CONSTRUCTOR = 0x62D6B459
 NEW_SESSION_CREATED_CONSTRUCTOR = 0x9EC20908
 BAD_SERVER_SALT_CONSTRUCTOR = 0xEDAB447B
@@ -25,6 +26,9 @@ BOOL_FALSE_CONSTRUCTOR = 0xBC799737
 INVOKE_WITH_LAYER_CONSTRUCTOR = 0xDA9B0D0D
 INIT_CONNECTION_CONSTRUCTOR = 0xC1CD5EA9
 HELP_GET_CONFIG_CONSTRUCTOR = 0xC4F9186B
+HELP_GET_APP_CONFIG_CONSTRUCTOR = 0x61E3F854
+HELP_APP_CONFIG_CONSTRUCTOR = 0xDD18782E
+JSON_OBJECT_CONSTRUCTOR = 0x99C1D49D
 CONFIG_CONSTRUCTOR = 0xCC1A241E
 DC_OPTION_CONSTRUCTOR = 0x18B7A10D
 AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR = 0xB7E085FE
@@ -76,6 +80,8 @@ MESSAGES_SEND_MESSAGE_CONSTRUCTOR = 0xFEF48F62
 MESSAGES_GET_PEER_DIALOGS_CONSTRUCTOR = 0xE470BCFD
 ACCOUNT_UPDATE_STATUS_CONSTRUCTOR = 0x6628562C
 ACCOUNT_GET_PRIVACY_CONSTRUCTOR = 0xDADBC950
+ACCOUNT_GET_CONTENT_SETTINGS_CONSTRUCTOR = 0x8B9B4DAE
+ACCOUNT_CONTENT_SETTINGS_CONSTRUCTOR = 0x57E28221
 PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR = 0x65427B82
 ACCOUNT_PRIVACY_RULES_CONSTRUCTOR = 0x50A04E45
 CHAT_CONSTRUCTOR = 0x41CBF256
@@ -109,6 +115,7 @@ MESSAGES_READ_HISTORY_CONSTRUCTOR = 0x0E306D3A
 MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR = 0x84D19185
 MESSAGES_SET_TYPING_CONSTRUCTOR = 0x58943EE2
 MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR = 0xEFD9A6A2
+MESSAGES_GET_PAID_REACTION_PRIVACY_CONSTRUCTOR = 0x472455AA
 MESSAGES_PEER_SETTINGS_CONSTRUCTOR = 0x6880B94D
 LANGPACK_GET_LANG_PACK_CONSTRUCTOR = 0xF2F2330A
 LANG_PACK_DIFFERENCE_CONSTRUCTOR = 0xF385C1F6
@@ -370,10 +377,17 @@ def parse_request(data: bytes) -> TLRequest:
     constructor_id = reader.uint32()
     if constructor_id == PING_CONSTRUCTOR:
         request = TLRequest(constructor_id, "ping", {"ping_id": reader.int64()})
+    elif constructor_id == PING_DELAY_DISCONNECT_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "ping_delay_disconnect", {
+            "ping_id": reader.int64(),
+            "disconnect_delay": reader.int32(),
+        })
     elif constructor_id == MSGS_ACK_CONSTRUCTOR:
         request = TLRequest(constructor_id, "msgs_ack", {"msg_ids": reader.vector_longs()})
     elif constructor_id == HELP_GET_CONFIG_CONSTRUCTOR:
         request = TLRequest(constructor_id, "help_get_config", {})
+    elif constructor_id == HELP_GET_APP_CONFIG_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "help_get_app_config", {"hash": reader.int32()})
     elif constructor_id == LANGPACK_GET_LANG_PACK_CONSTRUCTOR:
         request = TLRequest(constructor_id, "langpack_get_lang_pack", {
             "lang_pack": reader.bytes().decode("utf-8"),
@@ -596,6 +610,8 @@ def parse_request(data: bytes) -> TLRequest:
         })
     elif constructor_id == MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_peer_settings", {"peer": _read_input_peer(reader)})
+    elif constructor_id == MESSAGES_GET_PAID_REACTION_PRIVACY_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_paid_reaction_privacy", {})
     elif constructor_id == AUTH_LOG_OUT_CONSTRUCTOR:
         request = TLRequest(constructor_id, "auth_log_out", {})
     elif constructor_id == UPDATES_GET_DIFFERENCE_CONSTRUCTOR:
@@ -660,6 +676,8 @@ def parse_request(data: bytes) -> TLRequest:
     elif constructor_id == ACCOUNT_GET_PRIVACY_CONSTRUCTOR:
         reader.uint32()  # InputPrivacyKey constructor; all current variants have no fields.
         request = TLRequest(constructor_id, "account_get_privacy", {})
+    elif constructor_id == ACCOUNT_GET_CONTENT_SETTINGS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "account_get_content_settings", {})
     else:
         raise TLDecodeError(f"Unsupported TL constructor: 0x{constructor_id:08x}")
     if reader.remaining:
@@ -671,8 +689,23 @@ def encode_pong(*, message_id: int, ping_id: int) -> bytes:
     return encode_uint32(PONG_CONSTRUCTOR) + encode_int64(message_id) + encode_int64(ping_id)
 
 
+def encode_help_app_config(*, config_hash: int = 0) -> bytes:
+    """Return an empty but valid layer-228 application configuration object."""
+    return (
+        encode_uint32(HELP_APP_CONFIG_CONSTRUCTOR)
+        + encode_int32(config_hash)
+        + encode_uint32(JSON_OBJECT_CONSTRUCTOR)
+        + encode_vector([])
+    )
+
+
 def encode_bool(value: bool) -> bytes:
     return encode_uint32(BOOL_TRUE_CONSTRUCTOR if value else BOOL_FALSE_CONSTRUCTOR)
+
+
+def encode_account_content_settings(*, sensitive_enabled: bool = False, sensitive_can_change: bool = False) -> bytes:
+    flags = (1 if sensitive_enabled else 0) | (2 if sensitive_can_change else 0)
+    return encode_uint32(ACCOUNT_CONTENT_SETTINGS_CONSTRUCTOR) + encode_uint32(flags)
 
 
 def encode_imported_contact(*, user_id: int, client_id: int) -> bytes:
