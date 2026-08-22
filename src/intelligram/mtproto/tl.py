@@ -116,7 +116,11 @@ MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR = 0x84D19185
 MESSAGES_SET_TYPING_CONSTRUCTOR = 0x58943EE2
 MESSAGES_GET_PEER_SETTINGS_CONSTRUCTOR = 0xEFD9A6A2
 MESSAGES_GET_PAID_REACTION_PRIVACY_CONSTRUCTOR = 0x472455AA
+MESSAGES_GET_AVAILABLE_REACTIONS_CONSTRUCTOR = 0x18DEA0AC
 MESSAGES_PEER_SETTINGS_CONSTRUCTOR = 0x6880B94D
+MESSAGES_AVAILABLE_REACTIONS_CONSTRUCTOR = 0x768E3AAD
+MESSAGES_CHATS_CONSTRUCTOR = 0x64FF9FD5
+COMMUNITIES_GET_JOINED_COMMUNITIES_CONSTRUCTOR = 0xA663E830
 LANGPACK_GET_LANG_PACK_CONSTRUCTOR = 0xF2F2330A
 LANG_PACK_DIFFERENCE_CONSTRUCTOR = 0xF385C1F6
 HELP_GET_COUNTRIES_LIST_CONSTRUCTOR = 0x735787A8
@@ -612,6 +616,10 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_get_peer_settings", {"peer": _read_input_peer(reader)})
     elif constructor_id == MESSAGES_GET_PAID_REACTION_PRIVACY_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_paid_reaction_privacy", {})
+    elif constructor_id == MESSAGES_GET_AVAILABLE_REACTIONS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_available_reactions", {"hash": reader.int32()})
+    elif constructor_id == COMMUNITIES_GET_JOINED_COMMUNITIES_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "communities_get_joined_communities", {})
     elif constructor_id == AUTH_LOG_OUT_CONSTRUCTOR:
         request = TLRequest(constructor_id, "auth_log_out", {})
     elif constructor_id == UPDATES_GET_DIFFERENCE_CONSTRUCTOR:
@@ -784,6 +792,18 @@ def encode_auth_logged_out() -> bytes:
 
 def encode_messages_peer_settings(*, settings: bytes, chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
     return encode_uint32(MESSAGES_PEER_SETTINGS_CONSTRUCTOR) + settings + encode_vector(chats) + encode_vector(users)
+
+
+def encode_messages_available_reactions(*, hash_value: int = 0, reactions: Iterable[bytes] = ()) -> bytes:
+    """Return a layer-228 reaction catalogue; self-hosted instances may start empty."""
+
+    return encode_uint32(MESSAGES_AVAILABLE_REACTIONS_CONSTRUCTOR) + encode_int32(hash_value) + encode_vector(reactions)
+
+
+def encode_messages_chats(*, chats: Iterable[bytes] = ()) -> bytes:
+    """Return the ordinary `messages.Chats` container used by communities discovery."""
+
+    return encode_uint32(MESSAGES_CHATS_CONSTRUCTOR) + encode_vector(chats)
 
 
 def encode_vector(values: Iterable[bytes]) -> bytes:

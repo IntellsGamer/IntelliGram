@@ -71,7 +71,9 @@ from intelligram.mtproto.tl import (
     encode_dialog,
     encode_message,
     encode_messages_affected_messages,
+    encode_messages_available_reactions,
     encode_messages_chat_full,
+    encode_messages_chats,
     encode_messages_peer_settings,
     encode_messages_dialogs,
     encode_messages_dialogs_slice,
@@ -284,6 +286,13 @@ class MTProtoSessionAdapter:
             return self._handle_messages_get_peer_settings(message, peer=request.fields["peer"])
         if request.name == "messages_get_paid_reaction_privacy":
             return self._encrypt_result(message, encode_updates_too_long())
+        if request.name == "messages_get_available_reactions":
+            return self._encrypt_result(
+                message,
+                encode_messages_available_reactions(hash_value=int(request.fields["hash"])),
+            )
+        if request.name == "communities_get_joined_communities":
+            return self._encrypt_result(message, encode_messages_chats())
         if request.name == "auth_log_out":
             return self._handle_auth_log_out(message)
         if request.name == "messages_get_dialogs":
