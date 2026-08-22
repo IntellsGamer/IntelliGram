@@ -52,16 +52,17 @@ INPUT_PEER_CHAT_CONSTRUCTOR = 0x35A95CB9
 INPUT_USER_SELF_CONSTRUCTOR = 0xF7C1B13F
 INPUT_USER_CONSTRUCTOR = 0xF210AAE0
 INPUT_DIALOG_PEER_CONSTRUCTOR = 0xFCAAFEB7
-MESSAGE_CONSTRUCTOR = 0x75F3F635
+MESSAGE_CONSTRUCTOR = 0x7600B9D3
 DIALOG_CONSTRUCTOR = 0xFC89F7F3
 PEER_NOTIFY_SETTINGS_CONSTRUCTOR = 0x99622C0C
 PEER_SETTINGS_CONSTRUCTOR = 0xF47741F7
 CONTACT_CONSTRUCTOR = 0x145ADE0B
 CONTACTS_CONTACTS_CONSTRUCTOR = 0xEAE87E42
 MESSAGES_DIALOGS_CONSTRUCTOR = 0x15BA6C40
+MESSAGES_DIALOGS_SLICE_CONSTRUCTOR = 0x71E094F3
 MESSAGES_MESSAGES_CONSTRUCTOR = 0x1D73E7EA
 MESSAGES_PEER_DIALOGS_CONSTRUCTOR = 0x3371C354
-USER_FULL_CONSTRUCTOR = 0x06CBC1E5
+USER_FULL_CONSTRUCTOR = 0x06CBE645
 USERS_USER_FULL_CONSTRUCTOR = 0x3B6D152E
 UPDATE_NEW_MESSAGE_CONSTRUCTOR = 0x1F2B0AFD
 UPDATE_MESSAGE_ID_CONSTRUCTOR = 0x4E90BFD6
@@ -133,6 +134,10 @@ IMPORTED_CONTACT_CONSTRUCTOR = 0xC13E3C50
 CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR = 0x77D01C3B
 CONTACTS_SEARCH_CONSTRUCTOR = 0x05F58D0F
 CONTACTS_FOUND_CONSTRUCTOR = 0xB3134D9D
+ACCOUNT_AUTHORIZATION_CONSTRUCTOR = 0xAD01D61D
+ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR = 0x4BFF8EA0
+ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR = 0xE320C158
+ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR = 0xDF77F3BC
 
 
 class TLDecodeError(ValueError):
@@ -452,6 +457,10 @@ def parse_request(data: bytes) -> TLRequest:
             "query": reader.bytes().decode("utf-8"),
             "limit": reader.int32(),
         })
+    elif constructor_id == ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "account_get_authorizations", {})
+    elif constructor_id == ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "account_reset_authorization", {"hash": reader.int64()})
     elif constructor_id == MESSAGES_GET_DIALOGS_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b11:
@@ -688,6 +697,30 @@ def encode_contacts_found(*, my_results: Iterable[bytes], results: Iterable[byte
         + encode_vector([])
         + encode_vector(users)
     )
+
+
+def encode_account_authorization(*, key_id: int, device_label: str, created_at: int, current: bool) -> bytes:
+    flags = 1 if current else 0
+    return (
+        encode_uint32(ACCOUNT_AUTHORIZATION_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_int64(key_id if key_id < (1 << 63) else key_id - (1 << 64))
+        + encode_tl_string(device_label)
+        + encode_tl_string("Web")
+        + encode_tl_string("IntelliGram")
+        + encode_int32(0)
+        + encode_tl_string("IntelliGram Web K")
+        + encode_tl_string("self-hosted")
+        + encode_int32(created_at)
+        + encode_int32(created_at)
+        + encode_tl_string("127.0.0.1")
+        + encode_tl_string("Self-hosted")
+        + encode_tl_string("")
+    )
+
+
+def encode_account_authorizations(*, authorizations: Iterable[bytes]) -> bytes:
+    return encode_uint32(ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR) + encode_int32(365) + encode_vector(authorizations)
 
 
 def encode_contacts_resolved_peer(*, peer: bytes, chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
@@ -1000,6 +1033,26 @@ def encode_messages_invited_users(*, updates: bytes, missing_invitees: Iterable[
 def encode_messages_dialogs(*, dialogs: Iterable[bytes], messages: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
     return (
         encode_uint32(MESSAGES_DIALOGS_CONSTRUCTOR)
+        + encode_vector(dialogs)
+        + encode_vector(messages)
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
+
+
+def encode_messages_dialogs_slice(
+    *,
+    count: int,
+    dialogs: Iterable[bytes],
+    messages: Iterable[bytes],
+    chats: Iterable[bytes],
+    users: Iterable[bytes],
+) -> bytes:
+    """Encode the count-bearing first page Web K expects for its virtual dialog list."""
+
+    return (
+        encode_uint32(MESSAGES_DIALOGS_SLICE_CONSTRUCTOR)
+        + encode_int32(count)
         + encode_vector(dialogs)
         + encode_vector(messages)
         + encode_vector(chats)

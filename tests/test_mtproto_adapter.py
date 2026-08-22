@@ -310,6 +310,7 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
         INPUT_PEER_USER_CONSTRUCTOR,
         INPUT_USER_SELF_CONSTRUCTOR,
         MESSAGES_DIALOGS_CONSTRUCTOR,
+        MESSAGES_DIALOGS_SLICE_CONSTRUCTOR,
         MESSAGES_GET_DIALOGS_CONSTRUCTOR,
         MESSAGES_GET_HISTORY_CONSTRUCTOR,
         MESSAGES_MESSAGES_CONSTRUCTOR,
@@ -411,9 +412,10 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
         + struct.pack("<i", 30)
         + encode_int64(0)
     )
-    assert dialogs_reader.uint32() == MESSAGES_DIALOGS_CONSTRUCTOR
+    assert dialogs_reader.uint32() == MESSAGES_DIALOGS_SLICE_CONSTRUCTOR
+    assert dialogs_reader.int32() == 2
     assert dialogs_reader.uint32() == 0x1CB5C415
-    assert dialogs_reader.int32() == 1
+    assert dialogs_reader.int32() == 2
     assert dialogs_reader.uint32() == DIALOG_CONSTRUCTOR
 
     history_reader = invoke(
@@ -1659,3 +1661,82 @@ def test_web_k_contacts_import_and_search_are_durable(tmp_path) -> None:
     assert reader.uint32() == PEER_USER_CONSTRUCTOR
     assert reader.int64() == bob.user_id
     assert reader.vector_count() == 0
+
+
+def test_web_k_account_authorizations_lists_and_revokes_remote_session(tmp_path) -> None:
+    from intelligram.database import Database, now_unix
+    from intelligram.mtproto.crypto import auth_key_id
+    from intelligram.mtproto.tl import (
+        ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR,
+        ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR,
+        ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR,
+        BOOL_TRUE_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int64,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    current_auth_key = bytes(range(256))
+    remote_auth_key = bytes(reversed(range(256)))
+    salt, session_id = 930, 203
+    database = Database(tmp_path / "account-authorizations.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        user = register_password_account(
+            connection, phone="+15550000261", password="correct-horse-battery-staple", first_name="Devices", device_label="Primary",
+        )
+        now = now_unix()
+        connection.execute(
+            """
+            INSERT INTO auth_keys(auth_key_id, user_id, key_fingerprint, key_material, server_salt, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (str(auth_key_id(current_auth_key)), user.user_id, "mtproto:current", current_auth_key, str(salt), now),
+        )
+        connection.execute(
+            """
+            INSERT INTO auth_keys(auth_key_id, user_id, key_fingerprint, key_material, server_salt, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (str(auth_key_id(remote_auth_key)), user.user_id, "mtproto:remote", remote_auth_key, str(salt), now),
+        )
+    adapter = MTProtoSessionAdapter(auth_key=current_auth_key, server_salt=salt, database=database, user_id=user.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    list_response = adapter.handle_encrypted(_encrypt_client(
+        current_auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1,
+        body=encode_uint32(ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR),
+    ))
+    assert list_response is not None
+    _, _, _, _, list_body = _decrypt_server(current_auth_key, list_response)
+    reader = TLReader(list_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR
+    assert reader.int32() == 365
+    assert reader.vector_count() == 2
+
+    reset_response = adapter.handle_encrypted(_encrypt_client(
+        current_auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 4,
+        seq_no=3,
+        body=encode_uint32(ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR) + encode_int64(auth_key_id(remote_auth_key)),
+    ))
+    assert reset_response is not None
+    _, _, _, _, reset_body = _decrypt_server(current_auth_key, reset_response)
+    reader = TLReader(reset_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    with database.transaction() as connection:
+        remote = connection.execute(
+            "SELECT revoked_at FROM auth_keys WHERE auth_key_id = ?", (str(auth_key_id(remote_auth_key)),)
+        ).fetchone()
+        current = connection.execute(
+            "SELECT revoked_at FROM auth_keys WHERE auth_key_id = ?", (str(auth_key_id(current_auth_key)),)
+        ).fetchone()
+        assert remote is not None and remote["revoked_at"] is not None
+        assert current is not None and current["revoked_at"] is None

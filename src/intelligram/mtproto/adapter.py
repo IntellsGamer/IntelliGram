@@ -14,7 +14,7 @@ import logging
 import secrets
 import time
 
-from intelligram.database import Database
+from intelligram.database import Database, now_unix
 from intelligram.mtproto.crypto import EncryptedMessage, MTProtoSecurityError, auth_key_id, decrypt_client_message, encrypt_server_message
 from intelligram.services.accounts import (
     AccountAuthError,
@@ -32,6 +32,7 @@ from intelligram.services.messaging import (
     edit_message,
     edit_chat_about,
     edit_chat_title,
+    ensure_dialog_anchor_message,
     get_dialogs,
     get_history,
     get_or_create_direct_peer,
@@ -49,6 +50,8 @@ from intelligram.mtproto.tl import (
     encode_chat_participant,
     encode_chat_participants,
     encode_auth_authorization,
+    encode_account_authorization,
+    encode_account_authorizations,
     encode_auth_logged_out,
     encode_auth_login_token,
     encode_auth_sent_code,
@@ -69,6 +72,7 @@ from intelligram.mtproto.tl import (
     encode_messages_chat_full,
     encode_messages_peer_settings,
     encode_messages_dialogs,
+    encode_messages_dialogs_slice,
     encode_messages_invited_users,
     encode_messages_messages,
     encode_messages_peer_dialogs,
@@ -327,6 +331,10 @@ class MTProtoSessionAdapter:
             return self._encrypt_result(message, b"\xb5\x75\x72\x99")
         if request.name == "account_get_privacy":
             return self._encrypt_result(message, encode_account_privacy_rules())
+        if request.name == "account_get_authorizations":
+            return self._handle_account_get_authorizations(message)
+        if request.name == "account_reset_authorization":
+            return self._handle_account_reset_authorization(message, key_id=int(request.fields["hash"]))
         LOGGER.warning("Unsupported MTProto encrypted request: %s (0x%08x)", request.name, request.constructor_id)
         return self._encrypt_rpc_error(message, "METHOD_INVALID")
 
@@ -1143,6 +1151,57 @@ class MTProtoSessionAdapter:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(message, encode_bool(True))
 
+    def _handle_account_get_authorizations(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        current_key_id = int(auth_key_id(self.auth_key))
+        with database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT auth_key_id, key_fingerprint, created_at
+                FROM auth_keys
+                WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at >= ?)
+                ORDER BY created_at DESC
+                """,
+                (self_user_id, now_unix()),
+            ).fetchall()
+        authorizations = [
+            encode_account_authorization(
+                key_id=int(row["auth_key_id"]),
+                device_label=str(row["key_fingerprint"]).removeprefix("mtproto:") or "IntelliGram session",
+                created_at=int(row["created_at"]),
+                current=int(row["auth_key_id"]) == current_key_id,
+            )
+            for row in rows
+        ]
+        return self._encrypt_result(message, encode_account_authorizations(authorizations=authorizations))
+
+    def _handle_account_reset_authorization(self, message: EncryptedMessage, *, key_id: int) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        current_key_id = int(auth_key_id(self.auth_key))
+        key_id &= (1 << 64) - 1
+        if key_id == 0 or key_id == current_key_id:
+            return self._encrypt_result(message, encode_bool(False))
+        with database.transaction(immediate=True) as connection:
+            changed = connection.execute(
+                """
+                UPDATE auth_keys SET revoked_at = ?
+                WHERE auth_key_id = ? AND user_id = ? AND revoked_at IS NULL
+                """,
+                (now_unix(), str(key_id), self_user_id),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    "UPDATE sessions SET revoked_at = ? WHERE auth_key_id = ? AND revoked_at IS NULL",
+                    (now_unix(), str(key_id)),
+                )
+        return self._encrypt_result(message, encode_bool(bool(changed)))
+
     def _handle_auth_log_out(self, message: EncryptedMessage) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -1386,7 +1445,17 @@ class MTProtoSessionAdapter:
             return authenticated
         database, self_user_id = authenticated
         try:
-            with database.transaction() as connection:
+            with database.transaction(immediate=True) as connection:
+                saved_peer_id = get_or_create_direct_peer(
+                    connection, user_id=self_user_id, other_user_id=self_user_id
+                )
+                ensure_dialog_anchor_message(
+                    connection,
+                    peer_id=saved_peer_id,
+                    user_id=self_user_id,
+                    body="Saved Messages",
+                    client_random_id=f"intelligram:saved-anchor:{self_user_id}",
+                )
                 dialogs = get_dialogs(connection, user_id=self_user_id, offset=0, limit=min(max(limit, 1), 100))
                 encoded_dialogs, encoded_messages, encoded_chats, encoded_users = self._dialog_payloads(
                     connection, self_user_id=self_user_id, dialogs=dialogs,
@@ -1395,7 +1464,13 @@ class MTProtoSessionAdapter:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(
             message,
-            encode_messages_dialogs(dialogs=encoded_dialogs, messages=encoded_messages, chats=encoded_chats, users=encoded_users),
+            encode_messages_dialogs_slice(
+                count=len(dialogs),
+                dialogs=encoded_dialogs,
+                messages=encoded_messages,
+                chats=encoded_chats,
+                users=encoded_users,
+            ),
         )
 
     def _handle_messages_get_peer_dialogs(self, message: EncryptedMessage, peers: list[dict[str, object]]) -> bytes:
@@ -1504,6 +1579,14 @@ class MTProtoSessionAdapter:
                     title=title,
                     member_user_ids=invited_ids,
                 )
+                anchor, anchor_updates = ensure_dialog_anchor_message(
+                    connection,
+                    peer_id=chat_id,
+                    user_id=self_user_id,
+                    body=f"{title} created",
+                    client_random_id=f"intelligram:group-anchor:{chat_id}",
+                )
+                emitted.extend(anchor_updates)
                 chat = connection.execute(
                     "SELECT id, title, created_at FROM peers WHERE id = ? AND kind = 'chat'", (chat_id,)
                 ).fetchone()
@@ -1524,8 +1607,25 @@ class MTProtoSessionAdapter:
                     date=int(chat["created_at"]),
                     creator=True,
                 )
+                encoded_updates: list[bytes] = []
+                if anchor is not None:
+                    encoded_anchor = encode_message(
+                        message=anchor,
+                        recipient_peer=encode_peer_chat(chat_id=chat_id),
+                        outgoing=True,
+                    )
+                    anchor_update = next(
+                        (update for update in anchor_updates if update.user_id == self_user_id), owner_update
+                    )
+                    encoded_updates.append(
+                        encode_update_new_message(
+                            message=encoded_anchor,
+                            pts=anchor_update.pts,
+                            pts_count=anchor_update.pts_count,
+                        )
+                    )
                 updates = encode_updates(
-                    updates=[],
+                    updates=encoded_updates,
                     users=self._encode_users(users, self_user_id=self_user_id),
                     chats=[encoded_chat],
                     date=owner_update.date,

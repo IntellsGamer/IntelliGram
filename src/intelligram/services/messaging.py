@@ -146,18 +146,27 @@ def get_peer(connection: sqlite3.Connection, *, peer_id: int, user_id: int) -> d
     return result
 
 
-def _ensure_dialog(connection: sqlite3.Connection, user_id: int, peer_id: int, message_id: int | None, unread_delta: int) -> None:
+def _ensure_dialog(
+    connection: sqlite3.Connection,
+    user_id: int,
+    peer_id: int,
+    message_id: int | None,
+    unread_delta: int,
+    *,
+    read_outbox_max_id: int = 0,
+) -> None:
     now = now_unix()
     connection.execute(
         """
-        INSERT INTO dialogs(user_id, peer_id, top_message_id, unread_count, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO dialogs(user_id, peer_id, top_message_id, unread_count, read_outbox_max_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, peer_id) DO UPDATE SET
             top_message_id = excluded.top_message_id,
             unread_count = MAX(0, dialogs.unread_count + excluded.unread_count),
+            read_outbox_max_id = MAX(dialogs.read_outbox_max_id, excluded.read_outbox_max_id),
             updated_at = excluded.updated_at
         """,
-        (user_id, peer_id, message_id, unread_delta, now),
+        (user_id, peer_id, message_id, unread_delta, read_outbox_max_id, now),
     )
 
 
@@ -349,7 +358,14 @@ def send_message(
     emitted: list[UpdateEnvelope] = []
     for member in members:
         recipient_user_id = int(member["user_id"])
-        _ensure_dialog(connection, recipient_user_id, peer_id, message_id, 0 if recipient_user_id == sender_user_id else 1)
+        _ensure_dialog(
+            connection,
+            recipient_user_id,
+            peer_id,
+            message_id,
+            0 if recipient_user_id == sender_user_id else 1,
+            read_outbox_max_id=message_id if recipient_user_id == sender_user_id else 0,
+        )
         emitted.append(
             append_update(
                 connection,
@@ -542,7 +558,33 @@ def read_history(connection: sqlite3.Connection, *, peer_id: int, user_id: int, 
     )
 
 
-def get_history(connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | None, limit: int) -> list[dict[str, Any]]:
+def ensure_dialog_anchor_message(
+    connection: sqlite3.Connection, *, peer_id: int, user_id: int, body: str, client_random_id: str
+) -> tuple[dict[str, Any] | None, list[UpdateEnvelope]]:
+    row = connection.execute(
+        "SELECT top_message_id FROM dialogs WHERE user_id = ? AND peer_id = ?", (user_id, peer_id)
+    ).fetchone()
+    if row is not None and row["top_message_id"] is not None:
+        connection.execute(
+            """
+            UPDATE dialogs
+            SET read_outbox_max_id = MAX(read_outbox_max_id, top_message_id)
+            WHERE user_id = ? AND peer_id = ?
+            """,
+            (user_id, peer_id),
+        )
+        return None, []
+    return send_message(
+        connection,
+        peer_id=peer_id,
+        sender_user_id=user_id,
+        body=body,
+        client_random_id=client_random_id,
+    )
+
+
+def get_history(
+connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | None, limit: int) -> list[dict[str, Any]]:
     _require_active_membership(connection, peer_id, user_id)
     if limit < 1 or limit > 100:
         raise MessagingError("LIMIT_INVALID")

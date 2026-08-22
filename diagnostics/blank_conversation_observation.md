@@ -1,0 +1,53 @@
+# Blank Conversation Pane Observation
+
+The live Web K preview at `http://127.0.0.1:1235/` mounted the application shell successfully but showed an empty sidebar and only the default green background in the conversation area. No message composer or peer header was rendered.
+
+The initial console completed state restoration and reported `Will mount IM page`; it did not yet expose an explicit RPC or rendering error. The next diagnostic step is to create/open a group in this active browser session and correlate its MTProto calls with the gateway log and browser console.
+
+The sidebar remains completely empty even though the authenticated application shell and New Channel/New Group/New Private Chat menu render. This confirms a dialog-storage/data-hydration failure rather than a general UI mount failure. The server log contained no `messages.getDialogs`, `messages.getPeerDialogs`, or history calls for this active session, so the next focus is why Web K’s startup dialog loader does not request or accept dialog state.
+
+Opening New Group succeeds and reaches Web K’s **Add Members** screen, but its selectable-peer list is empty. The next arrow remains visible for the owner-only flow, but no pre-existing sidebar dialogs or contact entities are present. This supports the diagnosis that initial dialog/contact hydration is missing before the later group-open/composer issue.
+
+After the server-side anchor repair and gateway restart, a clean preview reload still showed no sidebar rows. The console successfully mounted the IM page but emitted neither a dialog-loader error nor a dialog RPC. Gateway logs likewise contained no `messages.getDialogs` call. The repair must therefore force the Web K client bootstrap to fetch dialogs after manager initialization, rather than relying on a path that is currently skipped in this self-hosted fork.
+
+After adding explicit client hydration, the gateway now receives `messages.getDialogs`, followed by `users.getFullUser` and `updates.getState`. The sidebar nevertheless remains empty and the browser console adds no error. This proves the bootstrap trigger is fixed; the remaining defect is in the serialized `messages.dialogs` payload or Web K’s processing of its dialog/message entities.
+
+The legacy dialog migration succeeded: the live row now has `top_message_id = 1` and `read_outbox_max_id = 1`. The sidebar still appears empty. The live client exposes `rootScope`, `appDialogsManager`, and `appImManager` on `window`, so the next step is to inspect its in-memory dialog storage directly and determine whether Web K accepted the server result but failed to render it.
+
+Direct inspection shows `rootScope.managers.appMessagesManager.dialogsStorage` is a proxied manager facade, not the raw storage instance: it exposes no enumerable properties or direct dialog methods. The investigation therefore continues through the public `appDialogsManager` and message-manager APIs rather than assuming storage internals are available on this window proxy.
+
+The public `appDialogsManager` reports `hasDialog: true` for the current self peer and a sidebar container length of one, but the returned dialog object’s `peerId`, `top_message`, and read cursors are all `undefined`. This is decisive evidence that Web K accepted a dialog record but failed to normalize its peer/message fields, pointing to an entity shape or peer-ID encoding mismatch in the returned `messages.dialogs` payload.
+
+Inspecting the live sidebar DOM shows `appDialogsManager.chatsContainer` contains only the connection/folders overlay and no dialog row. This rules out hidden styling of a rendered row. The remaining defect lies between Web K accepting `messages.getDialogs` and `appDialogsManager.addDialogNew` inserting a dialog into the chat list, likely in dialog storage filtering or peer/message entity indexing.
+
+Schema validation then ruled out the prior entity-byte hypothesis. `peerUser(user_id: long)`, `peerChat(chat_id: long)`, and IntelliGram's `user` field order (flags, flags2, id, conditional access hash, optional profile strings) match Web K layer 228 exactly. The undefined values seen from `appDialogsManager.getDialog()` are not a serialized Dialog; that method returns a `DialogElement` UI instance. The defect is therefore in dialog storage/index-to-virtual-list propagation, not TL entity alignment.
+
+A count-bearing `messages.dialogsSlice` encoder was added and all 43 backend tests pass. After restarting the gateway and reloading Web K, the sidebar stayed visually empty and the search header showed “Updating…”, so the remaining issue is now a client request/result pipeline stall rather than absent virtual-list count metadata. The next check is the fresh gateway request sequence and client runtime errors.
+
+After the gateway restart, a browser refresh and explicit fresh navigation still show the shell without dialog rows. The fresh gateway log has no non-acknowledgement encrypted RPCs, so this pass cannot yet validate `messages.dialogsSlice`; Web K is stalled in a post-restart reconnect/update condition before it sends `messages.getDialogs`. This must be distinguished from the original first-load serialization/rendering failure.
+
+Live browser inspection found the actual blocking condition: `apiManagerProxy.awaiting` contains `appProfileManager.getProfileByPeerId` and `appMessagesManager.getTopMessages`, both with `port: undefined`. No post-restart `messages.getDialogs` RPC can occur because these manager calls never reach the main worker. The API proxy reports the service worker as online and has port registry keys `0`, but neither pending task was assigned a usable port. Sidebar repair must now fix the client’s worker-bridge registration/recovery path before payload testing can resume.
+
+A controlled `?noWorker=1` Web K session was also tested. It reached the same empty sidebar/update shell, so the issue is not solely the SharedWorker transport implementation. The shared symptom remains unfulfilled manager calls during common initialization; next diagnostics must inspect the startup state/crypto manager readiness and any worker-side exception rather than treat the port selection alone as root cause.
+
+A temporary, targeted RPC-result diagnostic was added to Web K’s MTProto networker and the production bundle was rebuilt/restarted. The clean `?noWorker=1` session is now loaded specifically to distinguish an unknown `req_msg_id` from a result-decoding failure for the gateway’s acknowledged `users.getFullUser` and `messages.getDialogs` replies.
+
+The instrumented client confirms `rpc_result` responses are being acknowledged but do not match Web K’s outstanding-request table (`result for unknown request`). In `?noWorker=1`, Web K exposes live managers on `window` (including `apiManager`, `networkerFactory`, and `appMessagesManager`), allowing direct request-ID inspection rather than further speculative TL changes. The next step is to read the active networker’s sent-message map and correlate it with IntelliGram’s response IDs.
+
+Root cause confirmed and repaired: Web K acknowledged IntelliGram RPC responses but could not deserialize them because `tl.py` used stale constructor IDs. Layer-228 validation and an instrumented client showed `userFull` must be `0x06CBE645` (not `0x06CBC1E5`) and `message` must be `0x7600B9D3` (not `0x75F3F635`). This was why `users.getFullUser` and `messages.getDialogs` appeared permanently pending. The codec was corrected; all 43 backend tests pass; the gateway has been restarted for live visual confirmation.
+
+After correcting the stale constructors and restarting the gateway, the first refreshed Web K frame still shows the empty shell. This has to be distinguished from the previous decoder failure by inspecting the fresh console and live dialog state immediately after the corrected response cycle.
+
+The `?noWorker=1` path was useful to prove decoder correctness, but it is not a valid end-user visual test: its single-realm manager globals are overwritten while creating accounts 1–4, leaving `rootScope.myId` at 0. Verification has therefore returned to normal SharedWorker mode, which preserves the real active account boundary.
+
+The clean bundle containing the explicit hydration event has been rebuilt and loaded in normal worker mode. Its first visual frames still show an empty sidebar, so the final check now focuses on whether the emitted `dialogs_multiupdate` event reaches the active virtual-list subscriber and creates a row.
+
+The native storage-backed loader build has been loaded in normal worker mode. The first visual frames still show no row, so the next check reads the active virtual-list total count and the folder count written by `dialogsStorage.getDialogs` to determine whether the loader is running before list activation or returning a zero count.
+
+Native loader validation succeeded in normal worker mode: `dialogsStorage.getDialogs` returns `count=1` and one self dialog, while the active `SortedDialogList` now reports `totalCount=1`, `itemsLength=1`, and the expected peer key. The original data/index failure is resolved. The next visual check targets only whether the virtual list has mounted that seeded item into the DOM.
+
+The final build with default-folder selection has been loaded in normal mode. The first rendered frames still show the left list pane hidden, so the immediate next check inspects the folder selector callback and active tab class after bootstrap rather than revisiting protocol or virtual-list state.
+
+After the unselected-to-default transition build, the first normal-mode frames still visually show the empty pane. The next inspection checks the active folder pane state and selector outcome to determine whether activation is being skipped because the zero-folder menu itself has no selectable target.
+
+Visual confirmation achieved in normal SharedWorker mode: adding `active` to the already-populated default folder pane immediately renders a real Saved Messages sidebar row (icon, title, timestamp, and preview). The remaining permanent change is limited to applying this initial active-pane state when no horizontal folder target exists; MTProto payload decoding, storage hydration, virtual-list count, and row construction are all working.

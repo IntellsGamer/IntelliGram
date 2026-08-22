@@ -49,6 +49,26 @@ export async function bootstrapIm(): Promise<void> {
     (window as any).Recorder = recorder.default;
   }
   appDialogsManager.start();
+  // The upstream lazy sidebar trigger assumes Telegram's persisted dialog
+  // cache is already populated. A newly self-hosted IntelliGram account has
+  // no such cache, so prime it through the storage-backed first-page loader.
+  // This is intentionally not a direct `getTopMessages` call: Web K's
+  // `dialogsStorage.getDialogs` records the folder count, and the active
+  // virtual list then seeds its rows and total count through `requestItemForIdx`.
+  void rootScope.managers.acknowledged.dialogsStorage.getDialogs({
+    offsetIndex: 0,
+    limit: 20,
+    filterId: 0,
+    skipMigrated: true
+  }).then((acked) => acked.result).then(() => {
+    appDialogsManager.xd?.requestItemForIdx(0);
+    // With no custom chat folders, Web K has no horizontal-tab target to select
+    // during this direct signed-in bootstrap. Its default pane already contains
+    // the native virtual list above, so mark that sole pane active explicitly.
+    appDialogsManager.xd?.scrollable?.container.classList.add('active');
+  }).catch((error) => {
+    console.error('[IntelliGram] Initial dialog hydration failed', error);
+  });
   // start() toggles body.is-left-column-shown synchronously
   // (appImManager.selectTab(CHATLIST)). The .main-column transform/opacity
   // transition in _chats.scss is gated by :not(.has-auth-pages) so the bar
