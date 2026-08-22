@@ -25,8 +25,13 @@ let init = () => {
   setCountries();
   rootScope.addEventListener('language_apply', () => {
     setCountries();
+    // The country list is populated asynchronously from the language pack.
+    // If a card mounts before that, the picker was built empty; rebuild every
+    // live instance so the selector actually contains countries.
+    countryInputFields.forEach((field) => field.deref?.()?.rebuildList());
   });
 };
+const countryInputFields = [] as Array<{deref?: () => CountryInputField | undefined}>;
 
 const VIRTUAL_COUNTRIES = new Set(['FT']);
 
@@ -69,6 +74,7 @@ export default class CountryInputField extends InputField {
 
   private hideTimeout: number;
   private selectWrapper: HTMLElement;
+  private selectList: HTMLUListElement;
 
   private liMap: Map<string, HTMLLIElement[]>;
 
@@ -95,78 +101,29 @@ export default class CountryInputField extends InputField {
     arrowDown.classList.add('arrow', 'arrow-down');
     this.container.append(arrowDown);
 
-    const selectList = document.createElement('ul');
-    selectWrapper.appendChild(selectList);
+    this.selectList = document.createElement('ul');
+    selectWrapper.appendChild(this.selectList);
 
     const scroll = new Scrollable(selectWrapper);
 
-    let initSelect = () => {
-      initSelect = null;
+    countryInputFields.push(new WeakRef(this) as any);
+    this.buildList();
+    this.container.appendChild(selectWrapper);
+    this.selectList.addEventListener('mousedown', (e) => {
+      if(e.button !== 0) { // other buttons but left shall not pass
+        return;
+      }
 
-      countries.forEach((c) => {
-        if(options.noPhoneCodes && VIRTUAL_COUNTRIES.has(c.iso2)) {
-          return;
-        }
-
-        const emoji = getCountryEmoji(c.iso2);
-
-        const liArr: Array<HTMLLIElement> = [];
-        for(let i = 0, length = Math.min(c.country_codes.length, options.noPhoneCodes ? 1 : Infinity); i < length; ++i) {
-          const countryCode = c.country_codes[i];
-          const li = document.createElement('li');
-
-          const wrapped = wrapEmojiText(emoji);
-          if(IS_EMOJI_SUPPORTED) {
-            const spanEmoji = document.createElement('span');
-            setInnerHTML(spanEmoji, wrapped);
-            li.append(spanEmoji);
-          } else {
-            setInnerHTML(li, wrapped);
-          }
-
-          const el = i18n(c.default_name as any);
-          el.dataset.defaultName = c.default_name;
-          li.append(el);
-
-          if(!options.noPhoneCodes) {
-            const span = document.createElement('span');
-            span.classList.add('phone-code');
-            span.innerText = '+' + countryCode.country_code;
-            li.appendChild(span);
-          }
-
-          liArr.push(li);
-          selectList.append(li);
-        }
-
-        this.liMap.set(c.iso2, liArr);
-      });
-
-      selectList.addEventListener('mousedown', (e) => {
-        if(e.button !== 0) { // other buttons but left shall not pass
-          return;
-        }
-
-        const target = findUpTag(e.target, 'LI')
-        this.selectCountryByTarget(target);
-        // console.log('clicked', e, countryName, phoneCode);
-      });
-
-      this.container.appendChild(selectWrapper);
-    };
-
-    initSelect();
+      const target = findUpTag(e.target, 'LI')
+      this.selectCountryByTarget(target);
+    });
 
     this.input.addEventListener('focus', (e) => {
-      if(initSelect) {
-        initSelect();
-      } else {
-        countries.forEach((c) => {
-          const arr = this.liMap.get(c.iso2);
-          if(!arr) return;
-          arr.forEach((li) => li.style.display = '');
-        });
-      }
+      countries.forEach((c) => {
+        const arr = this.liMap.get(c.iso2);
+        if(!arr) return;
+        arr.forEach((li) => li.style.display = '');
+      });
 
       clearTimeout(this.hideTimeout);
       this.hideTimeout = undefined;
@@ -268,6 +225,54 @@ export default class CountryInputField extends InputField {
 
   public getSelected() {
     return {country: this.lastCountrySelected, code: this.lastCountryCodeSelected};
+  }
+
+  private buildList() {
+    this.selectList?.replaceChildren();
+    this.liMap.clear();
+
+    countries.forEach((c) => {
+      if(this.options.noPhoneCodes && VIRTUAL_COUNTRIES.has(c.iso2)) {
+        return;
+      }
+
+      const emoji = getCountryEmoji(c.iso2);
+
+      const liArr: Array<HTMLLIElement> = [];
+      for(let i = 0, length = Math.min(c.country_codes.length, this.options.noPhoneCodes ? 1 : Infinity); i < length; ++i) {
+        const countryCode = c.country_codes[i];
+        const li = document.createElement('li');
+
+        const wrapped = wrapEmojiText(emoji);
+        if(IS_EMOJI_SUPPORTED) {
+          const spanEmoji = document.createElement('span');
+          setInnerHTML(spanEmoji, wrapped);
+          li.append(spanEmoji);
+        } else {
+          setInnerHTML(li, wrapped);
+        }
+
+        const el = i18n(c.default_name as any);
+        el.dataset.defaultName = c.default_name;
+        li.append(el);
+
+        if(!this.options.noPhoneCodes) {
+          const span = document.createElement('span');
+          span.classList.add('phone-code');
+          span.innerText = '+' + countryCode.country_code;
+          li.appendChild(span);
+        }
+
+        liArr.push(li);
+        this.selectList.append(li);
+      }
+
+      this.liMap.set(c.iso2, liArr);
+    });
+  }
+
+  public rebuildList() {
+    this.buildList();
   }
 
   public hidePicker = () => {

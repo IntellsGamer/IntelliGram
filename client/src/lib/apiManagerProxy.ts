@@ -792,24 +792,17 @@ class ApiManagerProxy extends MTProtoMessagePort {
       this.log('SW registered', registration);
       this.serviceWorkerRegistration = registration;
 
+      // The old "no controller" hard-refresh workaround unregistered the SW and
+      // reloaded with ?swfix=N. It ran every time the active SW had not yet
+      // claimed the page — which is the normal state on the first load after a
+      // registration (and intermittently after refresh) — so it produced a
+      // swfix=1 → reload → white-screen loop. The page never needed a
+      // controller to talk to the worker: attach to the registration's worker
+      // directly and let `clients.claim()` take over on the next navigation.
       const url = new URL(window.location.href);
-      const FIX_KEY = 'swfix';
-      const swfix = +url.searchParams.get(FIX_KEY) || 0;
-      if(registration.active && !navigator.serviceWorker.controller) {
-        if(swfix >= 3) {
-          throw new Error('no controller');
-        }
-
-        // ! doubtful fix for hard refresh
-        return registration.unregister().then(() => {
-          url.searchParams.set(FIX_KEY, '' + (swfix + 1));
-          appNavigationController.navigateToUrl(url.toString());
-        });
-      }
-
-      if(swfix) {
-        url.searchParams.delete(FIX_KEY);
-        history.pushState(undefined, '', url);
+      if(url.searchParams.has('swfix')) {
+        url.searchParams.delete('swfix');
+        history.replaceState(undefined, '', url);
       }
 
       const sw = registration.installing || registration.waiting || registration.active;
@@ -916,18 +909,6 @@ class ApiManagerProxy extends MTProtoMessagePort {
     createWorker: () => SharedWorker | Worker,
     superMessagePort: SuperMessagePort<ThreadedWorkerEvents, ThreadedWorkerEvents, any>
   }) {
-    const get = (url: string) => {
-      return fetch(url).then((response) => response.text()).then((text) => {
-        const pathnameSplitted = location.pathname.split('/');
-        pathnameSplitted[pathnameSplitted.length - 1] = '';
-        const pre = location.origin + pathnameSplitted.join('/');
-        text = text.replace(/(import (?:.+? from )?['"])\//g, '$1' + pre);
-
-        const blob = new Blob([text], {type: 'application/javascript'});
-        return blob;
-      });
-    };
-
     const workerHandler = {
       construct(target: any, args: any): any {
         return {
@@ -966,8 +947,15 @@ class ApiManagerProxy extends MTProtoMessagePort {
     const firstWorker = createWorker(originalUrl);
     attachWorkerToPort(firstWorker);
 
-    const blob = await get(originalUrl);
-    const urlsPromise = await this.invoke('createProxyWorkerURLs', {originalUrl, blob, type});
+    // Additional thread instances must all be backed by REAL URLs and never by
+    // Blob URLs. A module worker'ed from a Blob has no origin path, so any
+    // relative or path-absolute import inside it (Vite emits both in dev and
+    // production) resolves to a non-existent blob child and stays pending
+    // forever — this was exactly the multiple `blob:` pending script requests
+    // during a refresh. SharedWorker instances are keyed by URL including the
+    // query string, so a unique `thread` query gives each extra thread its own
+    // worker while still loading through Vite/production normally.
+    const urlsPromise = await this.invoke('createProxyWorkerURLs', {originalUrl, type});
     const workers = urlsPromise.slice(1).map(createWorker);
     workers.forEach(attachWorkerToPort);
 

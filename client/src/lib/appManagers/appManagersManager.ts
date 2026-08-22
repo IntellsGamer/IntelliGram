@@ -16,8 +16,7 @@ import AccountController from '@lib/accounts/accountController';
 import pushSingleManager from '@appManagers/pushSingleManager';
 import Modes from '@config/modes';
 import SuperMessagePort from '@lib/superMessagePort';
-import objectUrlRegistry from '@lib/mainWorker/objectUrlRegistry';
-import {makeObjectUrlOwner, parseObjectUrlOwner} from '@helpers/objectUrlUtils';
+import {parseObjectUrlOwner} from '@helpers/objectUrlUtils';
 import {releaseSharedObjectURLsWhere} from '@lib/mainWorker/sharedObjectUrlCache';
 
 type Managers = Awaited<ReturnType<typeof createManagers>>;
@@ -130,7 +129,7 @@ export class AppManagersManager {
       threadedWorker.promise?.resolve();
     });
 
-    port.addEventListener('createProxyWorkerURLs', ({originalUrl, blob, type}) => {
+    port.addEventListener('createProxyWorkerURLs', ({originalUrl, type}) => {
       const {urls, threads} = this.threadedSharedWorkers[type];
       let length = urls.length;
       if(!length) {
@@ -143,9 +142,16 @@ export class AppManagersManager {
         return urls;
       }
 
+      // Distinct REAL worker URLs, not Blob copies. A SharedWorker is keyed by
+      // its full URL (including the query string), so each thread gets a fresh
+      // worker while the browser can still load Vite's dev graph and the
+      // production chunk graph normally. Blob-based copies break once the
+      // worker source contains imports: a Blob has no path, so relative and
+      // root imports cannot resolve and the worker hangs as a pending blob.
       const newURLs = new Array(maxLength - length).fill(undefined).map((_, index) => {
-        const owner = makeObjectUrlOwner('threaded-worker', type, length + index);
-        return objectUrlRegistry.createShared(blob, owner);
+        const workerUrl = new URL(originalUrl, location.href);
+        workerUrl.searchParams.set('thread', String(length + index));
+        return workerUrl.toString();
       });
       urls.push(...newURLs);
       return urls;

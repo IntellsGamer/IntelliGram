@@ -68,6 +68,10 @@ const USE_DEV_HTTP2 = !USE_SSL && !process.env.TWEB_PREVIEW && !process.env.VITE
 const serverOptions: ServerOptions = {
   host,
   port: USE_SSL ? 443 : 1234,
+  // Allow the Arena preview host and arbitrary tunneled/local hosts. The app is
+  // served on a dynamic sandbox hostname during preview, so restricting Vite's
+  // host header would block the whole UI.
+  allowedHosts: true,
   watch: {
     // NB: anchor on rootDir. A worktree checkout's own path contains
     // ".claude/worktrees/<name>/", so a bare '**/.claude/**' glob would also match
