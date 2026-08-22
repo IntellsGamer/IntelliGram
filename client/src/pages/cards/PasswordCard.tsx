@@ -121,20 +121,29 @@ export default function PasswordCard(_props: {spec: Spec}) {
 
   /* ---------- state polling (session relevance) ---------- */
 
+  function applyState(_state: AccountPassword) {
+    state = _state;
+
+    if(state.hint) {
+      replaceContent(passwordInputField.label, htmlToSpan(wrapEmojiText(state.hint)));
+    } else {
+      passwordInputField.setLabel();
+    }
+
+    return state;
+  }
+
   function getState() {
     if(!getStateInterval) {
       getStateInterval = window.setInterval(getState, 10e3);
     }
 
-    return !TEST && managers.passwordManager.getState().then((_state) => {
-      state = _state;
+    return !TEST && managers.passwordManager.getState().then(applyState);
+  }
 
-      if(state.hint) {
-        replaceContent(passwordInputField.label, htmlToSpan(wrapEmojiText(state.hint)));
-      } else {
-        passwordInputField.setLabel();
-      }
-    });
+  function ensureState(): Promise<AccountPassword> {
+    if(state) return Promise.resolve(state);
+    return getState();
   }
 
   /* ---------- submit ---------- */
@@ -155,7 +164,13 @@ export default function PasswordCard(_props: {spec: Spec}) {
     passwordInputField.setValueSilently('' + Math.random()); // prevent saving suggestion
     passwordInputField.setValueSilently(value);
 
-    managers.passwordManager.check(value, state).then((response) => {
+    // The SRP state comes from `account.getPassword`, which is asynchronous and
+    // can fail (expired binding / no context) after navigating via "Can't sign
+    // in?". Never submit with `undefined` state — that made a correct password
+    // look like `PASSWORD_HASH_INVALID`.
+    ensureState().then((_state) => {
+      return managers.passwordManager.check(value, _state);
+    }).then((response) => {
       switch(response._) {
         case 'auth.authorization':
           if(getStateInterval) {
@@ -175,6 +190,15 @@ export default function PasswordCard(_props: {spec: Spec}) {
       setSubmitting(false);
       passwordInput.disabled = false;
       passwordInputField.input.classList.add('error');
+
+      if(!state) {
+        // `getState` above failed: this is a session/state error, not a wrong
+        // password. Tell the user instead of painting the password invalid.
+        setNextKey('Error.AnError');
+        passwordInput.select();
+        getState();
+        return;
+      }
 
       switch(err.type) {
         default:

@@ -2,7 +2,7 @@ import type lang from '@/lang';
 import type langSign from '@/langSign';
 import type {State} from '@config/state';
 import {IS_BETA, MOUNT_CLASS_TO} from '@config/debug';
-import {HelpCountry, LangPackDifference, LangPackString} from '@layer';
+import {HelpCountriesList, HelpCountry, LangPackDifference, LangPackString} from '@layer';
 import App from '@config/app';
 import rootScope from '@lib/rootScope';
 import {IS_MOBILE} from '@environment/userAgent';
@@ -112,11 +112,32 @@ namespace I18n {
     ]).then(([langPack]) => langPack);
   }
 
+  function isHelpCountriesList(value: unknown): value is HelpCountriesList.helpCountriesList {
+    return !!value && (value as any)._ === 'help.countriesList' && Array.isArray((value as any).countries);
+  }
+
+  function hasUsableCountries(value: unknown): value is HelpCountriesList.helpCountriesList {
+    return isHelpCountriesList(value) && value.countries.length > 0;
+  }
+
   export function getCacheLangPackAndApply() {
     return cacheLangPackPromise ||= getCacheLangPack(true).then(async(langPack) => {
       if(!langPack) {
         langPack = await loadLocalLangPack();
         langPack = await saveLangPack(langPack, false);
+      }
+
+      // Stored language packs created before the country-list migration (or a
+      // server that returned `help.countriesListNotModified`) may not carry a
+      // usable `countries` field. Fall back to the bundled list so the country
+      // selector is never empty — this also keeps `applyLangPack` from throwing
+      // `countries.countries is not iterable` and taking the whole boot down.
+      if(!Array.isArray(langPack.strings) || !hasUsableCountries(langPack.countries)) {
+        const local = await loadLocalLangPack();
+        if(!Array.isArray(langPack.strings)) langPack.strings = local.strings;
+        if(!hasUsableCountries(langPack.countries) && hasUsableCountries(local.countries)) {
+          langPack.countries = local.countries;
+        }
       }
 
       setLangCode(langPack.lang_code);
@@ -232,7 +253,7 @@ namespace I18n {
 
   export function getLangPackAndApply(langCode: string, web?: boolean, ignoreCache?: boolean) {
     setLangCode(langCode);
-    return loadLangPack(langCode, web, ignoreCache).then(([langPack1, langPack2, localLangPack1, localLangPack2, countries, _]) => {
+    return loadLangPack(langCode, web, ignoreCache).then(async([langPack1, langPack2, localLangPack1, localLangPack2, countries, _]) => {
       let strings: LangPackString[] = [];
 
       const pushLocal = () => [localLangPack1, localLangPack2].forEach((l) => {
@@ -242,6 +263,15 @@ namespace I18n {
       if(!TEST_LOCAL) pushLocal();
       strings = strings.concat(...[langPack1.strings, langPack2.strings].filter(Boolean));
       if(TEST_LOCAL) pushLocal();
+
+      // `appLangPackManager.getCountriesList` can return an empty catalog,
+      // `help.countriesListNotModified` after the local cache was cleared, or
+      // nothing at all on the self-hosted server. Without the bundled fallback
+      // `applyLangPack` throws and the country picker stays empty.
+      if(!hasUsableCountries(countries)) {
+        const local = await loadLocalLangPack();
+        countries = hasUsableCountries(local.countries) ? local.countries : undefined;
+      }
 
       langPack1.strings = strings;
       langPack1.countries = countries;
@@ -292,11 +322,13 @@ namespace I18n {
 
     strings.clear();
 
-    for(const string of langPack.strings) {
-      strings.set(string.key as LangPackKey, string);
+    if(Array.isArray(langPack.strings)) {
+      for(const string of langPack.strings) {
+        strings.set(string.key as LangPackKey, string);
+      }
     }
 
-    if(langPack.countries) {
+    if(hasUsableCountries(langPack.countries)) {
       countriesList.length = 0;
       countriesList.push(...langPack.countries.countries);
 

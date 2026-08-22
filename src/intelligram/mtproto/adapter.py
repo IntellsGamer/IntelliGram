@@ -81,6 +81,7 @@ from intelligram.mtproto.tl import (
     encode_auth_sent_code_success_for_sign_up,
     encode_config,
     encode_help_app_config,
+    encode_help_nearest_dc,
     encode_help_countries_list,
     encode_lang_pack_difference,
     encode_contacts_contacts,
@@ -193,6 +194,15 @@ class MTProtoSessionAdapter:
                 expires=now + 3_600,
             )
             return self._encrypt_result(message, result)
+        if request.name == "help_get_nearest_dc":
+            return self._encrypt_result(
+                message,
+                encode_help_nearest_dc(
+                    country="DE",
+                    this_dc=1,
+                    nearest_dc=1,
+                ),
+            )
         if request.name == "help_get_app_config":
             return self._encrypt_result(message, encode_help_app_config(config_hash=int(request.fields["hash"])))
         if request.name == "langpack_get_lang_pack":

@@ -26,8 +26,10 @@ BOOL_FALSE_CONSTRUCTOR = 0xBC799737
 INVOKE_WITH_LAYER_CONSTRUCTOR = 0xDA9B0D0D
 INIT_CONNECTION_CONSTRUCTOR = 0xC1CD5EA9
 HELP_GET_CONFIG_CONSTRUCTOR = 0xC4F9186B
+HELP_GET_NEAREST_DC_CONSTRUCTOR = 531836966
 HELP_GET_APP_CONFIG_CONSTRUCTOR = 0x61E3F854
 HELP_APP_CONFIG_CONSTRUCTOR = 0xDD18782E
+NEAREST_DC_CONSTRUCTOR = -1910892683
 JSON_OBJECT_CONSTRUCTOR = 0x99C1D49D
 CONFIG_CONSTRUCTOR = 0xCC1A241E
 DC_OPTION_CONSTRUCTOR = 0x18B7A10D
@@ -478,6 +480,8 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "msgs_ack", {"msg_ids": reader.vector_longs()})
     elif constructor_id == HELP_GET_CONFIG_CONSTRUCTOR:
         request = TLRequest(constructor_id, "help_get_config", {})
+    elif constructor_id == HELP_GET_NEAREST_DC_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "help_get_nearest_dc", {})
     elif constructor_id == HELP_GET_APP_CONFIG_CONSTRUCTOR:
         request = TLRequest(constructor_id, "help_get_app_config", {"hash": reader.int32()})
     elif constructor_id == LANGPACK_GET_LANG_PACK_CONSTRUCTOR:
@@ -979,6 +983,15 @@ def encode_lang_pack_difference(*, lang_code: str, from_version: int = 0, versio
         + encode_int32(from_version)
         + encode_int32(version)
         + encode_vector([])
+    )
+
+
+def encode_help_nearest_dc(*, country: str, this_dc: int, nearest_dc: int) -> bytes:
+    return (
+        encode_uint32(NEAREST_DC_CONSTRUCTOR)
+        + encode_tl_string(country)
+        + encode_int32(this_dc)
+        + encode_int32(nearest_dc)
     )
 
 
