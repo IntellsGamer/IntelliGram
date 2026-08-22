@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +89,7 @@ class Database:
                     kind TEXT NOT NULL CHECK(kind IN ('user', 'chat', 'channel')),
                     title TEXT NOT NULL,
                     about TEXT NOT NULL DEFAULT '',
+                    username TEXT,
                     created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     created_at INTEGER NOT NULL
                 );
@@ -237,7 +238,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '8')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '9')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
@@ -269,6 +270,11 @@ class Database:
             }
             if "about" not in peer_columns:
                 connection.execute("ALTER TABLE peers ADD COLUMN about TEXT NOT NULL DEFAULT ''")
+            if "username" not in peer_columns:
+                connection.execute("ALTER TABLE peers ADD COLUMN username TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS peers_username_unique_idx ON peers(username COLLATE NOCASE) WHERE username IS NOT NULL"
+            )
             upload_part_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(upload_parts)").fetchall()

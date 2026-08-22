@@ -1646,6 +1646,136 @@ def test_web_k_persists_channel_content_protection_after_encrypted_toggle(tmp_pa
     assert full_channel.uint32() & (1 << 27)
 
 
+def test_web_k_persists_public_channel_username_and_returns_to_private(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        CHANNEL_CONSTRUCTOR,
+        CHANNELS_CHECK_USERNAME_CONSTRUCTOR,
+        CHANNELS_DEACTIVATE_ALL_USERNAMES_CONSTRUCTOR,
+        CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
+        CHANNELS_UPDATE_USERNAME_CONSTRUCTOR,
+        INPUT_CHANNEL_CONSTRUCTOR,
+        MESSAGES_CHAT_FULL_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import create_group, migrate_chat_to_channel
+
+    auth_key = bytes(range(256))
+    salt, session_id = 953, 211
+    database = Database(tmp_path / "public-username.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000184", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+        chat_id, _ = create_group(connection, owner_user_id=owner.user_id, title="Public group", member_user_ids=[])
+        migrate_chat_to_channel(connection, chat_id=chat_id, actor_user_id=owner.user_id)
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    input_channel = encode_uint32(INPUT_CHANNEL_CONSTRUCTOR) + encode_int64(chat_id) + encode_int64((chat_id << 32) | 1)
+    username = "IntelliGramPublicTest"
+    message_id = (int(time.time()) << 32) + 12
+
+    check_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=encode_uint32(CHANNELS_CHECK_USERNAME_CONSTRUCTOR) + input_channel + encode_tl_string(username),
+    ))
+    assert check_response is not None
+    _, _, _, _, check_body = _decrypt_server(auth_key, check_response)
+    check_reader = TLReader(check_body)
+    assert check_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert check_reader.int64() == message_id
+    assert check_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    update_message_id = message_id + 4
+    update_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=update_message_id,
+        seq_no=3,
+        body=encode_uint32(CHANNELS_UPDATE_USERNAME_CONSTRUCTOR) + input_channel + encode_tl_string(username),
+    ))
+    assert update_response is not None
+    _, _, _, _, update_body = _decrypt_server(auth_key, update_response)
+    update_reader = TLReader(update_body)
+    assert update_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert update_reader.int64() == update_message_id
+    assert update_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    with database.transaction() as connection:
+        stored = connection.execute("SELECT username FROM peers WHERE id = ?", (chat_id,)).fetchone()
+        assert stored is not None and stored["username"] == username
+
+    full_message_id = update_message_id + 4
+    full_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=full_message_id,
+        seq_no=5,
+        body=encode_uint32(CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR) + input_channel,
+    ))
+    assert full_response is not None
+    _, _, _, _, full_body = _decrypt_server(auth_key, full_response)
+    full_reader = TLReader(full_body)
+    assert full_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert full_reader.int64() == full_message_id
+    assert full_reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+    channel_offset = full_body.index(encode_uint32(CHANNEL_CONSTRUCTOR))
+    encoded_channel = TLReader(full_body[channel_offset:])
+    assert encoded_channel.uint32() == CHANNEL_CONSTRUCTOR
+    assert encoded_channel.uint32() & (1 << 6)
+    encoded_channel.uint32()  # flags2
+    encoded_channel.int64()  # channel id
+    encoded_channel.int64()  # access hash
+    encoded_channel.bytes()  # title
+    assert encoded_channel.bytes().decode("utf-8") == username
+
+    clear_message_id = full_message_id + 4
+    clear_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=clear_message_id,
+        seq_no=7,
+        body=encode_uint32(CHANNELS_UPDATE_USERNAME_CONSTRUCTOR) + input_channel + encode_tl_string(""),
+    ))
+    assert clear_response is not None
+    _, _, _, _, clear_body = _decrypt_server(auth_key, clear_response)
+    clear_reader = TLReader(clear_body)
+    assert clear_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert clear_reader.int64() == clear_message_id
+    assert clear_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    deactivate_message_id = clear_message_id + 4
+    deactivate_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=deactivate_message_id,
+        seq_no=9,
+        body=encode_uint32(CHANNELS_DEACTIVATE_ALL_USERNAMES_CONSTRUCTOR) + input_channel,
+    ))
+    assert deactivate_response is not None
+    _, _, _, _, deactivate_body = _decrypt_server(auth_key, deactivate_response)
+    deactivate_reader = TLReader(deactivate_body)
+    assert deactivate_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert deactivate_reader.int64() == deactivate_message_id
+    assert deactivate_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    with database.transaction() as connection:
+        stored = connection.execute("SELECT username FROM peers WHERE id = ?", (chat_id,)).fetchone()
+        assert stored is not None and stored["username"] is None
+
+
 def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:
     from intelligram.mtproto.tl import (
         HELP_COUNTRIES_LIST_CONSTRUCTOR,

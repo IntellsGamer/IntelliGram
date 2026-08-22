@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 import secrets
 import sqlite3
 from typing import Any
@@ -340,7 +341,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         raise MessagingError("CHANNEL_INVALID")
     row = connection.execute(
         """
-        SELECT p.id, p.title, p.about, p.created_at, p.created_by_user_id,
+        SELECT p.id, p.title, p.about, p.username, p.created_at, p.created_by_user_id,
                COUNT(pm.user_id) AS participants_count,
                SUM(CASE WHEN pm.role IN ('owner', 'admin') THEN 1 ELSE 0 END) AS admins_count,
                COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds,
@@ -353,7 +354,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         LEFT JOIN channel_settings cs ON cs.peer_id = p.id
         LEFT JOIN channel_reaction_settings crs ON crs.peer_id = p.id
         WHERE p.id = ? AND p.kind = 'channel'
-        GROUP BY p.id, p.title, p.about, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards,
+        GROUP BY p.id, p.title, p.about, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards,
                  crs.mode, crs.allow_custom, crs.emoticons_json
         """,
         (channel_id,),
@@ -388,6 +389,63 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         else None
     )
     return details
+
+
+_CHANNEL_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{4,31}")
+
+
+def check_channel_username(
+    connection: sqlite3.Connection, *, channel_id: int, actor_user_id: int, username: str
+) -> bool:
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if not _CHANNEL_USERNAME_RE.fullmatch(username):
+        return False
+    existing = connection.execute(
+        "SELECT id FROM peers WHERE username = ? COLLATE NOCASE", (username,)
+    ).fetchone()
+    return existing is None or int(existing["id"]) == channel_id
+
+
+def update_channel_username(
+    connection: sqlite3.Connection, *, channel_id: int, actor_user_id: int, username: str
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    normalized_username = username.strip()
+    if normalized_username and not _CHANNEL_USERNAME_RE.fullmatch(normalized_username):
+        raise MessagingError("USERNAME_INVALID")
+    if normalized_username:
+        existing = connection.execute(
+            "SELECT id FROM peers WHERE username = ? COLLATE NOCASE", (normalized_username,)
+        ).fetchone()
+        if existing is not None and int(existing["id"]) != channel_id:
+            raise MessagingError("USERNAME_OCCUPIED")
+    try:
+        connection.execute(
+            "UPDATE peers SET username = ? WHERE id = ? AND kind = 'channel'",
+            (normalized_username or None, channel_id),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise MessagingError("USERNAME_OCCUPIED") from exc
+    details = get_channel_details(connection, channel_id=channel_id, user_id=actor_user_id)
+    emitted = [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in _active_member_ids(connection, peer_id=channel_id)
+    ]
+    return details, emitted
+
+
+def deactivate_all_channel_usernames(
+    connection: sqlite3.Connection, *, channel_id: int, actor_user_id: int
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    return update_channel_username(
+        connection, channel_id=channel_id, actor_user_id=actor_user_id, username=""
+    )
 
 
 def set_channel_noforwards(

@@ -27,6 +27,8 @@ from intelligram.services.messaging import (
     MessagingError,
     add_chat_user,
     create_group,
+    check_channel_username,
+    deactivate_all_channel_usernames,
     delete_chat_user,
     delete_messages,
     delete_exported_chat_invite,
@@ -49,6 +51,7 @@ from intelligram.services.messaging import (
     set_channel_noforwards,
     set_channel_reactions,
     set_channel_slow_mode,
+    update_channel_username,
     read_history,
     send_message,
 )
@@ -266,6 +269,18 @@ class MTProtoSessionAdapter:
             return self._handle_channels_get_channels(message, channels=request.fields["channels"])
         if request.name == "channels_get_full_channel":
             return self._handle_channels_get_full_channel(message, channel=request.fields["channel"])
+        if request.name == "channels_check_username":
+            return self._handle_channels_check_username(
+                message, channel=request.fields["channel"], username=str(request.fields["username"])
+            )
+        if request.name == "channels_update_username":
+            return self._handle_channels_update_username(
+                message, channel=request.fields["channel"], username=str(request.fields["username"])
+            )
+        if request.name == "channels_deactivate_all_usernames":
+            return self._handle_channels_deactivate_all_usernames(
+                message, channel=request.fields["channel"]
+            )
         if request.name == "channels_toggle_slow_mode":
             return self._handle_channels_toggle_slow_mode(
                 message, channel=request.fields["channel"], seconds=int(request.fields["seconds"])
@@ -720,7 +735,7 @@ class MTProtoSessionAdapter:
         placeholders = ",".join("?" for _ in chat_ids)
         rows = connection.execute(
             f"""
-            SELECT p.id, p.kind, p.title, p.created_at, p.created_by_user_id,
+            SELECT p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id,
                    COUNT(pm.user_id) AS participants_count,
                    COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds,
                    COALESCE(cs.noforwards, 0) AS noforwards,
@@ -730,7 +745,7 @@ class MTProtoSessionAdapter:
             LEFT JOIN channel_settings cs ON cs.peer_id = p.id
             LEFT JOIN peer_permissions pp ON pp.peer_id = p.id
             WHERE p.kind IN ('chat', 'channel') AND p.id IN ({placeholders})
-            GROUP BY p.id, p.kind, p.title, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, pp.default_banned_rights_flags
+            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, pp.default_banned_rights_flags
             ORDER BY p.id
             """,
             sorted(chat_ids),
@@ -739,6 +754,7 @@ class MTProtoSessionAdapter:
             encode_channel(
                 channel_id=int(row["id"]),
                 title=str(row["title"]),
+                username=(str(row["username"]) if row["username"] is not None else None),
                 participants_count=int(row["participants_count"]),
                 date=int(row["created_at"]),
                 creator=int(row["created_by_user_id"] or 0) == self_user_id,
@@ -1540,6 +1556,7 @@ class MTProtoSessionAdapter:
         encoded_channel = encode_channel(
             channel_id=int(channel["id"]),
             title=str(channel["title"]),
+            username=(str(channel["username"]) if channel["username"] is not None else None),
             participants_count=int(channel["participants_count"]),
             date=int(channel["created_at"]),
             creator=int(channel["created_by_user_id"] or 0) == self_user_id,
@@ -1953,6 +1970,67 @@ class MTProtoSessionAdapter:
                     date=actor_update.date,
                     seq=actor_update.seq,
                 )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _validate_input_channel(self, channel: dict[str, object]) -> int:
+        channel_id = int(channel["channel_id"])
+        if int(channel["access_hash"]) != channel_access_hash(channel_id):
+            raise MessagingError("CHANNEL_PRIVATE")
+        return channel_id
+
+    def _handle_channels_check_username(
+        self, message: EncryptedMessage, *, channel: dict[str, object], username: str
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction() as connection:
+                result = encode_bool(check_channel_username(
+                    connection, channel_id=channel_id, actor_user_id=self_user_id, username=username
+                ))
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_update_username(
+        self, message: EncryptedMessage, *, channel: dict[str, object], username: str
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction(immediate=True) as connection:
+                _, emitted = update_channel_username(
+                    connection, channel_id=channel_id, actor_user_id=self_user_id, username=username
+                )
+                self.pending_update_envelopes.extend(emitted)
+                result = encode_bool(True)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_deactivate_all_usernames(
+        self, message: EncryptedMessage, *, channel: dict[str, object]
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction(immediate=True) as connection:
+                _, emitted = deactivate_all_channel_usernames(
+                    connection, channel_id=channel_id, actor_user_id=self_user_id
+                )
+                self.pending_update_envelopes.extend(emitted)
+                result = encode_bool(True)
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(message, result)

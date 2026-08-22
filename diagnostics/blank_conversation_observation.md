@@ -101,3 +101,21 @@ The next native group-management surface, **Group Type**, renders its Private Gr
 **Content protection enablement passed.** After the durable `messages.toggleNoForwards` implementation and encrypted regression passed, the gateway was restarted and the native **Restrict saving content** control was switched on in Group Type. Its visual toggle became blue/on. Gateway evidence recorded `messages.toggleNoForwards` (`0xB2081A35`) and the durable `channel_settings.noforwards` value is `1`. A clean normal SharedWorker session rehydrated the channel, Group Info, editor, and Group Type with the native content-protection switch still blue/on. This completes the enablement server-response, visible-state, and reload-persistence matrix.
 
 **Content protection reverse mutation passed.** Switching **Restrict saving content** off returned the same native toggle to its gray/off state. Gateway evidence recorded the second `messages.toggleNoForwards` request and durable `channel_settings.noforwards` is `0`. A clean normal SharedWorker session rehydrated the channel, Group Info, editor, and Group Type with the native content-protection switch still gray/off. This completes the disablement server-response, visible-state, and reload-persistence matrix, alongside the prior verified enablement path.
+
+**Public Group pre-submit validation passed.** In native Group Type, selecting **Public Group** exposed the `t.me/` username field and approval setting. Entering `intelligrampublictest` rendered the native **Link is available** success state and exposed the Save action, confirming Web K accepted the live `channels.checkUsername` response. The actual public transition is next.
+
+**Public Group native mutation is visibly applied.** Saving the available `intelligrampublictest` username closed Group Type, changed the editor’s Group Type summary to **Public**, and updated the native route to `#@intelligrampublictest`. Gateway, database, and clean-reload verification follows.
+
+The clean normal session resolves `#@intelligrampublictest` back to the persisted channel conversation. Group Info and Group Type will now be reopened to complete the public-state visual persistence check.
+
+The clean public-route session visibly rehydrates `t.me/intelligrampublictest` in Group Info and **Public** in the editor’s Group Type summary. The native Group Type field will now be reopened for the final username-state check.
+
+**Public Group transition passed.** After a clean normal SharedWorker reload, native Group Info showed `t.me/intelligrampublictest`, the editor showed **Group Type — Public**, and native Group Type rehydrated the selected Public Group radio plus the stored `t.me/intelligrampublictest` username. This completes the public transition server-response, visible-state, route, and reload-persistence matrix. The reverse private transition is next.
+
+**Private Group native mutation is visibly applied.** The native confirmation for releasing `@intelligrampublictest` was accepted, and Web K returned to the editor with Group Type visibly shown as **Private**. Gateway, database, and clean-reload verification follows.
+
+The clean normal session resolves the channel back through its private numeric route `#-2`. Group Info and Group Type will now be reopened for the final private-state visual persistence check.
+
+The clean private-route session rehydrates Group Info without a public link and the editor with **Group Type — Private**. Group Type will now be reopened for the final absence check.
+
+**Private Group transition passed.** After a clean normal SharedWorker reload, the channel returned to numeric route `#-2`; Group Info no longer displayed a public `t.me/` username, the editor showed **Group Type — Private**, and native Group Type displayed the Private selection with its permanent invite link and no public username field. This completes the private-transition server-response, visible-state, route, and reload-persistence matrix.

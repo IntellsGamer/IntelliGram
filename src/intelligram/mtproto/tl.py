@@ -129,6 +129,9 @@ MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xBDCA2F75
 MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0x56987BD5
 MESSAGES_DELETE_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xD464A42B
 MESSAGES_TOGGLE_NO_FORWARDS_CONSTRUCTOR = 0xB2081A35
+CHANNELS_CHECK_USERNAME_CONSTRUCTOR = 0x10E6BD2C
+CHANNELS_UPDATE_USERNAME_CONSTRUCTOR = 0x3514B3DE
+CHANNELS_DEACTIVATE_ALL_USERNAMES_CONSTRUCTOR = 0x0A245DD3
 CHAT_INVITE_EXPORTED_CONSTRUCTOR = 0xA22CBD96
 MESSAGES_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0x1871BE50
 MESSAGES_EXPORTED_CHAT_INVITE_REPLACED_CONSTRUCTOR = 0x222600EF
@@ -648,6 +651,20 @@ def parse_request(data: bytes) -> TLRequest:
             "request_needed": _read_bool(reader) if flags & (1 << 3) else None,
             "title": reader.bytes().decode("utf-8") if flags & (1 << 4) else None,
             "title_provided": bool(flags & (1 << 4)),
+        })
+    elif constructor_id == CHANNELS_CHECK_USERNAME_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_check_username", {
+            "channel": _read_input_channel(reader),
+            "username": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == CHANNELS_UPDATE_USERNAME_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_update_username", {
+            "channel": _read_input_channel(reader),
+            "username": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == CHANNELS_DEACTIVATE_ALL_USERNAMES_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_deactivate_all_usernames", {
+            "channel": _read_input_channel(reader),
         })
     elif constructor_id == MESSAGES_TOGGLE_NO_FORWARDS_CONSTRUCTOR:
         flags = reader.uint32()
@@ -1241,6 +1258,7 @@ def encode_channel(
     *,
     channel_id: int,
     title: str,
+    username: str | None = None,
     participants_count: int,
     date: int,
     creator: bool,
@@ -1251,6 +1269,8 @@ def encode_channel(
     flags = (1 << 8) | (1 << 13) | (1 << 17)
     if creator:
         flags |= 1
+    if username:
+        flags |= 1 << 6
     if slowmode_enabled:
         flags |= 1 << 22
     if noforwards:
@@ -1264,6 +1284,7 @@ def encode_channel(
         + encode_int64(channel_id)
         + encode_int64(channel_access_hash(channel_id))
         + encode_tl_string(title)
+        + (encode_tl_string(username) if username else b"")
         + encode_uint32(CHAT_PHOTO_EMPTY_CONSTRUCTOR)
         + encode_int32(date)
         + (encode_chat_banned_rights(flags=default_banned_rights_flags) if default_banned_rights_flags is not None else b"")
