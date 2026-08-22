@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +83,43 @@ class Database:
                 CREATE INDEX IF NOT EXISTS login_challenges_user_active_idx
                     ON login_challenges(user_id, expires_at DESC)
                     WHERE completed_at IS NULL AND denied_at IS NULL;
+
+                -- Existing REST/session password verification remains scrypt-backed.
+                -- These records add the independent verifier Web K requires for
+                -- `account.getPassword` / `auth.checkPassword` SRP exchange.
+                CREATE TABLE IF NOT EXISTS password_srp_verifiers (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    salt1 BLOB NOT NULL,
+                    salt2 BLOB NOT NULL,
+                    verifier BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS password_srp_challenges (
+                    srp_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    auth_key_id TEXT NOT NULL,
+                    private_b BLOB NOT NULL,
+                    srp_B BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
+                );
+                CREATE INDEX IF NOT EXISTS password_srp_challenges_active_idx
+                    ON password_srp_challenges(user_id, auth_key_id, expires_at DESC)
+                    WHERE completed_at IS NULL;
+
+                -- `account.getPassword` has no phone argument.  auth.sendCode
+                -- binds the selected account to this unauthenticated auth key;
+                -- that survives a Web K page reload which reuses the auth key.
+                CREATE TABLE IF NOT EXISTS password_login_contexts (
+                    auth_key_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS peers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,7 +276,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '9')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '10')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )

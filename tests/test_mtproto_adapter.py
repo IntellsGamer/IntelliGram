@@ -137,7 +137,12 @@ def test_web_k_chat_startup_compatibility_calls_return_valid_results() -> None:
 
 
 def _tl_bytes(value: bytes) -> bytes:
-    encoded = bytes([len(value)]) + value
+    if len(value) < 254:
+        encoded = bytes([len(value)]) + value
+    elif len(value) < 1 << 24:
+        encoded = b"\xfe" + len(value).to_bytes(3, "little") + value
+    else:
+        raise ValueError("test TL byte value exceeds the protocol limit")
     return encoded + b"\x00" * (-len(encoded) % 4)
 
 
@@ -344,6 +349,37 @@ def test_web_k_existing_session_login_uses_durable_in_app_code(tmp_path) -> None
     assert payload["challenge_id"] == challenge_id
     code = payload["code"]
 
+    # The app-code is also a normal incoming message from the local
+    # IntelliGram service identity, so an unmodified Web K session has a real
+    # dialog/message surface to render instead of an unhandled custom update.
+    with database.transaction() as connection:
+        delivered = connection.execute(
+            """
+            SELECT m.body, sender.first_name AS sender_name, p.title AS peer_title
+            FROM messages m
+            JOIN users sender ON sender.id = m.sender_user_id
+            JOIN peers p ON p.id = m.peer_id
+            WHERE p.id IN (
+                SELECT d.peer_id FROM dialogs d WHERE d.user_id = ?
+            ) AND sender.username = 'intelligram_login'
+            ORDER BY m.id DESC LIMIT 1
+            """,
+            (issued.user_id,),
+        ).fetchone()
+        incoming_update = connection.execute(
+            """
+            SELECT 1 FROM updates
+            WHERE user_id = ? AND kind = 'updateNewMessage'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (issued.user_id,),
+        ).fetchone()
+    assert delivered is not None
+    assert str(delivered["sender_name"]) == "IntelliGram"
+    assert str(delivered["peer_title"]) == "IntelliGram"
+    assert f"login code is: {code}" in str(delivered["body"])
+    assert incoming_update is not None
+
     sign_in = (
         struct.pack("<II", AUTH_SIGN_IN_CONSTRUCTOR, 1)
         + _tl_bytes(phone.encode())
@@ -522,6 +558,8 @@ def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
         MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
+        UPDATE_MESSAGE_ID_CONSTRUCTOR,
+        UPDATE_NEW_MESSAGE_CONSTRUCTOR,
         UPDATES_CONSTRUCTOR,
         encode_int32,
         encode_int64,
@@ -575,6 +613,23 @@ def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
     assert first_reader.uint32() == RPC_RESULT_CONSTRUCTOR
     first_reader.int64()
     assert first_reader.uint32() == UPDATES_CONSTRUCTOR
+    assert first_reader.vector_count() == 2
+    assert first_reader.uint32() == UPDATE_MESSAGE_ID_CONSTRUCTOR
+    first_reader.int32()  # final server message id
+    assert first_reader.int64() == 1001
+    assert first_reader.uint32() == UPDATE_NEW_MESSAGE_CONSTRUCTOR
+    assert first_reader.uint32() == MESSAGE_CONSTRUCTOR
+    assert first_reader.uint32() & (1 << 1)  # outgoing
+    first_reader.uint32()  # flags2
+    first_reader.int32()  # message id
+    assert first_reader.uint32() == 0x59511722  # peerUser sender
+    first_reader.int64()
+    assert first_reader.uint32() == 0x59511722  # peerUser recipient
+    first_reader.int64()
+    first_reader.int32()  # date
+    assert first_reader.bytes() == b"Reply target"
+    assert first_reader.int32() == 0  # pre-send PTS
+    assert first_reader.int32() == 0  # neutral immediate pts_count
     with database.transaction() as connection:
         target = connection.execute("SELECT id FROM messages WHERE client_random_id = ?", ("1001",)).fetchone()
         assert target is not None
@@ -2381,6 +2436,7 @@ def test_web_k_message_edit_and_revoke_delete_are_durable_and_replayable(tmp_pat
         MESSAGES_AFFECTED_MESSAGES_CONSTRUCTOR,
         MESSAGES_DELETE_MESSAGES_CONSTRUCTOR,
         MESSAGES_EDIT_MESSAGE_CONSTRUCTOR,
+        MESSAGE_CONSTRUCTOR,
         PEER_USER_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
@@ -2440,6 +2496,7 @@ def test_web_k_message_edit_and_revoke_delete_are_durable_and_replayable(tmp_pat
     with database.transaction() as connection:
         row = connection.execute("SELECT body, edited_at FROM messages WHERE id = ?", (int(stored["id"]),)).fetchone()
         assert row is not None and row["body"] == "After edit" and row["edited_at"] is not None
+        edited_at = int(row["edited_at"])
 
     edit_difference = (
         encode_uint32(UPDATES_GET_DIFFERENCE_CONSTRUCTOR)
@@ -2461,6 +2518,18 @@ def test_web_k_message_edit_and_revoke_delete_are_durable_and_replayable(tmp_pat
     assert reader.vector_count() == 0
     assert reader.vector_count() == 1
     assert reader.uint32() == UPDATE_EDIT_MESSAGE_CONSTRUCTOR
+    assert reader.uint32() == MESSAGE_CONSTRUCTOR
+    message_flags = reader.uint32()
+    assert message_flags & (1 << 15)
+    reader.uint32()  # flags2
+    assert reader.int32() == int(stored["id"])
+    assert reader.uint32() == PEER_USER_CONSTRUCTOR
+    assert reader.int64() == alice.user_id
+    assert reader.uint32() == PEER_USER_CONSTRUCTOR
+    assert reader.int64() == bob.user_id
+    reader.int32()  # date
+    assert reader.bytes().decode("utf-8") == "After edit"
+    assert reader.int32() == edited_at
 
     delete_response = adapter.handle_encrypted(_encrypt_client(
         auth_key,
@@ -2732,3 +2801,212 @@ def test_web_k_account_authorizations_lists_and_revokes_remote_session(tmp_path)
         ).fetchone()
         assert remote is not None and remote["revoked_at"] is not None
         assert current is not None and current["revoked_at"] is None
+
+
+def test_web_k_password_fallback_uses_srp_and_authorizes_over_encrypted_mtproto(tmp_path) -> None:
+    """The preserved Web K PasswordCard can fall back without a plaintext RPC."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_GET_PASSWORD_CONSTRUCTOR,
+        ACCOUNT_PASSWORD_CONSTRUCTOR,
+        AUTH_AUTHORIZATION_CONSTRUCTOR,
+        AUTH_CHECK_PASSWORD_CONSTRUCTOR,
+        AUTH_SEND_CODE_CONSTRUCTOR,
+        AUTH_SENT_CODE_CONSTRUCTOR,
+        INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR,
+        PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR,
+        RPC_ERROR_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        SECURE_PASSWORD_KDF_ALGO_UNKNOWN_CONSTRUCTOR,
+        TLReader,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.srp import G, P, P_BYTES
+
+    code_settings_constructor = 0xAD253D78
+    auth_key = bytes(range(255, -1, -1))
+    salt, session_id = 101, 404
+    database = Database(tmp_path / "password-fallback.sqlite3")
+    database.initialize()
+    phone = "+15551239991"
+    password = "correct-horse-battery-staple"
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone=phone,
+            password=password,
+            first_name="Fallback",
+            device_label="Primary IntelliGram device",
+        )
+
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database)
+    first_message_id = (int(time.time()) << 32) + 4
+
+    def invoke(query: bytes, index: int) -> TLReader:
+        request_message_id = first_message_id + index * 4
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id,
+            seq_no=index * 2 + 1,
+            body=query,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == request_message_id
+        return reader
+
+    send_code = (
+        struct.pack("<I", AUTH_SEND_CODE_CONSTRUCTOR)
+        + _tl_bytes(phone.encode())
+        + struct.pack("<i", 1)
+        + _tl_bytes(b"intelligram-self-hosted")
+        + struct.pack("<II", code_settings_constructor, 0)
+    )
+    reader = invoke(send_code, 0)
+    assert reader.uint32() == AUTH_SENT_CODE_CONSTRUCTOR
+
+    # account.getPassword has no phone field; the prior sendCode stores the
+    # one-time account binding against this encrypted auth key.
+    reader = invoke(struct.pack("<I", ACCOUNT_GET_PASSWORD_CONSTRUCTOR), 1)
+    assert reader.uint32() == ACCOUNT_PASSWORD_CONSTRUCTOR
+    assert reader.uint32() == 1 << 2
+    assert reader.uint32() == PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR
+    salt1 = reader.bytes()
+    salt2 = reader.bytes()
+    assert reader.int32() == G
+    assert reader.bytes() == P_BYTES
+    srp_B = reader.bytes()
+    srp_id = reader.int64()
+    assert len(srp_B) == 256
+    # Required new_algo and secure algorithm still decode after current state.
+    assert reader.uint32() == PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR
+    assert reader.bytes() == salt1
+    assert reader.bytes() == salt2
+    assert reader.int32() == G
+    assert reader.bytes() == P_BYTES
+    assert reader.uint32() == SECURE_PASSWORD_KDF_ALGO_UNKNOWN_CONSTRUCTOR
+    assert reader.bytes() == b"\x00" * 32
+
+    def proof() -> tuple[bytes, bytes]:
+        def sha(value: bytes) -> bytes:
+            return hashlib.sha256(value).digest()
+
+        def pad(value: int) -> bytes:
+            return value.to_bytes(256, "big")
+
+        first_hash = sha(salt1 + password.encode() + salt1)
+        second_hash = sha(salt2 + first_hash + salt2)
+        stretched = hashlib.pbkdf2_hmac("sha512", second_hash, salt1, 100_000, dklen=64)
+        x = int.from_bytes(sha(salt2 + stretched + salt2), "big")
+        private_a = 0x123456789ABCDEF
+        public_A = pow(G, private_a, P)
+        public_B = int.from_bytes(srp_B, "big")
+        multiplier = int.from_bytes(sha(pad(P) + pad(G)), "big")
+        scrambling = int.from_bytes(sha(pad(public_A) + pad(public_B)), "big")
+        shared_secret = pow((public_B - multiplier * pow(G, x, P)) % P, private_a + scrambling * x, P)
+        session_key = sha(pad(shared_secret))
+        hash_prime_xor_generator = bytes(left ^ right for left, right in zip(sha(pad(P)), sha(pad(G)), strict=True))
+        m1 = sha(
+            hash_prime_xor_generator
+            + sha(salt1)
+            + sha(salt2)
+            + pad(public_A)
+            + pad(public_B)
+            + session_key
+        )
+        return pad(public_A), m1
+
+    client_A, client_M1 = proof()
+    check_password_prefix = (
+        struct.pack("<I", AUTH_CHECK_PASSWORD_CONSTRUCTOR)
+        + struct.pack("<I", INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR)
+        + struct.pack("<q", srp_id)
+        + _tl_bytes(client_A)
+    )
+    reader = invoke(check_password_prefix + _tl_bytes(b"\x00" * 32), 2)
+    assert reader.uint32() == RPC_ERROR_CONSTRUCTOR
+    assert reader.int32() == 400
+    assert reader.bytes().decode() == "PASSWORD_HASH_INVALID"
+
+    reader = invoke(check_password_prefix + _tl_bytes(client_M1), 3)
+    assert reader.uint32() == AUTH_AUTHORIZATION_CONSTRUCTOR
+
+    with database.transaction() as connection:
+        key_binding = connection.execute(
+            "SELECT user_id FROM auth_keys WHERE auth_key_id = ?",
+            (str(auth_key_id(auth_key)),),
+        ).fetchone()
+        challenge = connection.execute(
+            "SELECT completed_at, attempts FROM password_srp_challenges WHERE srp_id = ?",
+            (srp_id,),
+        ).fetchone()
+        context = connection.execute(
+            "SELECT 1 FROM password_login_contexts WHERE auth_key_id = ?",
+            (str(auth_key_id(auth_key)),),
+        ).fetchone()
+    assert key_binding is not None
+    assert int(key_binding["user_id"]) == issued.user_id
+    assert challenge is not None and challenge["completed_at"] is not None
+    assert int(challenge["attempts"]) == 1
+    assert context is None
+
+
+def test_device_login_invalidates_a_six_digit_code_after_five_bad_attempts(tmp_path) -> None:
+    """Code delivery remains one-time and invalidates on the documented limit."""
+
+    from intelligram.database import Database
+    from intelligram.services.accounts import (
+        AccountAuthError,
+        MAX_LOGIN_CODE_ATTEMPTS,
+        complete_device_login,
+        register_password_account,
+        start_device_login,
+    )
+
+    database = Database(tmp_path / "code-attempt-limit.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15551239992",
+            password="correct-horse-battery-staple",
+            first_name="Attempts",
+            device_label="Primary IntelliGram device",
+        )
+        started = start_device_login(connection, phone="+15551239992", device_label="New browser")
+        assert started.challenge_id is not None
+        for attempt in range(MAX_LOGIN_CODE_ATTEMPTS):
+            with pytest.raises(AccountAuthError, match="PHONE_CODE_INVALID"):
+                complete_device_login(
+                    connection,
+                    phone="+15551239992",
+                    challenge_id=started.challenge_id,
+                    code="000000",
+                    device_label=f"Attempt {attempt}",
+                )
+        challenge = connection.execute(
+            "SELECT attempts, denied_at FROM login_challenges WHERE id = ?",
+            (started.challenge_id,),
+        ).fetchone()
+        assert challenge is not None
+        assert int(challenge["attempts"]) == MAX_LOGIN_CODE_ATTEMPTS
+        assert challenge["denied_at"] is not None
+        with pytest.raises(AccountAuthError, match="PHONE_CODE_EXPIRED"):
+            complete_device_login(
+                connection,
+                phone="+15551239992",
+                challenge_id=started.challenge_id,
+                code="999999",
+                device_label="Post-limit browser",
+            )
+        # The existing primary session remains durable while a pending code is denied.
+        sessions = connection.execute(
+            "SELECT count(*) AS count FROM sessions WHERE user_id = ? AND revoked_at IS NULL",
+            (issued.user_id,),
+        ).fetchone()
+        assert sessions is not None and int(sessions["count"]) == 1

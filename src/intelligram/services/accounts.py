@@ -11,6 +11,14 @@ from typing import Literal
 
 from intelligram.auth.tokens import create_session_id
 from intelligram.database import now_unix
+from intelligram.services.messaging import create_user, get_or_create_direct_peer, send_message
+from intelligram.services.srp import (
+    CHALLENGE_LIFETIME_SECONDS as SRP_CHALLENGE_LIFETIME_SECONDS,
+    MAX_PASSWORD_ATTEMPTS,
+    make_challenge,
+    make_password_verifier,
+    verify_proof,
+)
 from intelligram.services.updates import UpdateEnvelope, append_update
 
 
@@ -23,6 +31,8 @@ PASSWORD_MIN_LENGTH = 8
 SESSION_LIFETIME_SECONDS = 60 * 60 * 24 * 30
 LOGIN_CHALLENGE_LIFETIME_SECONDS = 60 * 5
 MAX_LOGIN_CODE_ATTEMPTS = 5
+LOGIN_SERVICE_PHONE = "+00000000001"
+LOGIN_SERVICE_USERNAME = "intelligram_login"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +49,17 @@ class LoginStartResult:
     challenge_id: str | None
     expires_at: int | None
     updates: list[UpdateEnvelope]
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordSRPState:
+    """A single Web K `account.password` SRP state for a pending login."""
+
+    user_id: int
+    srp_id: int
+    salt1: bytes
+    salt2: bytes
+    srp_B: bytes
 
 
 def normalize_phone(phone: str) -> str:
@@ -70,6 +91,7 @@ def register_password_account(
     normalized_phone = normalize_phone(phone)
     _validate_profile(first_name=first_name, last_name=last_name, username=username)
     password_hash = hash_password(password)
+    srp_verifier = make_password_verifier(password)
     now = now_unix()
     try:
         cursor = connection.execute(
@@ -90,6 +112,13 @@ def register_password_account(
     except sqlite3.IntegrityError as exc:
         raise AccountAuthError("PHONE_OR_USERNAME_OCCUPIED") from exc
     user_id = int(cursor.lastrowid)
+    connection.execute(
+        """
+        INSERT INTO password_srp_verifiers(user_id, salt1, salt2, verifier, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, srp_verifier.salt1, srp_verifier.salt2, srp_verifier.verifier, now, now),
+    )
     connection.execute(
         "INSERT INTO update_state(user_id, pts, qts, seq, date) VALUES (?, 0, 0, 0, ?)",
         (user_id, now),
@@ -113,7 +142,9 @@ def password_login(
     stored_hash = user["password_hash"]
     if not isinstance(stored_hash, str) or not verify_password(password, stored_hash):
         raise AccountAuthError("PASSWORD_HASH_INVALID")
-    return _issue_session(connection, user_id=int(user["id"]), device_label=device_label)
+    user_id = int(user["id"])
+    _ensure_srp_verifier_from_password(connection, user_id=user_id, password=password)
+    return _issue_session(connection, user_id=user_id, device_label=device_label)
 
 
 def start_device_login(
@@ -163,6 +194,17 @@ def start_device_login(
         """,
         (challenge_id, user_id, _normalize_device_label(device_label), _challenge_code_hash(challenge_id, code), now, expires_at),
     )
+    # Preserve the machine-readable update for the self-hosted REST surface,
+    # and also deliver the secret through an ordinary incoming dialog/message.
+    # The latter is essential: unmodified Web K cannot render a private custom
+    # update constructor, but it does render a normal `updateNewMessage`.
+    message_updates = _deliver_login_code_message(
+        connection,
+        user_id=user_id,
+        challenge_id=challenge_id,
+        code=code,
+        expires_at=expires_at,
+    )
     update = append_update(
         connection,
         user_id=user_id,
@@ -179,8 +221,197 @@ def start_device_login(
         user_id=user_id,
         challenge_id=challenge_id,
         expires_at=expires_at,
-        updates=[update],
+        updates=[*message_updates, update],
     )
+
+
+def _deliver_login_code_message(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    challenge_id: str,
+    code: str,
+    expires_at: int,
+) -> list[UpdateEnvelope]:
+    """Deliver a short-lived code as a visible incoming IntelliGram message.
+
+    The system identity is local to this self-hosted database.  A direct peer
+    is used deliberately because Web K already hydrates and renders its
+    standard message/dialog updates; no Telegram production identity or SMS
+    transport is involved.
+    """
+
+    service = connection.execute(
+        "SELECT id FROM users WHERE phone = ?",
+        (LOGIN_SERVICE_PHONE,),
+    ).fetchone()
+    if service is None:
+        service_user_id = create_user(
+            connection,
+            phone=LOGIN_SERVICE_PHONE,
+            first_name="IntelliGram",
+            last_name="",
+            username=LOGIN_SERVICE_USERNAME,
+        )
+    else:
+        service_user_id = int(service["id"])
+    peer_id = get_or_create_direct_peer(
+        connection,
+        user_id=user_id,
+        other_user_id=service_user_id,
+    )
+    remaining_seconds = max(0, expires_at - now_unix())
+    _, updates = send_message(
+        connection,
+        peer_id=peer_id,
+        sender_user_id=service_user_id,
+        body=(
+            f"Your IntelliGram login code is: {code}\n\n"
+            f"It expires in {max(1, remaining_seconds // 60)} minutes. "
+            "Do not share this code with anyone."
+        ),
+        client_random_id=f"login-code:{challenge_id}",
+    )
+    return updates
+
+
+def begin_password_login(
+    connection: sqlite3.Connection,
+    *,
+    auth_key_id: str,
+    user_id: int,
+) -> None:
+    """Bind an unauthenticated MTProto key to the account chosen by sendCode.
+
+    Web K's `account.getPassword` carries no phone number.  The short-lived
+    binding lets the real PasswordCard request a password state after a code
+    delivery problem without leaking account information to another auth key.
+    """
+
+    now = now_unix()
+    connection.execute(
+        """
+        INSERT INTO password_login_contexts(auth_key_id, user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(auth_key_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            created_at = excluded.created_at,
+            expires_at = excluded.expires_at
+        """,
+        (auth_key_id, user_id, now, now + SRP_CHALLENGE_LIFETIME_SECONDS),
+    )
+
+
+def get_password_srp_state(
+    connection: sqlite3.Connection,
+    *,
+    auth_key_id: str,
+) -> PasswordSRPState:
+    """Issue the one-time SRP material consumed by Web K's PasswordCard."""
+
+    now = now_unix()
+    context = connection.execute(
+        """
+        SELECT user_id FROM password_login_contexts
+        WHERE auth_key_id = ? AND expires_at >= ?
+        """,
+        (auth_key_id, now),
+    ).fetchone()
+    if context is None:
+        raise AccountAuthError("SESSION_PASSWORD_NEEDED")
+    user_id = int(context["user_id"])
+    verifier = connection.execute(
+        "SELECT salt1, salt2, verifier FROM password_srp_verifiers WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if verifier is None:
+        # Legacy scrypt-only accounts are not silently downgraded to plaintext.
+        # A successful REST password login will safely bootstrap an SRP verifier.
+        raise AccountAuthError("PASSWORD_FALLBACK_UNAVAILABLE")
+    challenge = make_challenge(
+        salt1=bytes(verifier["salt1"]),
+        salt2=bytes(verifier["salt2"]),
+        verifier=bytes(verifier["verifier"]),
+    )
+    connection.execute(
+        """
+        UPDATE password_srp_challenges SET completed_at = ?
+        WHERE user_id = ? AND auth_key_id = ? AND completed_at IS NULL
+        """,
+        (now, user_id, auth_key_id),
+    )
+    connection.execute(
+        """
+        INSERT INTO password_srp_challenges(
+            srp_id, user_id, auth_key_id, private_b, srp_B, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            challenge.srp_id,
+            user_id,
+            auth_key_id,
+            challenge.private_b,
+            challenge.srp_B,
+            now,
+            now + SRP_CHALLENGE_LIFETIME_SECONDS,
+        ),
+    )
+    return PasswordSRPState(
+        user_id=user_id,
+        srp_id=challenge.srp_id,
+        salt1=challenge.salt1,
+        salt2=challenge.salt2,
+        srp_B=challenge.srp_B,
+    )
+
+
+def complete_password_srp_login(
+    connection: sqlite3.Connection,
+    *,
+    auth_key_id: str,
+    srp_id: int,
+    client_A: bytes,
+    client_M1: bytes,
+    device_label: str,
+) -> IssuedSession:
+    """Verify an `inputCheckPasswordSRP` proof and issue a normal session."""
+
+    now = now_unix()
+    row = connection.execute(
+        """
+        SELECT c.user_id, c.private_b, c.srp_B, c.expires_at, c.completed_at, c.attempts,
+               v.salt1, v.salt2, v.verifier
+        FROM password_srp_challenges c
+        JOIN password_srp_verifiers v ON v.user_id = c.user_id
+        WHERE c.srp_id = ? AND c.auth_key_id = ?
+        """,
+        (srp_id, auth_key_id),
+    ).fetchone()
+    if row is None or row["completed_at"] is not None or int(row["expires_at"]) < now:
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+    attempts = int(row["attempts"])
+    if attempts >= MAX_PASSWORD_ATTEMPTS:
+        connection.execute("UPDATE password_srp_challenges SET completed_at = ? WHERE srp_id = ?", (now, srp_id))
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+    accepted = verify_proof(
+        salt1=bytes(row["salt1"]),
+        salt2=bytes(row["salt2"]),
+        verifier=bytes(row["verifier"]),
+        private_b=bytes(row["private_b"]),
+        srp_B=bytes(row["srp_B"]),
+        client_A=client_A,
+        client_M1=client_M1,
+    )
+    if not accepted:
+        next_attempts = attempts + 1
+        connection.execute(
+            "UPDATE password_srp_challenges SET attempts = ?, completed_at = ? WHERE srp_id = ?",
+            (next_attempts, now if next_attempts >= MAX_PASSWORD_ATTEMPTS else None, srp_id),
+        )
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+    connection.execute("UPDATE password_srp_challenges SET completed_at = ? WHERE srp_id = ?", (now, srp_id))
+    connection.execute("DELETE FROM password_login_contexts WHERE auth_key_id = ?", (auth_key_id,))
+    return _issue_session(connection, user_id=int(row["user_id"]), device_label=device_label, now=now)
 
 
 def complete_device_login(
@@ -211,7 +442,11 @@ def complete_device_login(
         connection.execute("UPDATE login_challenges SET denied_at = ? WHERE id = ?", (now, challenge_id))
         raise AccountAuthError("PHONE_CODE_INVALID")
     if not hmac.compare_digest(str(challenge["code_hash"]), _challenge_code_hash(challenge_id, code)):
-        connection.execute("UPDATE login_challenges SET attempts = attempts + 1 WHERE id = ?", (challenge_id,))
+        next_attempts = attempts + 1
+        connection.execute(
+            "UPDATE login_challenges SET attempts = ?, denied_at = ? WHERE id = ?",
+            (next_attempts, now if next_attempts >= MAX_LOGIN_CODE_ATTEMPTS else None, challenge_id),
+        )
         raise AccountAuthError("PHONE_CODE_INVALID")
     connection.execute("UPDATE login_challenges SET completed_at = ? WHERE id = ?", (now, challenge_id))
     return _issue_session(connection, user_id=int(challenge["user_id"]), device_label=device_label, now=now)
@@ -237,6 +472,31 @@ def active_login_challenges(connection: sqlite3.Connection, *, user_id: int) -> 
         }
         for row in rows
     ]
+
+
+def _ensure_srp_verifier_from_password(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    password: str,
+) -> None:
+    """Backfill SRP only after an existing account proves its password locally."""
+
+    existing = connection.execute(
+        "SELECT 1 FROM password_srp_verifiers WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if existing is not None:
+        return
+    verifier = make_password_verifier(password)
+    now = now_unix()
+    connection.execute(
+        """
+        INSERT INTO password_srp_verifiers(user_id, salt1, salt2, verifier, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, verifier.salt1, verifier.salt2, verifier.verifier, now, now),
+    )
 
 
 def hash_password(password: str) -> str:

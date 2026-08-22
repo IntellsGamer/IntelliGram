@@ -18,7 +18,10 @@ from intelligram.database import Database, now_unix
 from intelligram.mtproto.crypto import EncryptedMessage, MTProtoSecurityError, auth_key_id, decrypt_client_message, encrypt_server_message
 from intelligram.services.accounts import (
     AccountAuthError,
+    begin_password_login,
     complete_device_login,
+    complete_password_srp_login,
+    get_password_srp_state,
     normalize_phone,
     register_password_account,
     start_device_login,
@@ -61,6 +64,7 @@ from intelligram.mtproto.tl import (
     TLDecodeError,
     channel_access_hash,
     encode_account_content_settings,
+    encode_account_password,
     encode_account_privacy_rules,
     encode_channel,
     encode_channel_full,
@@ -221,6 +225,15 @@ class MTProtoSessionAdapter:
             )
         if request.name == "auth_send_code":
             return self._handle_auth_send_code(message, phone_number=str(request.fields["phone_number"]))
+        if request.name == "account_get_password":
+            return self._handle_account_get_password(message)
+        if request.name == "auth_check_password":
+            return self._handle_auth_check_password(
+                message,
+                srp_id=int(request.fields["srp_id"]),
+                client_A=bytes(request.fields["A"]),
+                client_M1=bytes(request.fields["M1"]),
+            )
         if request.name == "auth_sign_up":
             return self._handle_auth_sign_up(
                 message,
@@ -605,12 +618,71 @@ class MTProtoSessionAdapter:
                 phone=normalized_phone,
                 device_label="IntelliGram Web K MTProto browser",
             )
+            begin_password_login(
+                connection,
+                auth_key_id=str(auth_key_id(self.auth_key)),
+                user_id=result.user_id,
+            )
         if result.status == "password_required" or result.challenge_id is None:
             return self._encrypt_rpc_error(message, "SESSION_PASSWORD_NEEDED")
         # The one-time value itself is persisted as a durable login-code update
         # for existing IntelliGram sessions. This response exposes only the
         # opaque challenge identifier mandated by auth.sentCode.
         return self._encrypt_result(message, encode_auth_sent_code(phone_code_hash=result.challenge_id))
+
+    def _handle_account_get_password(self, message: EncryptedMessage) -> bytes:
+        if self.database is None:
+            return self._encrypt_rpc_error(message, "AUTH_RESTART")
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                state = get_password_srp_state(
+                    connection,
+                    auth_key_id=str(auth_key_id(self.auth_key)),
+                )
+        except AccountAuthError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(
+            message,
+            encode_account_password(
+                srp_id=state.srp_id,
+                salt1=state.salt1,
+                salt2=state.salt2,
+                srp_B=state.srp_B,
+            ),
+        )
+
+    def _handle_auth_check_password(
+        self,
+        message: EncryptedMessage,
+        *,
+        srp_id: int,
+        client_A: bytes,
+        client_M1: bytes,
+    ) -> bytes:
+        if self.database is None:
+            return self._encrypt_rpc_error(message, "AUTH_RESTART")
+        error: str | None = None
+        issued = None
+        with self.database.transaction(immediate=True) as connection:
+            try:
+                issued = complete_password_srp_login(
+                    connection,
+                    auth_key_id=str(auth_key_id(self.auth_key)),
+                    srp_id=srp_id,
+                    client_A=client_A,
+                    client_M1=client_M1,
+                    device_label="IntelliGram Web K MTProto password fallback",
+                )
+            except AccountAuthError as exc:
+                # Deliberately stay inside the transaction so failed-attempt
+                # accounting and one-time invalidation are committed.
+                error = str(exc)
+        if error is not None:
+            return self._encrypt_rpc_error(message, error)
+        assert issued is not None
+        self.user_id = issued.user_id
+        self._associate_auth_key(issued.user_id)
+        return self._encrypt_result(message, encode_auth_authorization(user=self._load_user(issued.user_id)))
 
     def _handle_auth_sign_up(
         self,
@@ -654,8 +726,10 @@ class MTProtoSessionAdapter:
     ) -> bytes:
         if self.database is None:
             return self._encrypt_rpc_error(message, "AUTH_RESTART")
-        try:
-            with self.database.transaction(immediate=True) as connection:
+        error: str | None = None
+        issued = None
+        with self.database.transaction(immediate=True) as connection:
+            try:
                 issued = complete_device_login(
                     connection,
                     phone=phone_number,
@@ -663,8 +737,13 @@ class MTProtoSessionAdapter:
                     code=phone_code,
                     device_label="IntelliGram Web K MTProto browser",
                 )
-        except AccountAuthError as exc:
-            return self._encrypt_rpc_error(message, str(exc))
+            except AccountAuthError as exc:
+                # Preserve code attempt/denial state before replying with the
+                # client-safe MTProto error.
+                error = str(exc)
+        if error is not None:
+            return self._encrypt_rpc_error(message, error)
+        assert issued is not None
         self.user_id = issued.user_id
         self._associate_auth_key(issued.user_id)
         return self._encrypt_result(message, encode_auth_authorization(user=self._load_user(issued.user_id)))
@@ -1253,7 +1332,9 @@ class MTProtoSessionAdapter:
                     updates.extend([
                         encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
                         encode_update_new_message(
-                            message=encoded_message, pts=sender_update.pts, pts_count=sender_update.pts_count
+                            message=encoded_message,
+                            pts=sender_update.pts - sender_update.pts_count,
+                            pts_count=0,
                         ),
                     ])
                 user_ids = {self_user_id}
@@ -2403,8 +2484,8 @@ class MTProtoSessionAdapter:
                     encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
                     encode_update_new_message(
                         message=encoded_message,
-                        pts=sender_update.pts,
-                        pts_count=sender_update.pts_count,
+                        pts=sender_update.pts - sender_update.pts_count,
+                        pts_count=0,
                     ),
                 ]
         except MessagingError as exc:

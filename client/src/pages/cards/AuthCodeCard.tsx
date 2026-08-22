@@ -66,6 +66,15 @@ export default function AuthCodeCard(props: {spec: Spec}) {
   const codeInputErrorLabel = document.createElement('div');
   codeInputErrorLabel.classList.add(styles.errorLabel);
 
+  // IntelliGram fallback: the server binds the phone selected by auth.sendCode
+  // to this MTProto auth key, so the preserved PasswordCard can retrieve an
+  // SRP state without carrying a password or phone number in browser state.
+  const passwordFallbackLink = document.createElement('a');
+  passwordFallbackLink.textContent = "Can't sign in?";
+  passwordFallbackLink.setAttribute('role', 'button');
+  passwordFallbackLink.tabIndex = 0;
+  attachClickEvent(passwordFallbackLink, () => navigate({name: 'password'}));
+
   /* ---------- header pieces (mutated imperatively in applySentCode) ---------- */
 
   const phoneEl = document.createElement('h4');
@@ -335,6 +344,7 @@ export default function AuthCodeCard(props: {spec: Spec}) {
     >
       {codeInputField.container}
       {codeInputErrorLabel}
+      <div class={styles.forgotLink}>{passwordFallbackLink}</div>
       <Show when={resetEmailContent()}>
         <div class={styles.forgotLink}>{resetEmailContent()}</div>
       </Show>

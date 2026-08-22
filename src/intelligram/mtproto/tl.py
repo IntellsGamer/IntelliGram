@@ -185,6 +185,12 @@ ACCOUNT_AUTHORIZATION_CONSTRUCTOR = 0xAD01D61D
 ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR = 0x4BFF8EA0
 ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR = 0xE320C158
 ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR = 0xDF77F3BC
+ACCOUNT_GET_PASSWORD_CONSTRUCTOR = 0x548A30F5
+AUTH_CHECK_PASSWORD_CONSTRUCTOR = 0xD18B4D16
+ACCOUNT_PASSWORD_CONSTRUCTOR = 0x957B50FB
+PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR = 0x3A912D4A
+SECURE_PASSWORD_KDF_ALGO_UNKNOWN_CONSTRUCTOR = 0x004A8537
+INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR = 0xD27FF082
 
 
 class TLDecodeError(ValueError):
@@ -518,6 +524,17 @@ def parse_request(data: bytes) -> TLRequest:
             "phone_number": phone_number,
             "phone_code_hash": phone_code_hash,
             "phone_code": phone_code,
+        })
+    elif constructor_id == ACCOUNT_GET_PASSWORD_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "account_get_password", {})
+    elif constructor_id == AUTH_CHECK_PASSWORD_CONSTRUCTOR:
+        password_constructor = reader.uint32()
+        if password_constructor != INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR:
+            raise TLDecodeError("Expected inputCheckPasswordSRP")
+        request = TLRequest(constructor_id, "auth_check_password", {
+            "srp_id": reader.int64(),
+            "A": reader.bytes(),
+            "M1": reader.bytes(),
         })
     elif constructor_id == AUTH_SIGN_UP_CONSTRUCTOR:
         flags = reader.uint32()
@@ -1048,6 +1065,37 @@ def encode_auth_sent_code(*, phone_code_hash: str, length: int = 6) -> bytes:
     )
 
 
+def encode_password_kdf_algo(*, salt1: bytes, salt2: bytes) -> bytes:
+    """Encode the exact password KDF algorithm implemented by Web K SRP."""
+
+    from intelligram.services.srp import G, P_BYTES
+
+    return (
+        encode_uint32(PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR)
+        + encode_tl_bytes(salt1)
+        + encode_tl_bytes(salt2)
+        + encode_int32(G)
+        + encode_tl_bytes(P_BYTES)
+    )
+
+
+def encode_account_password(*, srp_id: int, salt1: bytes, salt2: bytes, srp_B: bytes) -> bytes:
+    """Encode a password state consumed by the unmodified Web K PasswordCard."""
+
+    algorithm = encode_password_kdf_algo(salt1=salt1, salt2=salt2)
+    flags = 1 << 2  # has_password/current_algo/srp_B/srp_id
+    return (
+        encode_uint32(ACCOUNT_PASSWORD_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + algorithm
+        + encode_tl_bytes(srp_B)
+        + encode_int64(srp_id)
+        + algorithm  # new_algo is mandatory even when no password update is offered.
+        + encode_uint32(SECURE_PASSWORD_KDF_ALGO_UNKNOWN_CONSTRUCTOR)
+        + encode_tl_bytes(b"\x00" * 32)
+    )
+
+
 def encode_auth_authorization_sign_up_required() -> bytes:
     return encode_uint32(AUTH_AUTHORIZATION_SIGN_UP_REQUIRED_CONSTRUCTOR) + encode_uint32(0)
 
@@ -1444,7 +1492,13 @@ def encode_message_reply_header(*, reply_to_message_id: int) -> bytes:
 
 def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: bool) -> bytes:
     reply_to_message_id = message.get("reply_to_message_id")
-    flags = (1 << 8) | ((1 << 1) if outgoing else 0) | ((1 << 3) if reply_to_message_id is not None else 0)
+    edited_at = message.get("edited_at")
+    flags = (
+        (1 << 8)
+        | ((1 << 1) if outgoing else 0)
+        | ((1 << 3) if reply_to_message_id is not None else 0)
+        | ((1 << 15) if edited_at is not None else 0)
+    )
     return (
         encode_uint32(MESSAGE_CONSTRUCTOR)
         + encode_uint32(flags)
@@ -1455,6 +1509,7 @@ def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: 
         + (encode_message_reply_header(reply_to_message_id=int(reply_to_message_id)) if reply_to_message_id is not None else b"")
         + encode_int32(int(message["sent_at"]))
         + encode_tl_string(str(message["body"]))
+        + (encode_int32(int(edited_at)) if edited_at is not None else b"")
     )
 
 
