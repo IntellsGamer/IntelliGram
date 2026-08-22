@@ -119,6 +119,11 @@ CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR = 0x08736A09
 CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR = 0xEDD49EF0
 MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR = 0xA5866B41
 CHAT_BANNED_RIGHTS_CONSTRUCTOR = 0x9F120418
+MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR = 0x864B2581
+CHAT_REACTIONS_NONE_CONSTRUCTOR = 0xEAFC32BC
+CHAT_REACTIONS_ALL_CONSTRUCTOR = 0x52928BCA
+CHAT_REACTIONS_SOME_CONSTRUCTOR = 0x661D4037
+REACTION_EMOJI_CONSTRUCTOR = 0x1B2286B8
 CHAT_FULL_CONSTRUCTOR = 0x2633421B
 CHAT_PARTICIPANT_CONSTRUCTOR = 0x38E79FDE
 CHAT_PARTICIPANTS_CONSTRUCTOR = 0x3CBC93F8
@@ -350,6 +355,27 @@ def _read_input_user(reader: TLReader) -> dict[str, Any]:
     raise TLDecodeError(f"Unsupported InputUser constructor: 0x{constructor_id:08x}")
 
 
+def _read_reaction(reader: TLReader) -> dict[str, str]:
+    if reader.uint32() != REACTION_EMOJI_CONSTRUCTOR:
+        raise TLDecodeError("Only standard emoji reactions are supported")
+    return {"emoticon": reader.bytes().decode("utf-8")}
+
+
+def _read_chat_reactions(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == CHAT_REACTIONS_NONE_CONSTRUCTOR:
+        return {"mode": "none", "allow_custom": False, "emoticons": []}
+    if constructor_id == CHAT_REACTIONS_ALL_CONSTRUCTOR:
+        return {"mode": "all", "allow_custom": bool(reader.uint32() & 1), "emoticons": []}
+    if constructor_id == CHAT_REACTIONS_SOME_CONSTRUCTOR:
+        return {
+            "mode": "some",
+            "allow_custom": False,
+            "emoticons": [reaction["emoticon"] for reaction in (_read_reaction(reader) for _ in range(reader.vector_count()))],
+        }
+    raise TLDecodeError(f"Unsupported ChatReactions constructor: 0x{constructor_id:08x}")
+
+
 def _read_chat_banned_rights(reader: TLReader) -> dict[str, int]:
     if reader.uint32() != CHAT_BANNED_RIGHTS_CONSTRUCTOR:
         raise TLDecodeError("Expected a chatBannedRights constructor")
@@ -577,6 +603,14 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_edit_chat_default_banned_rights", {
             "peer": _read_input_peer(reader),
             "banned_rights": _read_chat_banned_rights(reader),
+        })
+    elif constructor_id == MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_set_chat_available_reactions", {
+            "peer": _read_input_peer(reader),
+            "available_reactions": _read_chat_reactions(reader),
+            "reactions_limit": reader.int32() if flags & 1 else None,
+            "paid_enabled": _read_bool(reader) if flags & 2 else None,
         })
     elif constructor_id == MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_edit_chat_title", {
@@ -1045,6 +1079,22 @@ def encode_chat_banned_rights(*, flags: int, until_date: int = 0) -> bytes:
     return encode_uint32(CHAT_BANNED_RIGHTS_CONSTRUCTOR) + encode_uint32(flags) + encode_int32(until_date)
 
 
+def encode_reaction_emoji(*, emoticon: str) -> bytes:
+    return encode_uint32(REACTION_EMOJI_CONSTRUCTOR) + encode_tl_string(emoticon)
+
+
+def encode_chat_reactions(*, mode: str, allow_custom: bool = False, emoticons: Iterable[str] = ()) -> bytes:
+    if mode == "none":
+        return encode_uint32(CHAT_REACTIONS_NONE_CONSTRUCTOR)
+    if mode == "all":
+        return encode_uint32(CHAT_REACTIONS_ALL_CONSTRUCTOR) + encode_uint32(1 if allow_custom else 0)
+    if mode == "some":
+        return encode_uint32(CHAT_REACTIONS_SOME_CONSTRUCTOR) + encode_vector(
+            [encode_reaction_emoji(emoticon=emoticon) for emoticon in emoticons]
+        )
+    raise ValueError("Unsupported reaction mode")
+
+
 def encode_chat_full(*, chat_id: int, about: str, participants: bytes) -> bytes:
     return (
         encode_uint32(CHAT_FULL_CONSTRUCTOR)
@@ -1088,11 +1138,22 @@ def encode_channel(
 
 
 def encode_channel_full(
-    *, channel_id: int, about: str, participants_count: int, admins_count: int, slowmode_seconds: int = 0, pts: int = 0,
+    *,
+    channel_id: int,
+    about: str,
+    participants_count: int,
+    admins_count: int,
+    slowmode_seconds: int = 0,
+    reaction_mode: str | None = None,
+    reaction_allow_custom: bool = False,
+    reaction_emoticons: Iterable[str] = (),
+    pts: int = 0,
 ) -> bytes:
     flags = (1 << 0) | (1 << 1)
     if slowmode_seconds:
         flags |= 1 << 17
+    if reaction_mode is not None:
+        flags |= 1 << 30
     return (
         encode_uint32(CHANNEL_FULL_CONSTRUCTOR)
         + encode_uint32(flags)
@@ -1109,6 +1170,11 @@ def encode_channel_full(
         + encode_vector([])  # bot_info
         + (encode_int32(slowmode_seconds) if slowmode_seconds else b"")
         + encode_int32(pts)
+        + (encode_chat_reactions(
+            mode=reaction_mode,
+            allow_custom=reaction_allow_custom,
+            emoticons=reaction_emoticons,
+        ) if reaction_mode is not None else b"")
     )
 
 

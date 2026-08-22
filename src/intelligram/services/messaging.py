@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import sqlite3
 from typing import Any
 
@@ -320,6 +321,10 @@ def migrate_chat_to_channel(
         raise MessagingError("CHAT_ID_INVALID")
     connection.execute("UPDATE peers SET kind = 'channel' WHERE id = ?", (chat_id,))
     connection.execute("INSERT OR IGNORE INTO channel_settings(peer_id, slowmode_seconds) VALUES (?, 0)", (chat_id,))
+    connection.execute(
+        "INSERT OR IGNORE INTO channel_reaction_settings(peer_id, mode, allow_custom, emoticons_json, updated_at) VALUES (?, 'none', 0, '[]', ?)",
+        (chat_id, now_unix()),
+    )
     details = get_channel_details(connection, channel_id=chat_id, user_id=actor_user_id)
     emitted = [
         append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": chat_id})
@@ -337,18 +342,35 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         SELECT p.id, p.title, p.about, p.created_at, p.created_by_user_id,
                COUNT(pm.user_id) AS participants_count,
                SUM(CASE WHEN pm.role IN ('owner', 'admin') THEN 1 ELSE 0 END) AS admins_count,
-               COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds
+               COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds,
+               COALESCE(crs.mode, 'none') AS reaction_mode,
+               COALESCE(crs.allow_custom, 0) AS reaction_allow_custom,
+               COALESCE(crs.emoticons_json, '[]') AS reaction_emoticons_json
         FROM peers p
         JOIN peer_memberships pm ON pm.peer_id = p.id AND pm.left_at IS NULL
         LEFT JOIN channel_settings cs ON cs.peer_id = p.id
+        LEFT JOIN channel_reaction_settings crs ON crs.peer_id = p.id
         WHERE p.id = ? AND p.kind = 'channel'
-        GROUP BY p.id, p.title, p.about, p.created_at, p.created_by_user_id, cs.slowmode_seconds
+        GROUP BY p.id, p.title, p.about, p.created_at, p.created_by_user_id, cs.slowmode_seconds,
+                 crs.mode, crs.allow_custom, crs.emoticons_json
         """,
         (channel_id,),
     ).fetchone()
     if row is None:
         raise MessagingError("CHANNEL_INVALID")
-    return {key: (int(row[key]) if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds"} else row[key]) for key in row.keys()}
+    details = {
+        key: (
+            int(row[key])
+            if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds", "reaction_allow_custom"}
+            else row[key]
+        )
+        for key in row.keys()
+    }
+    try:
+        details["reaction_emoticons"] = [str(item) for item in json.loads(str(details.pop("reaction_emoticons_json")))]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        details["reaction_emoticons"] = []
+    return details
 
 
 def set_channel_slow_mode(
@@ -364,6 +386,47 @@ def set_channel_slow_mode(
     connection.execute(
         "INSERT INTO channel_settings(peer_id, slowmode_seconds) VALUES (?, ?) ON CONFLICT(peer_id) DO UPDATE SET slowmode_seconds = excluded.slowmode_seconds",
         (channel_id, seconds),
+    )
+    details = get_channel_details(connection, channel_id=channel_id, user_id=actor_user_id)
+    emitted = [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in _active_member_ids(connection, peer_id=channel_id)
+    ]
+    return details, emitted
+
+
+def set_channel_reactions(
+    connection: sqlite3.Connection,
+    *,
+    channel_id: int,
+    actor_user_id: int,
+    mode: str,
+    allow_custom: bool,
+    emoticons: list[str],
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    if mode not in {"all", "some", "none"}:
+        raise MessagingError("REACTIONS_INVALID")
+    normalized_emoticons = list(dict.fromkeys(item.strip() for item in emoticons if item.strip()))
+    if mode == "some" and not normalized_emoticons:
+        mode = "none"
+    if len(normalized_emoticons) > 32 or any(len(item) > 32 for item in normalized_emoticons):
+        raise MessagingError("REACTIONS_INVALID")
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    connection.execute(
+        """
+        INSERT INTO channel_reaction_settings(peer_id, mode, allow_custom, emoticons_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(peer_id) DO UPDATE SET
+            mode = excluded.mode,
+            allow_custom = excluded.allow_custom,
+            emoticons_json = excluded.emoticons_json,
+            updated_at = excluded.updated_at
+        """,
+        (channel_id, mode, int(allow_custom if mode == "all" else False), json.dumps(normalized_emoticons if mode == "some" else []), now_unix()),
     )
     details = get_channel_details(connection, channel_id=channel_id, user_id=actor_user_id)
     emitted = [

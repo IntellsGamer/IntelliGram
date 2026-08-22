@@ -1090,11 +1090,13 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
         CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
         CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR,
         CHAT_BANNED_RIGHTS_CONSTRUCTOR,
+        CHAT_REACTIONS_ALL_CONSTRUCTOR,
         INPUT_CHANNEL_CONSTRUCTOR,
         INPUT_PEER_CHAT_CONSTRUCTOR,
         MESSAGES_CHAT_FULL_CONSTRUCTOR,
         MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR,
         MESSAGES_MIGRATE_CHAT_CONSTRUCTOR,
+        MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
         UPDATES_CONSTRUCTOR,
@@ -1223,6 +1225,37 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
             "SELECT default_banned_rights_flags FROM peer_permissions WHERE peer_id = ?", (chat_id,)
         ).fetchone()
         assert restricted_flags is not None and int(restricted_flags["default_banned_rights_flags"]) == ((1 << 1) | (1 << 2))
+
+    reactions_message_id = restricted_message_id + 4
+    all_reactions = (
+        encode_uint32(MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_uint32(CHAT_REACTIONS_ALL_CONSTRUCTOR)
+        + encode_uint32(1)  # allow_custom
+    )
+    reactions_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=reactions_message_id,
+        seq_no=9,
+        body=all_reactions,
+    ))
+    assert reactions_response is not None
+    _, _, _, _, reactions_body = _decrypt_server(auth_key, reactions_response)
+    reactions_reader = TLReader(reactions_body)
+    assert reactions_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reactions_reader.int64() == reactions_message_id
+    assert reactions_reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        reaction_settings = connection.execute(
+            "SELECT mode, allow_custom, emoticons_json FROM channel_reaction_settings WHERE peer_id = ?", (chat_id,)
+        ).fetchone()
+        assert reaction_settings is not None
+        assert (reaction_settings["mode"], int(reaction_settings["allow_custom"]), reaction_settings["emoticons_json"]) == ("all", 1, "[]")
 
 
 def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:

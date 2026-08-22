@@ -104,6 +104,14 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS channel_reaction_settings (
+                    peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
+                    mode TEXT NOT NULL CHECK(mode IN ('all', 'some', 'none')) DEFAULT 'none',
+                    allow_custom INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom IN (0, 1)),
+                    emoticons_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS contacts (
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     contact_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

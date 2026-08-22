@@ -41,6 +41,7 @@ from intelligram.services.messaging import (
     get_peer,
     migrate_chat_to_channel,
     forward_messages,
+    set_channel_reactions,
     set_channel_slow_mode,
     read_history,
     send_message,
@@ -262,6 +263,10 @@ class MTProtoSessionAdapter:
         if request.name == "messages_edit_chat_default_banned_rights":
             return self._handle_messages_edit_chat_default_banned_rights(
                 message, peer=request.fields["peer"], banned_rights=request.fields["banned_rights"]
+            )
+        if request.name == "messages_set_chat_available_reactions":
+            return self._handle_messages_set_chat_available_reactions(
+                message, peer=request.fields["peer"], available_reactions=request.fields["available_reactions"]
             )
         if request.name == "messages_add_chat_user":
             return self._handle_messages_add_chat_user(
@@ -1550,12 +1555,43 @@ class MTProtoSessionAdapter:
                     participants_count=int(details["participants_count"]),
                     admins_count=int(details["admins_count"]),
                     slowmode_seconds=int(details["slowmode_seconds"]),
+                    reaction_mode=str(details["reaction_mode"]),
+                    reaction_allow_custom=bool(int(details["reaction_allow_custom"])),
+                    reaction_emoticons=details["reaction_emoticons"],
                     pts=state["pts"],
                 )
                 result = encode_messages_chat_full(
                     full_chat=full_channel,
                     chats=self._encode_chats(connection, chat_ids={channel_id}, self_user_id=self_user_id),
                     users=self._encode_users(self._load_users(connection, member_ids), self_user_id=self_user_id),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_set_chat_available_reactions(
+        self, message: EncryptedMessage, *, peer: dict[str, object], available_reactions: dict[str, object]
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                if str(summary["kind"]) != "channel":
+                    raise MessagingError("CHANNEL_INVALID")
+                details, emitted = set_channel_reactions(
+                    connection,
+                    channel_id=int(summary["peer_id"]),
+                    actor_user_id=self_user_id,
+                    mode=str(available_reactions["mode"]),
+                    allow_custom=bool(available_reactions["allow_custom"]),
+                    emoticons=[str(item) for item in available_reactions["emoticons"]],
+                )
+                self.pending_update_envelopes.extend(emitted)
+                result = self._channel_updates_result(
+                    connection=connection, self_user_id=self_user_id, channel=details, emitted=emitted
                 )
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
