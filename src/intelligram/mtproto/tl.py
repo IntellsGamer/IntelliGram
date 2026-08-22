@@ -51,6 +51,7 @@ PEER_USER_CONSTRUCTOR = 0x59511722
 PEER_CHAT_CONSTRUCTOR = 0x36C6019A
 PEER_CHANNEL_CONSTRUCTOR = 0xA2A5371E
 INPUT_PEER_EMPTY_CONSTRUCTOR = 0x7F3B18EA
+INPUT_USER_EMPTY_CONSTRUCTOR = 0xB98886CF
 INPUT_PEER_SELF_CONSTRUCTOR = 0x7DA07EC9
 INPUT_PEER_USER_CONSTRUCTOR = 0xDDE8A54C
 INPUT_PEER_CHAT_CONSTRUCTOR = 0x35A95CB9
@@ -117,6 +118,7 @@ MESSAGES_MIGRATE_CHAT_CONSTRUCTOR = 0xA2875319
 CHANNELS_GET_CHANNELS_CONSTRUCTOR = 0x0A7F6BBB
 CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR = 0x08736A09
 CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR = 0xEDD49EF0
+CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR = 0x0ECC2618
 MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR = 0xA5866B41
 CHAT_BANNED_RIGHTS_CONSTRUCTOR = 0x9F120418
 MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR = 0x864B2581
@@ -357,6 +359,8 @@ def _read_input_phone_contact(reader: TLReader) -> dict[str, Any]:
 
 def _read_input_user(reader: TLReader) -> dict[str, Any]:
     constructor_id = reader.uint32()
+    if constructor_id == INPUT_USER_EMPTY_CONSTRUCTOR:
+        return {"kind": "empty"}
     if constructor_id == INPUT_USER_SELF_CONSTRUCTOR:
         return {"kind": "self"}
     if constructor_id == INPUT_USER_CONSTRUCTOR:
@@ -611,6 +615,16 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "channels_toggle_slow_mode", {
             "channel": _read_input_channel(reader),
             "seconds": reader.int32(),
+        })
+    elif constructor_id == CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b11:
+            raise TLDecodeError("Unsupported channels.toggleJoinRequest optional fields")
+        request = TLRequest(constructor_id, "channels_toggle_join_request", {
+            "apply_to_invites": bool(flags & 1),
+            "channel": _read_input_channel(reader),
+            "enabled": _read_bool(reader),
+            "guard_bot": _read_input_user(reader) if flags & (1 << 1) else None,
         })
     elif constructor_id == MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_edit_chat_default_banned_rights", {
@@ -1264,6 +1278,7 @@ def encode_channel(
     creator: bool,
     slowmode_enabled: bool = False,
     noforwards: bool = False,
+    join_request_enabled: bool = False,
     default_banned_rights_flags: int | None = None,
 ) -> bytes:
     flags = (1 << 8) | (1 << 13) | (1 << 17)
@@ -1275,6 +1290,8 @@ def encode_channel(
         flags |= 1 << 22
     if noforwards:
         flags |= 1 << 27
+    if join_request_enabled:
+        flags |= 1 << 29
     if default_banned_rights_flags is not None:
         flags |= 1 << 18
     return (

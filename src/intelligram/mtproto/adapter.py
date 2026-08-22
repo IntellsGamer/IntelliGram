@@ -49,6 +49,7 @@ from intelligram.services.messaging import (
     migrate_chat_to_channel,
     forward_messages,
     set_channel_noforwards,
+    set_channel_join_request,
     set_channel_reactions,
     set_channel_slow_mode,
     update_channel_username,
@@ -285,6 +286,13 @@ class MTProtoSessionAdapter:
         if request.name == "channels_toggle_slow_mode":
             return self._handle_channels_toggle_slow_mode(
                 message, channel=request.fields["channel"], seconds=int(request.fields["seconds"])
+            )
+        if request.name == "channels_toggle_join_request":
+            return self._handle_channels_toggle_join_request(
+                message,
+                channel=request.fields["channel"],
+                enabled=bool(request.fields["enabled"]),
+                guard_bot=request.fields["guard_bot"],
             )
         if request.name == "messages_edit_chat_default_banned_rights":
             return self._handle_messages_edit_chat_default_banned_rights(
@@ -740,13 +748,14 @@ class MTProtoSessionAdapter:
                    COUNT(pm.user_id) AS participants_count,
                    COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds,
                    COALESCE(cs.noforwards, 0) AS noforwards,
+                   COALESCE(cs.join_request_enabled, 0) AS join_request_enabled,
                    pp.default_banned_rights_flags
             FROM peers p
             JOIN peer_memberships pm ON pm.peer_id = p.id AND pm.left_at IS NULL
             LEFT JOIN channel_settings cs ON cs.peer_id = p.id
             LEFT JOIN peer_permissions pp ON pp.peer_id = p.id
             WHERE p.kind IN ('chat', 'channel') AND p.id IN ({placeholders})
-            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, pp.default_banned_rights_flags
+            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, cs.join_request_enabled, pp.default_banned_rights_flags
             ORDER BY p.id
             """,
             sorted(chat_ids),
@@ -761,6 +770,7 @@ class MTProtoSessionAdapter:
                 creator=int(row["created_by_user_id"] or 0) == self_user_id,
                 slowmode_enabled=bool(int(row["slowmode_seconds"])),
                 noforwards=bool(int(row["noforwards"])),
+                join_request_enabled=bool(int(row["join_request_enabled"])),
                 default_banned_rights_flags=(
                     int(row["default_banned_rights_flags"])
                     if row["default_banned_rights_flags"] is not None else None
@@ -1563,6 +1573,7 @@ class MTProtoSessionAdapter:
             creator=int(channel["created_by_user_id"] or 0) == self_user_id,
             slowmode_enabled=bool(int(channel["slowmode_seconds"])),
             noforwards=bool(int(channel["noforwards"])),
+            join_request_enabled=bool(int(channel["join_request_enabled"])),
         )
         return encode_updates(
             updates=[encode_update_channel(channel_id=int(channel["id"]))],
@@ -1877,6 +1888,42 @@ class MTProtoSessionAdapter:
                     permanent=bool(int(invite["permanent"])),
                     revoked=bool(int(invite["revoked"])),
                     title=(str(invite["title"]) if invite["title"] is not None else None),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_toggle_join_request(
+        self,
+        message: EncryptedMessage,
+        *,
+        channel: dict[str, object],
+        enabled: bool,
+        guard_bot: dict[str, object] | None,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            if guard_bot is not None and guard_bot.get("kind") not in {"empty"}:
+                raise MessagingError("GUARD_BOT_INVALID")
+            channel_id = int(channel["channel_id"])
+            if int(channel["access_hash"]) != channel_access_hash(channel_id):
+                raise MessagingError("CHANNEL_PRIVATE")
+            with database.transaction(immediate=True) as connection:
+                details, emitted = set_channel_join_request(
+                    connection,
+                    channel_id=channel_id,
+                    actor_user_id=self_user_id,
+                    enabled=enabled,
+                )
+                self.pending_update_envelopes.extend(emitted)
+                result = self._channel_updates_result(
+                    connection=connection,
+                    self_user_id=self_user_id,
+                    channel=details,
+                    emitted=emitted,
                 )
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))

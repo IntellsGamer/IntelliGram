@@ -1658,6 +1658,104 @@ def test_web_k_persists_channel_content_protection_after_encrypted_toggle(tmp_pa
     assert full_channel.uint32() & (1 << 27)
 
 
+def test_web_k_persists_channel_join_request_after_encrypted_toggle(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CHANNEL_CONSTRUCTOR,
+        CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
+        CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR,
+        INPUT_CHANNEL_CONSTRUCTOR,
+        MESSAGES_CHAT_FULL_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_bool,
+        encode_int64,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import create_group, migrate_chat_to_channel
+
+    auth_key = bytes(range(256))
+    salt, session_id = 949, 211
+    database = Database(tmp_path / "join-request.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000185", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+        chat_id, _ = create_group(connection, owner_user_id=owner.user_id, title="Approval group", member_user_ids=[])
+        migrate_chat_to_channel(connection, chat_id=chat_id, actor_user_id=owner.user_id)
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    input_channel = (
+        encode_uint32(INPUT_CHANNEL_CONSTRUCTOR)
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+    )
+    message_id = (int(time.time()) << 32) + 8
+
+    def toggle(enabled: bool, *, request_message_id: int, sequence: int) -> bytes:
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id,
+            seq_no=sequence,
+            body=(
+                encode_uint32(CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR)
+                + encode_uint32(0)
+                + input_channel
+                + encode_bool(enabled)
+            ),
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == request_message_id
+        assert reader.uint32() == UPDATES_CONSTRUCTOR
+        return body
+
+    enabled_body = toggle(True, request_message_id=message_id, sequence=1)
+    enabled_channel = TLReader(enabled_body[enabled_body.index(encode_uint32(CHANNEL_CONSTRUCTOR)):])
+    assert enabled_channel.uint32() == CHANNEL_CONSTRUCTOR
+    assert enabled_channel.uint32() & (1 << 29)
+    with database.transaction() as connection:
+        settings = connection.execute(
+            "SELECT join_request_enabled FROM channel_settings WHERE peer_id = ?", (chat_id,)
+        ).fetchone()
+        assert settings is not None and int(settings["join_request_enabled"]) == 1
+
+    full_message_id = message_id + 4
+    full_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=full_message_id,
+        seq_no=3,
+        body=encode_uint32(CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR) + input_channel,
+    ))
+    assert full_response is not None
+    _, _, _, _, full_body = _decrypt_server(auth_key, full_response)
+    full_reader = TLReader(full_body)
+    assert full_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert full_reader.int64() == full_message_id
+    assert full_reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+    hydrated_channel = TLReader(full_body[full_body.index(encode_uint32(CHANNEL_CONSTRUCTOR)):])
+    assert hydrated_channel.uint32() == CHANNEL_CONSTRUCTOR
+    assert hydrated_channel.uint32() & (1 << 29)
+
+    disabled_body = toggle(False, request_message_id=full_message_id + 4, sequence=5)
+    disabled_channel = TLReader(disabled_body[disabled_body.index(encode_uint32(CHANNEL_CONSTRUCTOR)):])
+    assert disabled_channel.uint32() == CHANNEL_CONSTRUCTOR
+    assert not disabled_channel.uint32() & (1 << 29)
+    with database.transaction() as connection:
+        settings = connection.execute(
+            "SELECT join_request_enabled FROM channel_settings WHERE peer_id = ?", (chat_id,)
+        ).fetchone()
+        assert settings is not None and int(settings["join_request_enabled"]) == 0
+
+
 def test_web_k_persists_public_channel_username_and_returns_to_private(tmp_path) -> None:
     from intelligram.database import Database
     from intelligram.mtproto.tl import (
