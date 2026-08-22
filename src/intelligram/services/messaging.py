@@ -846,6 +846,13 @@ def send_message(
         raise MessagingError("MESSAGE_TOO_LONG")
     if not client_random_id or len(client_random_id) > 128:
         raise MessagingError("RANDOM_ID_INVALID")
+    if reply_to_message_id is not None:
+        reply_target = connection.execute(
+            "SELECT id FROM messages WHERE id = ? AND peer_id = ? AND deleted_at IS NULL",
+            (reply_to_message_id, peer_id),
+        ).fetchone()
+        if reply_target is None:
+            raise MessagingError("REPLY_MESSAGE_ID_INVALID")
 
     existing = connection.execute(
         """

@@ -510,6 +510,130 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
     assert privacy_reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR
 
 
+def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_USER_CONSTRUCTOR,
+        INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR,
+        MESSAGE_CONSTRUCTOR,
+        MESSAGE_REPLY_HEADER_CONSTRUCTOR,
+        MESSAGES_GET_HISTORY_CONSTRUCTOR,
+        MESSAGES_MESSAGES_CONSTRUCTOR,
+        MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 137, 271
+    database = Database(tmp_path / "message-replies.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000186", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000187", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    input_peer = (
+        encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+    )
+    message_id = (int(time.time()) << 32) + 4
+
+    def invoke(query: bytes, *, sequence: int) -> bytes:
+        nonlocal message_id
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=sequence, body=query,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == message_id
+        message_id += 4
+        return body
+
+    first_body = invoke(
+        encode_uint32(MESSAGES_SEND_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + input_peer
+        + encode_tl_string("Reply target")
+        + encode_int64(1001),
+        sequence=1,
+    )
+    first_reader = TLReader(first_body)
+    assert first_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    first_reader.int64()
+    assert first_reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        target = connection.execute("SELECT id FROM messages WHERE client_random_id = ?", ("1001",)).fetchone()
+        assert target is not None
+        target_id = int(target["id"])
+
+    reply_body = invoke(
+        encode_uint32(MESSAGES_SEND_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(1)
+        + input_peer
+        + encode_uint32(INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(target_id)
+        + encode_tl_string("Native reply")
+        + encode_int64(1002),
+        sequence=3,
+    )
+    reply_offset = reply_body.index(encode_uint32(MESSAGE_CONSTRUCTOR))
+    encoded_reply = TLReader(reply_body[reply_offset:])
+    assert encoded_reply.uint32() == MESSAGE_CONSTRUCTOR
+    assert encoded_reply.uint32() & (1 << 3)
+    encoded_reply.uint32()  # flags2
+    encoded_reply.int32()  # message id
+    assert encoded_reply.uint32() == 0x59511722  # peerUser sender
+    encoded_reply.int64()
+    assert encoded_reply.uint32() == 0x59511722  # peerUser recipient
+    encoded_reply.int64()
+    assert MESSAGE_REPLY_HEADER_CONSTRUCTOR == 0x1B97DD66
+    assert encoded_reply.uint32() == 0x1B97DD66
+    assert encoded_reply.uint32() & (1 << 4)
+    assert encoded_reply.int32() == target_id
+    with database.transaction() as connection:
+        stored = connection.execute(
+            "SELECT reply_to_message_id FROM messages WHERE client_random_id = ?", ("1002",)
+        ).fetchone()
+        assert stored is not None and int(stored["reply_to_message_id"]) == target_id
+
+    history_body = invoke(
+        encode_uint32(MESSAGES_GET_HISTORY_CONSTRUCTOR)
+        + input_peer
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int32(30)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int64(0),
+        sequence=5,
+    )
+    history_reader = TLReader(history_body)
+    assert history_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    history_reader.int64()
+    assert history_reader.uint32() == MESSAGES_MESSAGES_CONSTRUCTOR
+    reply_header_offset = history_body.index(encode_uint32(MESSAGE_REPLY_HEADER_CONSTRUCTOR))
+    hydrated_header = TLReader(history_body[reply_header_offset:])
+    assert hydrated_header.uint32() == 0x1B97DD66
+    assert hydrated_header.uint32() & (1 << 4)
+    assert hydrated_header.int32() == target_id
+
+
 def test_web_k_create_chat_returns_messages_invited_users(tmp_path) -> None:
     from intelligram.database import Database
     from intelligram.mtproto.tl import (

@@ -61,6 +61,8 @@ INPUT_USER_CONSTRUCTOR = 0xF210AAE0
 INPUT_CHANNEL_CONSTRUCTOR = 0xF35AEC28
 INPUT_DIALOG_PEER_CONSTRUCTOR = 0xFCAAFEB7
 MESSAGE_CONSTRUCTOR = 0x7600B9D3
+MESSAGE_REPLY_HEADER_CONSTRUCTOR = 0x1B97DD66
+INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR = 0x3BD4B7C2
 DIALOG_CONSTRUCTOR = 0xFC89F7F3
 PEER_NOTIFY_SETTINGS_CONSTRUCTOR = 0x99622C0C
 PEER_SETTINGS_CONSTRUCTOR = 0xF47741F7
@@ -357,6 +359,15 @@ def _read_input_phone_contact(reader: TLReader) -> dict[str, Any]:
     }
 
 
+def _read_input_reply_to(reader: TLReader) -> dict[str, Any]:
+    if reader.uint32() != INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR:
+        raise TLDecodeError("Only inputReplyToMessage is supported")
+    flags = reader.uint32()
+    if flags:
+        raise TLDecodeError("Extended inputReplyToMessage fields are not supported")
+    return {"reply_to_message_id": reader.int32()}
+
+
 def _read_input_user(reader: TLReader) -> dict[str, Any]:
     constructor_id = reader.uint32()
     if constructor_id == INPUT_USER_EMPTY_CONSTRUCTOR:
@@ -577,10 +588,11 @@ def parse_request(data: bytes) -> TLRequest:
     elif constructor_id == MESSAGES_SEND_MESSAGE_CONSTRUCTOR:
         flags = reader.uint32()
         supported_boolean_flags = (1 << 1) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 19)
-        if flags & ~supported_boolean_flags:
+        if flags & ~(supported_boolean_flags | 1):
             raise TLDecodeError("Unsupported messages.sendMessage optional fields")
         request = TLRequest(constructor_id, "messages_send_message", {
             "peer": _read_input_peer(reader),
+            "reply_to": _read_input_reply_to(reader) if flags & 1 else None,
             "message": reader.bytes().decode("utf-8"),
             "random_id": reader.int64(),
             "silent": bool(flags & (1 << 5)),
@@ -1422,8 +1434,17 @@ def encode_dialog(
     )
 
 
+def encode_message_reply_header(*, reply_to_message_id: int) -> bytes:
+    return (
+        encode_uint32(MESSAGE_REPLY_HEADER_CONSTRUCTOR)
+        + encode_uint32(1 << 4)
+        + encode_int32(reply_to_message_id)
+    )
+
+
 def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: bool) -> bytes:
-    flags = (1 << 8) | ((1 << 1) if outgoing else 0)
+    reply_to_message_id = message.get("reply_to_message_id")
+    flags = (1 << 8) | ((1 << 1) if outgoing else 0) | ((1 << 3) if reply_to_message_id is not None else 0)
     return (
         encode_uint32(MESSAGE_CONSTRUCTOR)
         + encode_uint32(flags)
@@ -1431,6 +1452,7 @@ def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: 
         + encode_int32(int(message["id"]))
         + encode_peer_user(user_id=int(message["sender_user_id"]))
         + recipient_peer
+        + (encode_message_reply_header(reply_to_message_id=int(reply_to_message_id)) if reply_to_message_id is not None else b"")
         + encode_int32(int(message["sent_at"]))
         + encode_tl_string(str(message["body"]))
     )

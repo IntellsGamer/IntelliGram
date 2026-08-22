@@ -430,6 +430,7 @@ class MTProtoSessionAdapter:
                 peer=request.fields["peer"],
                 body=str(request.fields["message"]),
                 random_id=int(request.fields["random_id"]),
+                reply_to=request.fields["reply_to"],
             )
         if request.name == "upload_get_file":
             return self._handle_upload_get_file(
@@ -2357,7 +2358,13 @@ class MTProtoSessionAdapter:
         )
 
     def _handle_messages_send_message(
-        self, message: EncryptedMessage, *, peer: dict[str, object], body: str, random_id: int,
+        self,
+        message: EncryptedMessage,
+        *,
+        peer: dict[str, object],
+        body: str,
+        random_id: int,
+        reply_to: dict[str, object] | None,
     ) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -2372,6 +2379,10 @@ class MTProtoSessionAdapter:
                     sender_user_id=self_user_id,
                     body=body,
                     client_random_id=str(random_id),
+                    reply_to_message_id=(
+                        int(reply_to["reply_to_message_id"])
+                        if reply_to is not None else None
+                    ),
                 )
                 self.pending_update_envelopes.extend(emitted)
                 sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
