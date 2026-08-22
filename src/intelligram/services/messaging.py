@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import secrets
 import sqlite3
 from typing import Any
 
@@ -370,6 +371,21 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         details["reaction_emoticons"] = [str(item) for item in json.loads(str(details.pop("reaction_emoticons_json")))]
     except (TypeError, ValueError, json.JSONDecodeError):
         details["reaction_emoticons"] = []
+    exported_invite = connection.execute(
+        """
+        SELECT token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+               usage, request_needed, permanent, revoked
+        FROM exported_invites
+        WHERE peer_id = ? AND permanent = 1 AND revoked = 0
+        ORDER BY created_at ASC LIMIT 1
+        """,
+        (channel_id,),
+    ).fetchone()
+    details["exported_invite"] = (
+        {key: exported_invite[key] for key in exported_invite.keys()}
+        if exported_invite is not None
+        else None
+    )
     return details
 
 
@@ -393,6 +409,109 @@ def set_channel_slow_mode(
         for member_id in _active_member_ids(connection, peer_id=channel_id)
     ]
     return details, emitted
+
+
+def export_chat_invite(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    actor_user_id: int,
+    expire_date: int | None,
+    usage_limit: int | None,
+    request_needed: bool,
+    title: str | None,
+) -> dict[str, Any]:
+    expire_date = expire_date or None
+    usage_limit = usage_limit or None
+    membership = _require_active_membership(connection, peer_id, actor_user_id)
+    if str(membership["kind"]) not in {"chat", "channel"}:
+        raise MessagingError("PEER_ID_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    now = now_unix()
+    if expire_date is not None and expire_date <= now:
+        raise MessagingError("INVITE_EXPIRE_INVALID")
+    if usage_limit is not None and not 0 < usage_limit <= 100000:
+        raise MessagingError("INVITE_USAGE_LIMIT_INVALID")
+    normalized_title = (title or "").strip() or None
+    if normalized_title is not None and len(normalized_title) > 64:
+        raise MessagingError("INVITE_TITLE_INVALID")
+    is_permanent = not any((expire_date, usage_limit, request_needed, normalized_title))
+    if is_permanent:
+        existing = connection.execute(
+            """
+            SELECT token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+                   usage, request_needed, permanent, revoked
+            FROM exported_invites
+            WHERE peer_id = ? AND admin_user_id = ? AND permanent = 1 AND revoked = 0
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (peer_id, actor_user_id),
+        ).fetchone()
+        if existing is not None:
+            return {key: existing[key] for key in existing.keys()}
+    token = secrets.token_urlsafe(18).replace("-", "").replace("_", "")
+    link = f"https://intelligram.local/+{token}"
+    connection.execute(
+        """
+        INSERT INTO exported_invites(
+            token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+            usage, request_needed, permanent, revoked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+        """,
+        (
+            token,
+            peer_id,
+            actor_user_id,
+            link,
+            normalized_title,
+            now,
+            expire_date,
+            usage_limit,
+            int(request_needed),
+            int(is_permanent),
+        ),
+    )
+    return {
+        "token": token,
+        "peer_id": peer_id,
+        "admin_user_id": actor_user_id,
+        "link": link,
+        "title": normalized_title,
+        "created_at": now,
+        "expire_date": expire_date,
+        "usage_limit": usage_limit,
+        "usage": 0,
+        "request_needed": int(request_needed),
+        "permanent": int(is_permanent),
+        "revoked": 0,
+    }
+
+
+def list_exported_chat_invites(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    actor_user_id: int,
+    admin_user_id: int,
+    revoked: bool,
+    limit: int,
+) -> list[dict[str, Any]]:
+    _require_active_membership(connection, peer_id, actor_user_id)
+    if limit < 1 or limit > 100:
+        raise MessagingError("INVITE_LIMIT_INVALID")
+    rows = connection.execute(
+        """
+        SELECT token, peer_id, admin_user_id, link, title, created_at, expire_date, usage_limit,
+               usage, request_needed, permanent, revoked
+        FROM exported_invites
+        WHERE peer_id = ? AND admin_user_id = ? AND revoked = ?
+        ORDER BY permanent DESC, created_at DESC
+        LIMIT ?
+        """,
+        (peer_id, admin_user_id, int(revoked), limit),
+    ).fetchall()
+    return [{key: row[key] for key in row.keys()} for row in rows]
 
 
 def set_channel_reactions(

@@ -124,6 +124,10 @@ CHAT_REACTIONS_NONE_CONSTRUCTOR = 0xEAFC32BC
 CHAT_REACTIONS_ALL_CONSTRUCTOR = 0x52928BCA
 CHAT_REACTIONS_SOME_CONSTRUCTOR = 0x661D4037
 REACTION_EMOJI_CONSTRUCTOR = 0x1B2286B8
+MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR = 0xA455DE90
+CHAT_INVITE_EXPORTED_CONSTRUCTOR = 0xA22CBD96
+MESSAGES_GET_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0xA2B5A3F6
+MESSAGES_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0xBDC62DCC
 CHAT_FULL_CONSTRUCTOR = 0x2633421B
 CHAT_PARTICIPANT_CONSTRUCTOR = 0x38E79FDE
 CHAT_PARTICIPANTS_CONSTRUCTOR = 0x3CBC93F8
@@ -612,6 +616,29 @@ def parse_request(data: bytes) -> TLRequest:
             "reactions_limit": reader.int32() if flags & 1 else None,
             "paid_enabled": _read_bool(reader) if flags & 2 else None,
         })
+    elif constructor_id == MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_export_chat_invite", {
+            "legacy_revoke_permanent": bool(flags & (1 << 2)),
+            "request_needed": bool(flags & (1 << 3)),
+            "peer": _read_input_peer(reader),
+            "expire_date": reader.int32() if flags & 1 else None,
+            "usage_limit": reader.int32() if flags & (1 << 1) else None,
+            "title": reader.bytes().decode("utf-8") if flags & (1 << 4) else None,
+            "subscription_pricing": None if not flags & (1 << 5) else (_ for _ in ()).throw(
+                TLDecodeError("Paid invite subscriptions are not supported")
+            ),
+        })
+    elif constructor_id == MESSAGES_GET_EXPORTED_CHAT_INVITES_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_get_exported_chat_invites", {
+            "revoked": bool(flags & (1 << 3)),
+            "peer": _read_input_peer(reader),
+            "admin": _read_input_user(reader),
+            "offset_date": reader.int32() if flags & (1 << 2) else None,
+            "offset_link": reader.bytes().decode("utf-8") if flags & (1 << 2) else None,
+            "limit": reader.int32(),
+        })
     elif constructor_id == MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_edit_chat_title", {
             "chat_id": reader.int64(),
@@ -1079,6 +1106,58 @@ def encode_chat_banned_rights(*, flags: int, until_date: int = 0) -> bytes:
     return encode_uint32(CHAT_BANNED_RIGHTS_CONSTRUCTOR) + encode_uint32(flags) + encode_int32(until_date)
 
 
+def encode_exported_chat_invite(
+    *,
+    link: str,
+    admin_user_id: int,
+    created_at: int,
+    expire_date: int | None = None,
+    usage_limit: int | None = None,
+    usage: int = 0,
+    request_needed: bool = False,
+    permanent: bool = False,
+    revoked: bool = False,
+    title: str | None = None,
+) -> bytes:
+    flags = 0
+    if revoked:
+        flags |= 1
+    if expire_date is not None:
+        flags |= 1 << 1
+    if usage_limit is not None:
+        flags |= 1 << 2
+    if usage_limit is not None:
+        flags |= 1 << 3
+    if permanent:
+        flags |= 1 << 5
+    if request_needed:
+        flags |= 1 << 6
+    if title is not None:
+        flags |= 1 << 8
+    return (
+        encode_uint32(CHAT_INVITE_EXPORTED_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_tl_string(link)
+        + encode_int64(admin_user_id)
+        + encode_int32(created_at)
+        + (encode_int32(expire_date) if expire_date is not None else b"")
+        + (encode_int32(usage_limit) if usage_limit is not None else b"")
+        + (encode_int32(usage) if usage_limit is not None else b"")
+        + (encode_tl_string(title) if title is not None else b"")
+    )
+
+
+def encode_messages_exported_chat_invites(
+    *, count: int, invites: Iterable[bytes], users: Iterable[bytes] = ()
+) -> bytes:
+    return (
+        encode_uint32(MESSAGES_EXPORTED_CHAT_INVITES_CONSTRUCTOR)
+        + encode_int32(count)
+        + encode_vector(invites)
+        + encode_vector(users)
+    )
+
+
 def encode_reaction_emoji(*, emoticon: str) -> bytes:
     return encode_uint32(REACTION_EMOJI_CONSTRUCTOR) + encode_tl_string(emoticon)
 
@@ -1147,11 +1226,14 @@ def encode_channel_full(
     reaction_mode: str | None = None,
     reaction_allow_custom: bool = False,
     reaction_emoticons: Iterable[str] = (),
+    exported_invite: bytes | None = None,
     pts: int = 0,
 ) -> bytes:
     flags = (1 << 0) | (1 << 1)
     if slowmode_seconds:
         flags |= 1 << 17
+    if exported_invite is not None:
+        flags |= 1 << 23
     if reaction_mode is not None:
         flags |= 1 << 30
     return (
@@ -1167,6 +1249,7 @@ def encode_channel_full(
         + encode_int32(0)  # unread_count
         + encode_photo_empty()
         + encode_peer_notify_settings()
+        + (exported_invite if exported_invite is not None else b"")
         + encode_vector([])  # bot_info
         + (encode_int32(slowmode_seconds) if slowmode_seconds else b"")
         + encode_int32(pts)

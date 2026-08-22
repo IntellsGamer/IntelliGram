@@ -112,6 +112,23 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS exported_invites (
+                    token TEXT PRIMARY KEY,
+                    peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+                    admin_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    link TEXT NOT NULL UNIQUE,
+                    title TEXT,
+                    created_at INTEGER NOT NULL,
+                    expire_date INTEGER,
+                    usage_limit INTEGER,
+                    usage INTEGER NOT NULL DEFAULT 0,
+                    request_needed INTEGER NOT NULL DEFAULT 0 CHECK(request_needed IN (0, 1)),
+                    permanent INTEGER NOT NULL DEFAULT 0 CHECK(permanent IN (0, 1)),
+                    revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0, 1))
+                );
+                CREATE INDEX IF NOT EXISTS exported_invites_peer_idx
+                    ON exported_invites(peer_id, revoked, permanent, created_at);
+
                 CREATE TABLE IF NOT EXISTS contacts (
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     contact_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

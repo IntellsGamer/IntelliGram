@@ -419,15 +419,16 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
         )
     adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
     message_id = (int(time.time()) << 32) + 4
+    sequence_no = 1
 
     def invoke(query: bytes) -> TLReader:
-        nonlocal message_id
+        nonlocal message_id, sequence_no
         response = adapter.handle_encrypted(_encrypt_client(
             auth_key,
             salt=salt,
             session_id=session_id,
             msg_id=message_id,
-            seq_no=((message_id - ((int(time.time()) << 32) + 4)) // 2) | 1,
+            seq_no=sequence_no,
             body=query,
         ))
         assert response is not None
@@ -436,6 +437,7 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
         assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
         assert reader.int64() == message_id
         message_id += 4
+        sequence_no += 2
         return reader
 
     users_reader = invoke(
@@ -1089,14 +1091,22 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
     from intelligram.mtproto.tl import (
         CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
         CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR,
+        CHANNEL_FULL_CONSTRUCTOR,
         CHAT_BANNED_RIGHTS_CONSTRUCTOR,
         CHAT_REACTIONS_ALL_CONSTRUCTOR,
+        CHAT_INVITE_EXPORTED_CONSTRUCTOR,
         INPUT_CHANNEL_CONSTRUCTOR,
+        INPUT_USER_SELF_CONSTRUCTOR,
         INPUT_PEER_CHAT_CONSTRUCTOR,
         MESSAGES_CHAT_FULL_CONSTRUCTOR,
         MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR,
         MESSAGES_MIGRATE_CHAT_CONSTRUCTOR,
         MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR,
+        PEER_NOTIFY_SETTINGS_CONSTRUCTOR,
+        PHOTO_EMPTY_CONSTRUCTOR,
+        MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR,
+        MESSAGES_GET_EXPORTED_CHAT_INVITES_CONSTRUCTOR,
+        MESSAGES_EXPORTED_CHAT_INVITES_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
         UPDATES_CONSTRUCTOR,
@@ -1256,6 +1266,125 @@ def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) ->
         ).fetchone()
         assert reaction_settings is not None
         assert (reaction_settings["mode"], int(reaction_settings["allow_custom"]), reaction_settings["emoticons_json"]) == ("all", 1, "[]")
+
+    invite_message_id = reactions_message_id + 4
+    invite_request = (
+        encode_uint32(MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32((1 << 0) | (1 << 1) | (1 << 4))  # zero expiry, zero usage limit, and title
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_tl_string("Regression invite")
+    )
+    invite_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=invite_message_id,
+        seq_no=11,
+        body=invite_request,
+    ))
+    assert invite_response is not None
+    _, _, _, _, invite_body = _decrypt_server(auth_key, invite_response)
+    invite_reader = TLReader(invite_body)
+    assert invite_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert invite_reader.int64() == invite_message_id
+    assert invite_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    invite_flags = invite_reader.uint32()
+    assert invite_flags & (1 << 8)
+    assert invite_reader.bytes().decode("utf-8").startswith("https://intelligram.local/+")
+    with database.transaction() as connection:
+        invite = connection.execute(
+            "SELECT title, permanent, revoked FROM exported_invites WHERE peer_id = ?", (chat_id,)
+        ).fetchone()
+        assert invite is not None and (invite["title"], int(invite["permanent"]), int(invite["revoked"])) == ("Regression invite", 0, 0)
+
+    list_message_id = invite_message_id + 4
+    list_request = (
+        encode_uint32(MESSAGES_GET_EXPORTED_CHAT_INVITES_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_uint32(INPUT_USER_SELF_CONSTRUCTOR)
+        + encode_int32(50)
+    )
+    list_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=list_message_id,
+        seq_no=13,
+        body=list_request,
+    ))
+    assert list_response is not None
+    _, _, _, _, list_body = _decrypt_server(auth_key, list_response)
+    list_reader = TLReader(list_body)
+    assert list_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert list_reader.int64() == list_message_id
+    assert list_reader.uint32() == MESSAGES_EXPORTED_CHAT_INVITES_CONSTRUCTOR
+    assert list_reader.int32() == 1
+
+    permanent_message_id = list_message_id + 4
+    permanent_request = (
+        encode_uint32(MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+    )
+    permanent_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=permanent_message_id,
+        seq_no=15,
+        body=permanent_request,
+    ))
+    assert permanent_response is not None
+    _, _, _, _, permanent_body = _decrypt_server(auth_key, permanent_response)
+    permanent_reader = TLReader(permanent_body)
+    assert permanent_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert permanent_reader.int64() == permanent_message_id
+    assert permanent_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    assert permanent_reader.uint32() & (1 << 5)  # permanent
+
+    full_with_invite_message_id = permanent_message_id + 4
+    full_with_invite_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=full_with_invite_message_id,
+        seq_no=17,
+        body=encode_uint32(CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR) + input_channel,
+    ))
+    assert full_with_invite_response is not None
+    _, _, _, _, full_with_invite_body = _decrypt_server(auth_key, full_with_invite_response)
+    full_with_invite_reader = TLReader(full_with_invite_body)
+    assert full_with_invite_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert full_with_invite_reader.int64() == full_with_invite_message_id
+    assert full_with_invite_reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+    assert full_with_invite_reader.uint32() == CHANNEL_FULL_CONSTRUCTOR
+    channel_full_flags = full_with_invite_reader.uint32()
+    assert channel_full_flags & (1 << 23)  # exported_invite
+    full_with_invite_reader.uint32()  # flags2
+    assert full_with_invite_reader.int64() == chat_id
+    full_with_invite_reader.bytes()  # about
+    full_with_invite_reader.int32()  # participants_count
+    full_with_invite_reader.int32()  # admins_count
+    full_with_invite_reader.int32()  # read_inbox_max_id
+    full_with_invite_reader.int32()  # read_outbox_max_id
+    full_with_invite_reader.int32()  # unread_count
+    assert full_with_invite_reader.uint32() == PHOTO_EMPTY_CONSTRUCTOR
+    full_with_invite_reader.int64()  # photoEmpty id
+    assert full_with_invite_reader.uint32() == PEER_NOTIFY_SETTINGS_CONSTRUCTOR
+    assert full_with_invite_reader.uint32() == 0  # peerNotifySettings flags
+    assert full_with_invite_reader.uint32() == CHAT_INVITE_EXPORTED_CONSTRUCTOR
+    exported_flags = full_with_invite_reader.uint32()
+    assert exported_flags & (1 << 5)  # permanent
+    assert full_with_invite_reader.bytes().decode("utf-8").startswith("https://intelligram.local/+")
 
 
 def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:
