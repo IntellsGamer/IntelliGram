@@ -271,6 +271,108 @@ def edit_chat_about(connection: sqlite3.Connection, *, chat_id: int, actor_user_
     connection.execute("UPDATE peers SET about = ? WHERE id = ? AND kind = 'chat'", (about, chat_id))
 
 
+def edit_peer_default_banned_rights(
+    connection: sqlite3.Connection, *, peer_id: int, actor_user_id: int, flags: int
+) -> list[UpdateEnvelope]:
+    if flags < 0 or flags > 0xFFFFFFFF:
+        raise MessagingError("BANNED_RIGHTS_INVALID")
+    membership = _require_active_membership(connection, peer_id, actor_user_id)
+    if str(membership["kind"]) not in {"chat", "channel"}:
+        raise MessagingError("PEER_ID_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    connection.execute(
+        """
+        INSERT INTO peer_permissions(peer_id, default_banned_rights_flags, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(peer_id) DO UPDATE SET
+            default_banned_rights_flags = excluded.default_banned_rights_flags,
+            updated_at = excluded.updated_at
+        """,
+        (peer_id, flags, now_unix()),
+    )
+    return [
+        append_update(
+            connection,
+            user_id=member_id,
+            kind="updateChatDefaultBannedRights",
+            payload={"peer_id": peer_id, "flags": flags},
+        )
+        for member_id in _active_member_ids(connection, peer_id=peer_id)
+    ]
+
+
+def migrate_chat_to_channel(
+    connection: sqlite3.Connection, *, chat_id: int, actor_user_id: int
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    """Convert an owner-managed legacy chat into a durable megagroup channel.
+
+    IntelliGram retains the peer ID so existing memberships, dialogs, and message
+    history remain stable while Web K transitions from `PeerChat` to `PeerChannel`.
+    """
+
+    _require_chat_manager(connection, chat_id=chat_id, user_id=actor_user_id)
+    row = connection.execute(
+        "SELECT id, title, about, created_at, created_by_user_id FROM peers WHERE id = ? AND kind = 'chat'",
+        (chat_id,),
+    ).fetchone()
+    if row is None:
+        raise MessagingError("CHAT_ID_INVALID")
+    connection.execute("UPDATE peers SET kind = 'channel' WHERE id = ?", (chat_id,))
+    connection.execute("INSERT OR IGNORE INTO channel_settings(peer_id, slowmode_seconds) VALUES (?, 0)", (chat_id,))
+    details = get_channel_details(connection, channel_id=chat_id, user_id=actor_user_id)
+    emitted = [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": chat_id})
+        for member_id in _active_member_ids(connection, peer_id=chat_id)
+    ]
+    return details, emitted
+
+
+def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user_id: int) -> dict[str, Any]:
+    membership = _require_active_membership(connection, channel_id, user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    row = connection.execute(
+        """
+        SELECT p.id, p.title, p.about, p.created_at, p.created_by_user_id,
+               COUNT(pm.user_id) AS participants_count,
+               SUM(CASE WHEN pm.role IN ('owner', 'admin') THEN 1 ELSE 0 END) AS admins_count,
+               COALESCE(cs.slowmode_seconds, 0) AS slowmode_seconds
+        FROM peers p
+        JOIN peer_memberships pm ON pm.peer_id = p.id AND pm.left_at IS NULL
+        LEFT JOIN channel_settings cs ON cs.peer_id = p.id
+        WHERE p.id = ? AND p.kind = 'channel'
+        GROUP BY p.id, p.title, p.about, p.created_at, p.created_by_user_id, cs.slowmode_seconds
+        """,
+        (channel_id,),
+    ).fetchone()
+    if row is None:
+        raise MessagingError("CHANNEL_INVALID")
+    return {key: (int(row[key]) if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds"} else row[key]) for key in row.keys()}
+
+
+def set_channel_slow_mode(
+    connection: sqlite3.Connection, *, channel_id: int, actor_user_id: int, seconds: int
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    if seconds not in {0, 5, 10, 30, 60, 300, 900, 3600}:
+        raise MessagingError("SLOWMODE_INVALID")
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    connection.execute(
+        "INSERT INTO channel_settings(peer_id, slowmode_seconds) VALUES (?, ?) ON CONFLICT(peer_id) DO UPDATE SET slowmode_seconds = excluded.slowmode_seconds",
+        (channel_id, seconds),
+    )
+    details = get_channel_details(connection, channel_id=channel_id, user_id=actor_user_id)
+    emitted = [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in _active_member_ids(connection, peer_id=channel_id)
+    ]
+    return details, emitted
+
+
 def create_group(
     connection: sqlite3.Connection, *, owner_user_id: int, title: str, member_user_ids: list[int]
 ) -> tuple[int, list[UpdateEnvelope]]:

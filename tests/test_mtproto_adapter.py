@@ -1084,6 +1084,147 @@ def test_web_k_messages_create_chat_permits_owner_only_group(tmp_path) -> None:
         assert [(int(row["user_id"]), str(row["role"])) for row in members] == [(owner.user_id, "owner")]
 
 
+def test_web_k_migrates_legacy_group_and_persists_channel_slow_mode(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR,
+        CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR,
+        CHAT_BANNED_RIGHTS_CONSTRUCTOR,
+        INPUT_CHANNEL_CONSTRUCTOR,
+        INPUT_PEER_CHAT_CONSTRUCTOR,
+        MESSAGES_CHAT_FULL_CONSTRUCTOR,
+        MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR,
+        MESSAGES_MIGRATE_CHAT_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import create_group
+
+    auth_key = bytes(range(256))
+    salt, session_id = 929, 195
+    database = Database(tmp_path / "legacy-group-migration.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection, phone="+15550000182", password="correct-horse-battery-staple", first_name="Owner", device_label="Owner",
+        )
+        chat_id, _ = create_group(connection, owner_user_id=owner.user_id, title="Migratable group", member_user_ids=[])
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    message_id = (int(time.time()) << 32) + 4
+
+    default_rights = (
+        encode_uint32(MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR)
+        + encode_uint32(INPUT_PEER_CHAT_CONSTRUCTOR)
+        + encode_int64(chat_id)
+        + encode_uint32(CHAT_BANNED_RIGHTS_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(0)
+    )
+    default_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=default_rights,
+    ))
+    assert default_response is not None
+    _, _, _, _, default_body = _decrypt_server(auth_key, default_response)
+    default_reader = TLReader(default_body)
+    assert default_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert default_reader.int64() == message_id
+    assert default_reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        default_flags = connection.execute(
+            "SELECT default_banned_rights_flags FROM peer_permissions WHERE peer_id = ?", (chat_id,)
+        ).fetchone()
+        assert default_flags is not None and int(default_flags["default_banned_rights_flags"]) == 0
+
+    migrate_message_id = message_id + 4
+    migrate = encode_uint32(MESSAGES_MIGRATE_CHAT_CONSTRUCTOR) + encode_int64(chat_id)
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=migrate_message_id, seq_no=3, body=migrate,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == migrate_message_id
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        migrated = connection.execute("SELECT kind FROM peers WHERE id = ?", (chat_id,)).fetchone()
+        assert migrated is not None and migrated["kind"] == "channel"
+        settings = connection.execute("SELECT slowmode_seconds FROM channel_settings WHERE peer_id = ?", (chat_id,)).fetchone()
+        assert settings is not None and int(settings["slowmode_seconds"]) == 0
+
+    input_channel = encode_uint32(INPUT_CHANNEL_CONSTRUCTOR) + encode_int64(chat_id) + encode_int64((chat_id << 32) | 1)
+    full_message_id = migrate_message_id + 4
+    full_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=full_message_id,
+        seq_no=3,
+        body=encode_uint32(CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR) + input_channel,
+    ))
+    assert full_response is not None
+    _, _, _, _, full_body = _decrypt_server(auth_key, full_response)
+    full_reader = TLReader(full_body)
+    assert full_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert full_reader.int64() == full_message_id
+    assert full_reader.uint32() == MESSAGES_CHAT_FULL_CONSTRUCTOR
+
+    slow_message_id = full_message_id + 4
+    slow_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=slow_message_id,
+        seq_no=5,
+        body=encode_uint32(CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR) + input_channel + encode_int32(5),
+    ))
+    assert slow_response is not None
+    _, _, _, _, slow_body = _decrypt_server(auth_key, slow_response)
+    slow_reader = TLReader(slow_body)
+    assert slow_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert slow_reader.int64() == slow_message_id
+    assert slow_reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        settings = connection.execute("SELECT slowmode_seconds FROM channel_settings WHERE peer_id = ?", (chat_id,)).fetchone()
+        assert settings is not None and int(settings["slowmode_seconds"]) == 5
+
+    restricted_message_id = slow_message_id + 4
+    restricted_rights = (
+        encode_uint32(MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR)
+        + encode_uint32(0x27BCBBFC)  # inputPeerChannel
+        + encode_int64(chat_id)
+        + encode_int64((chat_id << 32) | 1)
+        + encode_uint32(CHAT_BANNED_RIGHTS_CONSTRUCTOR)
+        + encode_uint32((1 << 1) | (1 << 2))  # send_messages and send_media
+        + encode_int32(0)
+    )
+    restricted_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=restricted_message_id,
+        seq_no=7,
+        body=restricted_rights,
+    ))
+    assert restricted_response is not None
+    _, _, _, _, restricted_body = _decrypt_server(auth_key, restricted_response)
+    restricted_reader = TLReader(restricted_body)
+    assert restricted_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert restricted_reader.int64() == restricted_message_id
+    assert restricted_reader.uint32() == UPDATES_CONSTRUCTOR
+    with database.transaction() as connection:
+        restricted_flags = connection.execute(
+            "SELECT default_banned_rights_flags FROM peer_permissions WHERE peer_id = ?", (chat_id,)
+        ).fetchone()
+        assert restricted_flags is not None and int(restricted_flags["default_banned_rights_flags"]) == ((1 << 1) | (1 << 2))
+
+
 def test_web_k_startup_langpack_and_countries_calls_receive_valid_responses() -> None:
     from intelligram.mtproto.tl import (
         HELP_COUNTRIES_LIST_CONSTRUCTOR,

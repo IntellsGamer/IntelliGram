@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +91,17 @@ class Database:
                     about TEXT NOT NULL DEFAULT '',
                     created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS channel_settings (
+                    peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
+                    slowmode_seconds INTEGER NOT NULL DEFAULT 0 CHECK(slowmode_seconds IN (0, 5, 10, 30, 60, 300, 900, 3600))
+                );
+
+                CREATE TABLE IF NOT EXISTS peer_permissions (
+                    peer_id INTEGER PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
+                    default_banned_rights_flags INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS contacts (
@@ -200,7 +211,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '6')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '7')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )

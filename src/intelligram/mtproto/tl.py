@@ -49,12 +49,15 @@ USER_CONSTRUCTOR = 0xB1B8CC83
 USER_STATUS_EMPTY_CONSTRUCTOR = 0x09D05049
 PEER_USER_CONSTRUCTOR = 0x59511722
 PEER_CHAT_CONSTRUCTOR = 0x36C6019A
+PEER_CHANNEL_CONSTRUCTOR = 0xA2A5371E
 INPUT_PEER_EMPTY_CONSTRUCTOR = 0x7F3B18EA
 INPUT_PEER_SELF_CONSTRUCTOR = 0x7DA07EC9
 INPUT_PEER_USER_CONSTRUCTOR = 0xDDE8A54C
 INPUT_PEER_CHAT_CONSTRUCTOR = 0x35A95CB9
+INPUT_PEER_CHANNEL_CONSTRUCTOR = 0x27BCBBFC
 INPUT_USER_SELF_CONSTRUCTOR = 0xF7C1B13F
 INPUT_USER_CONSTRUCTOR = 0xF210AAE0
+INPUT_CHANNEL_CONSTRUCTOR = 0xF35AEC28
 INPUT_DIALOG_PEER_CONSTRUCTOR = 0xFCAAFEB7
 MESSAGE_CONSTRUCTOR = 0x7600B9D3
 DIALOG_CONSTRUCTOR = 0xFC89F7F3
@@ -70,6 +73,8 @@ USER_FULL_CONSTRUCTOR = 0x06CBE645
 USERS_USER_FULL_CONSTRUCTOR = 0x3B6D152E
 UPDATE_NEW_MESSAGE_CONSTRUCTOR = 0x1F2B0AFD
 UPDATE_MESSAGE_ID_CONSTRUCTOR = 0x4E90BFD6
+UPDATE_CHANNEL_CONSTRUCTOR = 0x635B4C09
+UPDATE_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR = 0x54C01850
 UPDATES_CONSTRUCTOR = 0x74AE4240
 USERS_GET_USERS_CONSTRUCTOR = 0x0D91A548
 USERS_GET_FULL_USER_CONSTRUCTOR = 0xB60F5918
@@ -85,7 +90,10 @@ ACCOUNT_CONTENT_SETTINGS_CONSTRUCTOR = 0x57E28221
 PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR = 0x65427B82
 ACCOUNT_PRIVACY_RULES_CONSTRUCTOR = 0x50A04E45
 CHAT_CONSTRUCTOR = 0x41CBF256
+CHANNEL_CONSTRUCTOR = 0xD49F34C6
+CHANNEL_FULL_CONSTRUCTOR = 0xA04E8D3A
 CHAT_PHOTO_EMPTY_CONSTRUCTOR = 0x37C1011C
+PHOTO_EMPTY_CONSTRUCTOR = 0x2331B22D
 MESSAGES_INVITED_USERS_CONSTRUCTOR = 0x7F5DEFA6
 MESSAGES_CREATE_CHAT_CONSTRUCTOR = 0x92CEDDD4
 ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR = 0x78515775
@@ -105,6 +113,12 @@ UPDATES_GET_DIFFERENCE_CONSTRUCTOR = 0x19C2F763
 UPDATES_DIFFERENCE_EMPTY_CONSTRUCTOR = 0x5D75A138
 UPDATES_DIFFERENCE_CONSTRUCTOR = 0x00F49CA0
 MESSAGES_GET_FULL_CHAT_CONSTRUCTOR = 0xAEB00B34
+MESSAGES_MIGRATE_CHAT_CONSTRUCTOR = 0xA2875319
+CHANNELS_GET_CHANNELS_CONSTRUCTOR = 0x0A7F6BBB
+CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR = 0x08736A09
+CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR = 0xEDD49EF0
+MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR = 0xA5866B41
+CHAT_BANNED_RIGHTS_CONSTRUCTOR = 0x9F120418
 CHAT_FULL_CONSTRUCTOR = 0x2633421B
 CHAT_PARTICIPANT_CONSTRUCTOR = 0x38E79FDE
 CHAT_PARTICIPANTS_CONSTRUCTOR = 0x3CBC93F8
@@ -304,6 +318,8 @@ def _read_input_peer(reader: TLReader) -> dict[str, Any]:
         }
     if constructor_id == INPUT_PEER_CHAT_CONSTRUCTOR:
         return {"kind": "chat", "chat_id": reader.int64()}
+    if constructor_id == INPUT_PEER_CHANNEL_CONSTRUCTOR:
+        return {"kind": "channel", "channel_id": reader.int64(), "access_hash": reader.int64()}
     raise TLDecodeError(f"Unsupported InputPeer constructor: 0x{constructor_id:08x}")
 
 
@@ -332,6 +348,18 @@ def _read_input_user(reader: TLReader) -> dict[str, Any]:
             "access_hash": reader.int64(),
         }
     raise TLDecodeError(f"Unsupported InputUser constructor: 0x{constructor_id:08x}")
+
+
+def _read_chat_banned_rights(reader: TLReader) -> dict[str, int]:
+    if reader.uint32() != CHAT_BANNED_RIGHTS_CONSTRUCTOR:
+        raise TLDecodeError("Expected a chatBannedRights constructor")
+    return {"flags": reader.uint32(), "until_date": reader.int32()}
+
+
+def _read_input_channel(reader: TLReader) -> dict[str, Any]:
+    if reader.uint32() != INPUT_CHANNEL_CONSTRUCTOR:
+        raise TLDecodeError("Expected an inputChannel constructor")
+    return {"channel_id": reader.int64(), "access_hash": reader.int64()}
 
 
 def _read_input_file(reader: TLReader) -> dict[str, Any]:
@@ -532,6 +560,24 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_get_peer_dialogs", {"peers": peers})
     elif constructor_id == MESSAGES_GET_FULL_CHAT_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_full_chat", {"chat_id": reader.int64()})
+    elif constructor_id == MESSAGES_MIGRATE_CHAT_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_migrate_chat", {"chat_id": reader.int64()})
+    elif constructor_id == CHANNELS_GET_CHANNELS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_get_channels", {
+            "channels": [_read_input_channel(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == CHANNELS_GET_FULL_CHANNEL_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_get_full_channel", {"channel": _read_input_channel(reader)})
+    elif constructor_id == CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "channels_toggle_slow_mode", {
+            "channel": _read_input_channel(reader),
+            "seconds": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_edit_chat_default_banned_rights", {
+            "peer": _read_input_peer(reader),
+            "banned_rights": _read_chat_banned_rights(reader),
+        })
     elif constructor_id == MESSAGES_EDIT_CHAT_TITLE_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_edit_chat_title", {
             "chat_id": reader.int64(),
@@ -924,6 +970,16 @@ def encode_peer_chat(*, chat_id: int) -> bytes:
     return encode_uint32(PEER_CHAT_CONSTRUCTOR) + encode_int64(chat_id)
 
 
+def channel_access_hash(channel_id: int) -> int:
+    """Return a deterministic non-zero access hash for an IntelliGram channel."""
+
+    return (channel_id << 32) | 1
+
+
+def encode_peer_channel(*, channel_id: int) -> bytes:
+    return encode_uint32(PEER_CHANNEL_CONSTRUCTOR) + encode_int64(channel_id)
+
+
 def encode_upload_file(*, mtime: int, content: bytes) -> bytes:
     return (
         encode_uint32(UPLOAD_FILE_CONSTRUCTOR)
@@ -960,6 +1016,10 @@ def encode_photos_photo(*, photo: bytes, users: Iterable[bytes]) -> bytes:
     return encode_uint32(PHOTOS_PHOTO_CONSTRUCTOR) + photo + encode_vector(users)
 
 
+def encode_photo_empty(*, photo_id: int = 0) -> bytes:
+    return encode_uint32(PHOTO_EMPTY_CONSTRUCTOR) + encode_int64(photo_id)
+
+
 def encode_chat_participant(*, user_id: int, inviter_id: int, date: int, rank: str | None = None) -> bytes:
     flags = 1 if rank else 0
     result = (
@@ -981,6 +1041,10 @@ def encode_chat_participants(*, chat_id: int, participants: Iterable[bytes], ver
     )
 
 
+def encode_chat_banned_rights(*, flags: int, until_date: int = 0) -> bytes:
+    return encode_uint32(CHAT_BANNED_RIGHTS_CONSTRUCTOR) + encode_uint32(flags) + encode_int32(until_date)
+
+
 def encode_chat_full(*, chat_id: int, about: str, participants: bytes) -> bytes:
     return (
         encode_uint32(CHAT_FULL_CONSTRUCTOR)
@@ -989,6 +1053,62 @@ def encode_chat_full(*, chat_id: int, about: str, participants: bytes) -> bytes:
         + encode_tl_string(about)
         + participants
         + encode_peer_notify_settings()
+    )
+
+
+def encode_channel(
+    *,
+    channel_id: int,
+    title: str,
+    participants_count: int,
+    date: int,
+    creator: bool,
+    slowmode_enabled: bool = False,
+    default_banned_rights_flags: int | None = None,
+) -> bytes:
+    flags = (1 << 8) | (1 << 13) | (1 << 17)
+    if creator:
+        flags |= 1
+    if slowmode_enabled:
+        flags |= 1 << 22
+    if default_banned_rights_flags is not None:
+        flags |= 1 << 18
+    return (
+        encode_uint32(CHANNEL_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_uint32(0)
+        + encode_int64(channel_id)
+        + encode_int64(channel_access_hash(channel_id))
+        + encode_tl_string(title)
+        + encode_uint32(CHAT_PHOTO_EMPTY_CONSTRUCTOR)
+        + encode_int32(date)
+        + (encode_chat_banned_rights(flags=default_banned_rights_flags) if default_banned_rights_flags is not None else b"")
+        + encode_int32(participants_count)
+    )
+
+
+def encode_channel_full(
+    *, channel_id: int, about: str, participants_count: int, admins_count: int, slowmode_seconds: int = 0, pts: int = 0,
+) -> bytes:
+    flags = (1 << 0) | (1 << 1)
+    if slowmode_seconds:
+        flags |= 1 << 17
+    return (
+        encode_uint32(CHANNEL_FULL_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_uint32(1)  # flags2: can_delete_channel
+        + encode_int64(channel_id)
+        + encode_tl_string(about)
+        + encode_int32(participants_count)
+        + encode_int32(admins_count)
+        + encode_int32(0)  # read_inbox_max_id
+        + encode_int32(0)  # read_outbox_max_id
+        + encode_int32(0)  # unread_count
+        + encode_photo_empty()
+        + encode_peer_notify_settings()
+        + encode_vector([])  # bot_info
+        + (encode_int32(slowmode_seconds) if slowmode_seconds else b"")
+        + encode_int32(pts)
     )
 
 
@@ -1001,8 +1121,19 @@ def encode_messages_chat_full(*, full_chat: bytes, chats: Iterable[bytes], users
     )
 
 
-def encode_chat(*, chat_id: int, title: str, participants_count: int, date: int, creator: bool = False, version: int = 1) -> bytes:
+def encode_chat(
+    *,
+    chat_id: int,
+    title: str,
+    participants_count: int,
+    date: int,
+    creator: bool = False,
+    version: int = 1,
+    default_banned_rights_flags: int | None = None,
+) -> bytes:
     flags = 1 if creator else 0
+    if default_banned_rights_flags is not None:
+        flags |= 1 << 18
     return (
         encode_uint32(CHAT_CONSTRUCTOR)
         + encode_uint32(flags)
@@ -1012,6 +1143,7 @@ def encode_chat(*, chat_id: int, title: str, participants_count: int, date: int,
         + encode_int32(participants_count)
         + encode_int32(date)
         + encode_int32(version)
+        + (encode_chat_banned_rights(flags=default_banned_rights_flags) if default_banned_rights_flags is not None else b"")
     )
 
 
@@ -1161,6 +1293,19 @@ def encode_users_user_full(*, user: dict[str, Any], self_user_id: int | None = N
 
 def encode_update_new_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
     return encode_uint32(UPDATE_NEW_MESSAGE_CONSTRUCTOR) + message + encode_int32(pts) + encode_int32(pts_count)
+
+
+def encode_update_channel(*, channel_id: int) -> bytes:
+    return encode_uint32(UPDATE_CHANNEL_CONSTRUCTOR) + encode_int64(channel_id)
+
+
+def encode_update_chat_default_banned_rights(*, peer: bytes, flags: int, version: int = 1) -> bytes:
+    return (
+        encode_uint32(UPDATE_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR)
+        + peer
+        + encode_chat_banned_rights(flags=flags)
+        + encode_int32(version)
+    )
 
 
 def encode_update_chat_participants(*, participants: bytes) -> bytes:
