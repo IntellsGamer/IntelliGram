@@ -87,6 +87,40 @@ CONTACTS_GET_CONTACTS_CONSTRUCTOR = 0x5DD69E12
 MESSAGES_GET_DIALOGS_CONSTRUCTOR = 0xA0F4CB4F
 MESSAGES_GET_HISTORY_CONSTRUCTOR = 0x4423E6C5
 MESSAGES_SEND_MESSAGE_CONSTRUCTOR = 0xFEF48F62
+MESSAGES_SEND_MEDIA_CONSTRUCTOR = 0x0330E77F
+MESSAGES_UPLOAD_MEDIA_CONSTRUCTOR = 0x14967978
+INPUT_MEDIA_EMPTY_CONSTRUCTOR = 0x9664F57F  # -1771768449
+INPUT_MEDIA_UPLOADED_PHOTO_CONSTRUCTOR = 0x7D8375DA  # 2105767386
+INPUT_MEDIA_UPLOADED_DOCUMENT_CONSTRUCTOR = 0x037C9330  # 58495792
+INPUT_MEDIA_PHOTO_CONSTRUCTOR = 0xE3AF4434  # -475053004
+INPUT_MEDIA_DOCUMENT_CONSTRUCTOR = 0xA8763AB5  # -1468646731
+MESSAGE_MEDIA_PHOTO_CONSTRUCTOR = 0xE216EB63  # -501814429
+MESSAGE_MEDIA_DOCUMENT_CONSTRUCTOR = 0x52D8CCD9  # 1389939929
+DOCUMENT_CONSTRUCTOR = 0x8FD4C4D8  # -1881881384
+DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR = 0x15590068  # 358154344
+INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR = 0xBAD07584  # -1160743548
+INPUT_PHOTO_CONSTRUCTOR = 0x3BB3B94A  # 1001634122
+INPUT_DOCUMENT_CONSTRUCTOR = 0x1ABFB575  # 448771445
+DOCUMENT_ATTRIBUTE_IMAGE_SIZE_CONSTRUCTOR = 0x6C37C15C  # 1815593308
+DOCUMENT_ATTRIBUTE_VIDEO_CONSTRUCTOR = 0x43C57C48  # 1137015880
+DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR = 0x9852F9C6  # -1739392570
+DOCUMENT_ATTRIBUTE_ANIMATED_CONSTRUCTOR = 0x11B58939  # 297109817
+INPUT_MEDIA_WEB_PAGE_CONSTRUCTOR = 0xC21B8849  # -1038383031
+UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR = 0x62BA04D9  # 1656358105
+MESSAGES_GET_EMOJI_GROUPS_CONSTRUCTOR = 0x7488CE5B
+MESSAGES_GET_EMOJI_STATUS_GROUPS_CONSTRUCTOR = 0x2ECD56CD
+MESSAGES_GET_EMOJI_PROFILE_PHOTO_GROUPS_CONSTRUCTOR = 0x21A548F3
+MESSAGES_GET_ALL_STICKERS_CONSTRUCTOR = 0xB8A0A1A8
+MESSAGES_GET_STICKER_SET_CONSTRUCTOR = 0xC8A0EC74
+MESSAGES_GET_EMOJI_STICKERS_CONSTRUCTOR = 0xFBFCA18F
+MESSAGES_GET_EMOJI_KEYWORDS_DIFFERENCE_CONSTRUCTOR = 0x1508B6AF
+MESSAGES_EMOJI_GROUPS_NOT_MODIFIED_CONSTRUCTOR = 0x6FB4AD87
+MESSAGES_ALL_STICKERS_NOT_MODIFIED_CONSTRUCTOR = 0xE86602C3
+MESSAGES_STICKER_SET_NOT_MODIFIED_CONSTRUCTOR = 0xD3F924EB
+EMOJI_KEYWORDS_DIFFERENCE_CONSTRUCTOR = 0x5CC761BD
+INPUT_STICKER_SET_EMPTY_CONSTRUCTOR = 0xFFB62B95
+INPUT_STICKER_SET_ID_CONSTRUCTOR = 0x9DE7A269
+INPUT_STICKER_SET_SHORT_NAME_CONSTRUCTOR = 0x861CC8A0
 MESSAGES_GET_PEER_DIALOGS_CONSTRUCTOR = 0xE470BCFD
 ACCOUNT_UPDATE_STATUS_CONSTRUCTOR = 0x6628562C
 ACCOUNT_GET_PRIVACY_CONSTRUCTOR = 0xDADBC950
@@ -230,6 +264,12 @@ class TLReader:
     def int64(self) -> int:
         self._require(8)
         value = struct.unpack_from("<q", self.data, self.offset)[0]
+        self.offset += 8
+        return value
+
+    def double(self) -> float:
+        self._require(8)
+        value = struct.unpack_from("<d", self.data, self.offset)[0]
         self.offset += 8
         return value
 
@@ -454,7 +494,143 @@ def _read_input_file_location(reader: TLReader) -> dict[str, Any]:
             "file_reference": reader.bytes(),
             "thumb_size": reader.bytes().decode("utf-8"),
         }
+    if constructor_id == INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR:
+        return {
+            "kind": "document",
+            "document_id": reader.int64(),
+            "access_hash": reader.int64(),
+            "file_reference": reader.bytes(),
+            "thumb_size": reader.bytes().decode("utf-8"),
+        }
     raise TLDecodeError(f"Unsupported InputFileLocation constructor: 0x{constructor_id:08x}")
+
+
+def _read_input_photo(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_PHOTO_CONSTRUCTOR:
+        return {
+            "id": reader.int64(),
+            "access_hash": reader.int64(),
+            "file_reference": reader.bytes(),
+        }
+    raise TLDecodeError(f"Unsupported InputPhoto constructor: 0x{constructor_id:08x}")
+
+
+def _read_input_document(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_DOCUMENT_CONSTRUCTOR:
+        return {
+            "id": reader.int64(),
+            "access_hash": reader.int64(),
+            "file_reference": reader.bytes(),
+        }
+    raise TLDecodeError(f"Unsupported InputDocument constructor: 0x{constructor_id:08x}")
+
+
+def _read_document_attribute(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR:
+        return {"kind": "filename", "file_name": reader.bytes().decode("utf-8")}
+    if constructor_id == DOCUMENT_ATTRIBUTE_IMAGE_SIZE_CONSTRUCTOR:
+        return {"kind": "image_size", "w": reader.int32(), "h": reader.int32()}
+    if constructor_id == DOCUMENT_ATTRIBUTE_ANIMATED_CONSTRUCTOR:
+        return {"kind": "animated"}
+    if constructor_id == DOCUMENT_ATTRIBUTE_VIDEO_CONSTRUCTOR:
+        flags = reader.uint32()
+        attribute = {
+            "kind": "video",
+            "duration": reader.double(),
+            "w": reader.int32(),
+            "h": reader.int32(),
+        }
+        if flags & (1 << 2):
+            attribute["preload_prefix_size"] = reader.int32()
+        if flags & (1 << 4):
+            attribute["video_start_ts"] = reader.double()
+        if flags & (1 << 5):
+            attribute["video_codec"] = reader.bytes().decode("utf-8")
+        return attribute
+    if constructor_id == DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR:
+        flags = reader.uint32()
+        attribute = {"kind": "audio", "duration": reader.int32()}
+        if flags & 1:
+            attribute["title"] = reader.bytes().decode("utf-8")
+        if flags & 2:
+            attribute["performer"] = reader.bytes().decode("utf-8")
+        if flags & 4:
+            attribute["waveform"] = reader.bytes()
+        return attribute
+    raise TLDecodeError(f"Unsupported DocumentAttribute constructor: 0x{constructor_id:08x}")
+
+
+def _read_input_media(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_MEDIA_EMPTY_CONSTRUCTOR:
+        return {"kind": "empty"}
+    if constructor_id == INPUT_MEDIA_UPLOADED_PHOTO_CONSTRUCTOR:
+        flags = reader.uint32()
+        media = {"kind": "uploaded_photo", "file": _read_input_file(reader)}
+        if flags & 1:
+            for _ in range(reader.vector_count()):
+                _read_input_document(reader)
+        if flags & 2:
+            media["ttl_seconds"] = reader.int32()
+        if flags & 8:
+            _read_input_document(reader)
+        return media
+    if constructor_id == INPUT_MEDIA_UPLOADED_DOCUMENT_CONSTRUCTOR:
+        flags = reader.uint32()
+        media = {"kind": "uploaded_document", "file": _read_input_file(reader)}
+        if flags & 4:
+            media["thumb"] = _read_input_file(reader)
+        media["mime_type"] = reader.bytes().decode("utf-8")
+        media["attributes"] = [_read_document_attribute(reader) for _ in range(reader.vector_count())]
+        if flags & 1:
+            for _ in range(reader.vector_count()):
+                _read_input_document(reader)
+        if flags & 64:
+            _read_input_photo(reader)
+        if flags & 128:
+            media["video_timestamp"] = reader.int32()
+        if flags & 2:
+            media["ttl_seconds"] = reader.int32()
+        return media
+    if constructor_id == INPUT_MEDIA_PHOTO_CONSTRUCTOR:
+        flags = reader.uint32()
+        photo = _read_input_photo(reader)
+        if flags & 1:
+            reader.int32()
+        if flags & 4:
+            _read_input_document(reader)
+        return {"kind": "photo", "id": photo["id"]}
+    if constructor_id == INPUT_MEDIA_DOCUMENT_CONSTRUCTOR:
+        flags = reader.uint32()
+        document = _read_input_document(reader)
+        if flags & 8:
+            _read_input_photo(reader)
+        if flags & 16:
+            reader.int32()
+        if flags & 1:
+            reader.int32()
+        if flags & 2:
+            reader.bytes()
+        return {"kind": "document", "id": document["id"]}
+    if constructor_id == INPUT_MEDIA_WEB_PAGE_CONSTRUCTOR:
+        flags = reader.uint32()
+        url = reader.bytes().decode("utf-8")
+        return {"kind": "webpage", "url": url}
+    raise TLDecodeError(f"Unsupported InputMedia constructor: 0x{constructor_id:08x}")
+
+
+def _read_input_sticker_set(reader: TLReader) -> dict[str, Any]:
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_STICKER_SET_EMPTY_CONSTRUCTOR:
+        return {"kind": "empty"}
+    if constructor_id == INPUT_STICKER_SET_ID_CONSTRUCTOR:
+        return {"kind": "id", "id": reader.int64(), "access_hash": reader.int64()}
+    if constructor_id == INPUT_STICKER_SET_SHORT_NAME_CONSTRUCTOR:
+        return {"kind": "short_name", "short_name": reader.bytes().decode("utf-8")}
+    raise TLDecodeError(f"Unsupported InputStickerSet constructor: 0x{constructor_id:08x}")
 
 
 def _read_bool(reader: TLReader) -> bool:
@@ -617,6 +793,45 @@ def parse_request(data: bytes) -> TLRequest:
             "message": reader.bytes().decode("utf-8"),
             "random_id": reader.int64(),
             "silent": bool(flags & (1 << 5)),
+        })
+    elif constructor_id == MESSAGES_SEND_MEDIA_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_send_media", {
+            "peer": _read_input_peer(reader),
+            "reply_to": _read_input_reply_to(reader) if flags & 1 else None,
+            "media": _read_input_media(reader),
+            "message": reader.bytes().decode("utf-8"),
+            "random_id": reader.int64(),
+            "silent": bool(flags & (1 << 5)),
+        })
+        if reader.remaining:
+            reader.raw_bytes(reader.remaining)
+    elif constructor_id == MESSAGES_UPLOAD_MEDIA_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_upload_media", {
+            "business_connection_id": reader.bytes().decode("utf-8") if flags & 1 else None,
+            "peer": _read_input_peer(reader),
+            "media": _read_input_media(reader),
+        })
+    elif constructor_id == MESSAGES_GET_EMOJI_GROUPS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_emoji_groups", {"hash": reader.int32()})
+    elif constructor_id == MESSAGES_GET_EMOJI_STATUS_GROUPS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_emoji_status_groups", {"hash": reader.int32()})
+    elif constructor_id == MESSAGES_GET_EMOJI_PROFILE_PHOTO_GROUPS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_emoji_profile_photo_groups", {"hash": reader.int32()})
+    elif constructor_id == MESSAGES_GET_ALL_STICKERS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_all_stickers", {"hash": reader.int64()})
+    elif constructor_id == MESSAGES_GET_EMOJI_STICKERS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_emoji_stickers", {"hash": reader.int64()})
+    elif constructor_id == MESSAGES_GET_STICKER_SET_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_sticker_set", {
+            "stickerset": _read_input_sticker_set(reader),
+            "hash": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_GET_EMOJI_KEYWORDS_DIFFERENCE_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_emoji_keywords_difference", {
+            "lang_code": reader.bytes().decode("utf-8"),
+            "from_version": reader.int32(),
         })
     elif constructor_id == MESSAGES_CREATE_CHAT_CONSTRUCTOR:
         flags = reader.uint32()
@@ -1503,13 +1718,64 @@ def encode_message_reply_header(*, reply_to_message_id: int) -> bytes:
     )
 
 
+def encode_document_attribute_filename(*, file_name: str) -> bytes:
+    return encode_uint32(DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR) + encode_tl_string(file_name)
+
+
+def encode_document(*, media: dict[str, Any]) -> bytes:
+    file_id = int(media["file_id"])
+    return (
+        encode_uint32(DOCUMENT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int64(file_id)
+        + encode_int64((file_id << 32) | 1)
+        + encode_tl_bytes(f"intelligram-file:{file_id}".encode("ascii"))
+        + encode_int32(int(media.get("date") or 0))
+        + encode_tl_string(str(media.get("mime_type") or "application/octet-stream"))
+        + encode_int64(int(media.get("size") or 0))
+        + encode_int32(1)
+        + encode_vector([
+            encode_document_attribute_filename(file_name=str(media.get("filename") or "attachment")),
+        ])
+    )
+
+
+def encode_message_media(media: dict[str, Any] | None) -> bytes | None:
+    if not media:
+        return None
+    kind = str(media.get("kind") or "")
+    file_id = int(media["file_id"])
+    date = int(media.get("date") or 0)
+    size = int(media.get("size") or 0)
+    if kind == "photo":
+        return (
+            encode_uint32(MESSAGE_MEDIA_PHOTO_CONSTRUCTOR)
+            + encode_uint32(1)
+            + encode_photo(
+                photo_id=file_id,
+                file_reference=f"intelligram-file:{file_id}".encode("ascii"),
+                date=date,
+                size=size,
+            )
+        )
+    if kind == "document":
+        return (
+            encode_uint32(MESSAGE_MEDIA_DOCUMENT_CONSTRUCTOR)
+            + encode_uint32(1)
+            + encode_document(media=media)
+        )
+    return None
+
+
 def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: bool) -> bytes:
     reply_to_message_id = message.get("reply_to_message_id")
     edited_at = message.get("edited_at")
+    encoded_media = encode_message_media(message.get("media") if isinstance(message.get("media"), dict) else None)
     flags = (
         (1 << 8)
         | ((1 << 1) if outgoing else 0)
         | ((1 << 3) if reply_to_message_id is not None else 0)
+        | ((1 << 9) if encoded_media is not None else 0)
         | ((1 << 15) if edited_at is not None else 0)
     )
     return (
@@ -1522,7 +1788,39 @@ def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: 
         + (encode_message_reply_header(reply_to_message_id=int(reply_to_message_id)) if reply_to_message_id is not None else b"")
         + encode_int32(int(message["sent_at"]))
         + encode_tl_string(str(message["body"]))
+        + (encoded_media or b"")
         + (encode_int32(int(edited_at)) if edited_at is not None else b"")
+    )
+
+
+def encode_update_new_channel_message(*, message: bytes, pts: int, pts_count: int) -> bytes:
+    return (
+        encode_uint32(UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR)
+        + message
+        + encode_int32(pts)
+        + encode_int32(pts_count)
+    )
+
+
+def encode_messages_emoji_groups_not_modified() -> bytes:
+    return encode_uint32(MESSAGES_EMOJI_GROUPS_NOT_MODIFIED_CONSTRUCTOR)
+
+
+def encode_messages_all_stickers_not_modified() -> bytes:
+    return encode_uint32(MESSAGES_ALL_STICKERS_NOT_MODIFIED_CONSTRUCTOR)
+
+
+def encode_messages_sticker_set_not_modified() -> bytes:
+    return encode_uint32(MESSAGES_STICKER_SET_NOT_MODIFIED_CONSTRUCTOR)
+
+
+def encode_emoji_keywords_difference(*, lang_code: str, from_version: int, version: int) -> bytes:
+    return (
+        encode_uint32(EMOJI_KEYWORDS_DIFFERENCE_CONSTRUCTOR)
+        + encode_tl_string(lang_code)
+        + encode_int32(from_version)
+        + encode_int32(version)
+        + encode_vector([])
     )
 
 

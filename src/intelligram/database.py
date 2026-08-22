@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +227,26 @@ class Database:
                     created_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS stored_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    source_file_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS message_media (
+                    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES stored_files(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('photo', 'document')),
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS profile_photos_user_created_idx
                     ON profile_photos(user_id, created_at DESC);
 
@@ -276,7 +296,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '10')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '11')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )

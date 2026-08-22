@@ -20,6 +20,7 @@ from intelligram.services.accounts import (
     AccountAuthError,
     begin_password_login,
     complete_device_login,
+    complete_password_plaintext_login,
     complete_password_srp_login,
     get_password_srp_state,
     normalize_phone,
@@ -118,6 +119,12 @@ from intelligram.mtproto.tl import (
     encode_updates_difference_empty,
     encode_upload_file,
     encode_update_message_id,
+    encode_emoji_keywords_difference,
+    encode_message_media,
+    encode_messages_all_stickers_not_modified,
+    encode_messages_emoji_groups_not_modified,
+    encode_messages_sticker_set_not_modified,
+    encode_update_new_channel_message,
     encode_update_new_message,
     encode_update_read_history_inbox,
     encode_update_channel,
@@ -243,6 +250,21 @@ class MTProtoSessionAdapter:
                 srp_id=int(request.fields["srp_id"]),
                 client_A=bytes(request.fields["A"]),
                 client_M1=bytes(request.fields["M1"]),
+            )
+        if request.name == "messages_send_media":
+            return self._handle_messages_send_media(
+                message,
+                peer=request.fields["peer"],
+                body=str(request.fields["message"]),
+                random_id=int(request.fields["random_id"]),
+                reply_to=request.fields["reply_to"],
+                media=request.fields["media"],
+            )
+        if request.name == "messages_upload_media":
+            return self._handle_messages_upload_media(
+                message,
+                peer=request.fields["peer"],
+                media=request.fields["media"],
             )
         if request.name == "auth_sign_up":
             return self._handle_auth_sign_up(
@@ -425,6 +447,25 @@ class MTProtoSessionAdapter:
             return self._encrypt_result(
                 message,
                 encode_messages_available_reactions(hash_value=int(request.fields["hash"])),
+            )
+        if request.name in {
+            "messages_get_emoji_groups",
+            "messages_get_emoji_status_groups",
+            "messages_get_emoji_profile_photo_groups",
+        }:
+            return self._encrypt_result(message, encode_messages_emoji_groups_not_modified())
+        if request.name in {"messages_get_all_stickers", "messages_get_emoji_stickers"}:
+            return self._encrypt_result(message, encode_messages_all_stickers_not_modified())
+        if request.name == "messages_get_sticker_set":
+            return self._encrypt_result(message, encode_messages_sticker_set_not_modified())
+        if request.name == "messages_get_emoji_keywords_difference":
+            return self._encrypt_result(
+                message,
+                encode_emoji_keywords_difference(
+                    lang_code=str(request.fields["lang_code"]),
+                    from_version=int(request.fields["from_version"]),
+                    version=int(request.fields["from_version"]),
+                ),
             )
         if request.name == "communities_get_joined_communities":
             return self._encrypt_result(message, encode_messages_chats())
@@ -675,14 +716,26 @@ class MTProtoSessionAdapter:
         issued = None
         with self.database.transaction(immediate=True) as connection:
             try:
-                issued = complete_password_srp_login(
-                    connection,
-                    auth_key_id=str(auth_key_id(self.auth_key)),
-                    srp_id=srp_id,
-                    client_A=client_A,
-                    client_M1=client_M1,
-                    device_label="IntelliGram Web K MTProto password fallback",
-                )
+                if srp_id == 0:
+                    # PasswordCard fallback for scrypt-only accounts: A carries
+                    # the UTF-8 password inside the encrypted MTProto envelope.
+                    issued = complete_password_plaintext_login(
+                        connection,
+                        auth_key_id=str(auth_key_id(self.auth_key)),
+                        password=client_A.decode("utf-8"),
+                        device_label="IntelliGram Web K MTProto password fallback",
+                    )
+                else:
+                    issued = complete_password_srp_login(
+                        connection,
+                        auth_key_id=str(auth_key_id(self.auth_key)),
+                        srp_id=srp_id,
+                        client_A=client_A,
+                        client_M1=client_M1,
+                        device_label="IntelliGram Web K MTProto password fallback",
+                    )
+            except UnicodeDecodeError:
+                error = "PASSWORD_HASH_INVALID"
             except AccountAuthError as exc:
                 # Deliberately stay inside the transaction so failed-attempt
                 # accounting and one-time invalidation are committed.
@@ -776,14 +829,39 @@ class MTProtoSessionAdapter:
         return dict(row)
 
     @staticmethod
-    def _message_from_row(row: object) -> dict[str, object]:
+    def _load_row_media(connection: object, message_id: int) -> dict[str, object] | None:
+        row = connection.execute(
+            """
+            SELECT file_id, kind, filename, mime_type, size, created_at
+            FROM message_media WHERE message_id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return None
         return {
+            "kind": str(row["kind"]),
+            "file_id": int(row["file_id"]),
+            "filename": str(row["filename"]),
+            "mime_type": str(row["mime_type"]),
+            "size": int(row["size"]),
+            "date": int(row["created_at"]),
+        }
+
+    @staticmethod
+    def _message_from_row(row: object, connection: object | None = None) -> dict[str, object]:
+        message = {
             "id": int(row["id"]),
             "peer_id": int(row["peer_id"]),
             "sender_user_id": int(row["sender_user_id"]),
             "body": str(row["body"]),
             "sent_at": int(row["sent_at"]),
         }
+        if connection is not None:
+            media = MTProtoSessionAdapter._load_row_media(connection, int(row["id"]))
+            if media is not None:
+                message["media"] = media
+        return message
 
     def _load_users(self, connection: object, user_ids: set[int]) -> dict[int, dict[str, object]]:
         if not user_ids:
@@ -915,24 +993,28 @@ class MTProtoSessionAdapter:
         if isinstance(authenticated, bytes):
             return authenticated
         database, _self_user_id = authenticated
-        if not isinstance(location, dict) or location.get("kind") != "photo":
+        if not isinstance(location, dict) or location.get("kind") not in {"photo", "document"}:
             return self._encrypt_rpc_error(message, "LOCATION_INVALID")
-        photo_id = int(location.get("photo_id", 0))
-        expected_access_hash = (photo_id << 32) | 1
-        if photo_id <= 0 or int(location.get("access_hash", 0)) != expected_access_hash:
+        file_id = int(location.get("photo_id") or location.get("document_id") or 0)
+        expected_access_hash = (file_id << 32) | 1
+        if file_id <= 0 or int(location.get("access_hash", 0)) != expected_access_hash:
             return self._encrypt_rpc_error(message, "FILE_REFERENCE_INVALID")
         if offset < 0 or limit <= 0 or limit > 1_048_576:
             return self._encrypt_rpc_error(message, "OFFSET_INVALID")
         with database.transaction() as connection:
-            photo = connection.execute(
-                "SELECT content, created_at FROM profile_photos WHERE id = ?", (photo_id,)
+            stored = connection.execute(
+                "SELECT content, created_at FROM profile_photos WHERE id = ?", (file_id,)
             ).fetchone()
-        if photo is None:
+            if stored is None:
+                stored = connection.execute(
+                    "SELECT content, created_at FROM stored_files WHERE id = ?", (file_id,)
+                ).fetchone()
+        if stored is None:
             return self._encrypt_rpc_error(message, "LOCATION_INVALID")
-        content = bytes(photo["content"])[offset:offset + limit]
+        content = bytes(stored["content"])[offset:offset + limit]
         return self._encrypt_result(
             message,
-            encode_upload_file(mtime=int(photo["created_at"]), content=content),
+            encode_upload_file(mtime=int(stored["created_at"]), content=content),
         )
 
     def _handle_upload_save_file_part(
@@ -1115,7 +1197,7 @@ class MTProtoSessionAdapter:
                     (top_message_id,),
                 ).fetchone()
                 if row is not None:
-                    stored = self._message_from_row(row)
+                    stored = self._message_from_row(row, connection)
                     user_ids.add(int(stored["sender_user_id"]))
                     encoded_messages.append(
                         encode_message(
@@ -2475,41 +2557,226 @@ class MTProtoSessionAdapter:
                         if reply_to is not None else None
                     ),
                 )
-                self.pending_update_envelopes.extend(emitted)
-                sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
-                if sender_update is None:
-                    raise RuntimeError("Sender update was not emitted")
-                encoded_peer = self._encode_peer(summary)
-                user_ids = {self_user_id, int(stored["sender_user_id"])}
-                if summary.get("direct_user_id") is not None:
-                    user_ids.add(int(summary["direct_user_id"]))
-                users = self._load_users(connection, user_ids)
-                encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
-                encoded_chats = self._encode_chats(
-                    connection,
-                    chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) in {"chat", "channel"} else set(),
+                return self._finish_outgoing_message(
+                    message,
+                    connection=connection,
                     self_user_id=self_user_id,
+                    summary=summary,
+                    stored=stored,
+                    emitted=emitted,
+                    random_id=random_id,
                 )
-                updates = [
-                    encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
-                    encode_update_new_message(
-                        message=encoded_message,
-                        pts=sender_update.pts - sender_update.pts_count,
-                        pts_count=0,
-                    ),
-                ]
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
+
+    def _handle_messages_send_media(
+        self,
+        message: EncryptedMessage,
+        *,
+        peer: dict[str, object],
+        body: str,
+        random_id: int,
+        reply_to: dict[str, object] | None,
+        media: dict[str, object] | None,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                stored_media = self._materialize_input_media(
+                    connection, user_id=self_user_id, media=media
+                )
+                stored, emitted = send_message(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    sender_user_id=self_user_id,
+                    body=body,
+                    client_random_id=str(random_id),
+                    reply_to_message_id=(
+                        int(reply_to["reply_to_message_id"])
+                        if reply_to is not None else None
+                    ),
+                    media=stored_media,
+                )
+                return self._finish_outgoing_message(
+                    message,
+                    connection=connection,
+                    self_user_id=self_user_id,
+                    summary=summary,
+                    stored=stored,
+                    emitted=emitted,
+                    random_id=random_id,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+
+    def _handle_messages_upload_media(
+        self, message: EncryptedMessage, *, peer: dict[str, object], media: dict[str, object] | None
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                stored_media = self._materialize_input_media(
+                    connection, user_id=self_user_id, media=media
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        encoded = encode_message_media(stored_media)
+        if encoded is None:
+            return self._encrypt_rpc_error(message, "MEDIA_INVALID")
+        return self._encrypt_result(message, encoded)
+
+    def _finish_outgoing_message(
+        self,
+        message: EncryptedMessage,
+        *,
+        connection: object,
+        self_user_id: int,
+        summary: dict[str, object],
+        stored: dict[str, object],
+        emitted: list[object],
+        random_id: int,
+    ) -> bytes:
+        # Fan the durable update to other members. The sender already receives
+        # updateMessageID + updateNewMessage in this RPC result; re-publishing
+        # it via updatesTooLong / getDifference left the first outgoing bubble
+        # pending after a refresh.
+        self.pending_update_envelopes.extend(
+            update for update in emitted if getattr(update, "user_id", None) != self_user_id
+        )
+        sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
+        if sender_update is None:
+            raise RuntimeError("Sender update was not emitted")
+        encoded_peer = self._encode_peer(summary)
+        user_ids = {self_user_id, int(stored["sender_user_id"])}
+        if summary.get("direct_user_id") is not None:
+            user_ids.add(int(summary["direct_user_id"]))
+        users = self._load_users(connection, user_ids)
+        encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
+        encoded_chats = self._encode_chats(
+            connection,
+            chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) in {"chat", "channel"} else set(),
+            self_user_id=self_user_id,
+        )
+        new_message_update = (
+            encode_update_new_channel_message(
+                message=encoded_message,
+                pts=sender_update.pts,
+                pts_count=sender_update.pts_count,
+            )
+            if str(summary.get("kind")) == "channel"
+            else encode_update_new_message(
+                message=encoded_message,
+                pts=sender_update.pts,
+                pts_count=sender_update.pts_count,
+            )
+        )
         return self._encrypt_result(
             message,
             encode_updates(
-                updates=updates,
+                updates=[
+                    encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
+                    new_message_update,
+                ],
                 users=self._encode_users(users, self_user_id=self_user_id),
                 chats=encoded_chats,
                 date=sender_update.date,
                 seq=sender_update.seq,
             ),
         )
+
+    def _materialize_input_media(
+        self, connection: object, *, user_id: int, media: dict[str, object] | None
+    ) -> dict[str, object] | None:
+        if not media:
+            return None
+        kind = str(media.get("kind") or "")
+        if kind in {"empty", "webpage"}:
+            return None
+        if kind in {"uploaded_photo", "uploaded_document"}:
+            file = media.get("file")
+            if not isinstance(file, dict):
+                raise MessagingError("PHOTO_FILE_MISSING")
+            assembled = self._assemble_uploaded_file(connection, user_id=user_id, file=file)
+            filename = str(assembled["filename"])
+            for attribute in media.get("attributes") or []:
+                if isinstance(attribute, dict) and attribute.get("kind") == "filename" and attribute.get("file_name"):
+                    filename = str(attribute["file_name"])
+                    break
+            return {
+                "kind": "photo" if kind == "uploaded_photo" else "document",
+                "file_id": int(assembled["id"]),
+                "filename": filename,
+                "mime_type": str(media.get("mime_type") or assembled["mime_type"]),
+                "size": int(assembled["size"]),
+                "date": int(assembled["created_at"]),
+            }
+        if kind in {"photo", "document"}:
+            file_id = int(media.get("id") or 0)
+            stored = connection.execute(
+                "SELECT id, filename, mime_type, length(content) AS size, created_at FROM stored_files WHERE id = ?",
+                (file_id,),
+            ).fetchone()
+            if stored is None:
+                raise MessagingError("MEDIA_INVALID")
+            return {
+                "kind": kind,
+                "file_id": int(stored["id"]),
+                "filename": str(stored["filename"]),
+                "mime_type": str(stored["mime_type"]),
+                "size": int(stored["size"]),
+                "date": int(stored["created_at"]),
+            }
+        raise MessagingError("MEDIA_INVALID")
+
+    def _assemble_uploaded_file(
+        self, connection: object, *, user_id: int, file: dict[str, object]
+    ) -> dict[str, object]:
+        file_id = int(file.get("file_id", 0))
+        parts = int(file.get("parts", 0))
+        filename = str(file.get("name") or "attachment")
+        if parts < 1 or parts > 8_000 or not file_id:
+            raise MessagingError("FILE_PART_INVALID")
+        rows = connection.execute(
+            """
+            SELECT part_index, content FROM upload_parts
+            WHERE file_id = ? AND user_id = ?
+            ORDER BY part_index
+            """,
+            (file_id, user_id),
+        ).fetchall()
+        if len(rows) != parts or [int(row["part_index"]) for row in rows] != list(range(parts)):
+            raise MessagingError("FILE_PART_INVALID")
+        content = b"".join(bytes(row["content"]) for row in rows)
+        if not content or len(content) > 20 * 1024 * 1024:
+            raise MessagingError("FILE_TOO_BIG")
+        now = int(time.time())
+        mime_type = "application/octet-stream"
+        lowered = filename.lower()
+        if lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            mime_type = "image/jpeg" if lowered.endswith((".jpg", ".jpeg")) else f"image/{lowered.rsplit('.', 1)[-1]}"
+        stored = connection.execute(
+            """
+            INSERT INTO stored_files(owner_user_id, source_file_id, filename, mime_type, content, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, file_id, filename, mime_type, content, now),
+        )
+        connection.execute("DELETE FROM upload_parts WHERE file_id = ? AND user_id = ?", (file_id, user_id))
+        return {
+            "id": int(stored.lastrowid),
+            "filename": filename,
+            "mime_type": mime_type,
+            "size": len(content),
+            "created_at": now,
+        }
 
     def _associate_auth_key(self, user_id: int) -> None:
         if self.database is None:

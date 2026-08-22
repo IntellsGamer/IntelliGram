@@ -837,10 +837,11 @@ def send_message(
     body: str,
     client_random_id: str,
     reply_to_message_id: int | None = None,
+    media: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
     _require_active_membership(connection, peer_id, sender_user_id)
-    body = body.strip()
-    if not body:
+    body = (body or "").strip()
+    if not body and media is None:
         raise MessagingError("MESSAGE_EMPTY")
     if len(body) > 4096:
         raise MessagingError("MESSAGE_TOO_LONG")
@@ -862,7 +863,7 @@ def send_message(
         (sender_user_id, client_random_id),
     ).fetchone()
     if existing is not None:
-        return _message_row(existing), []
+        return _message_row(existing, connection), []
 
     now = now_unix()
     try:
@@ -876,13 +877,15 @@ def send_message(
     except sqlite3.IntegrityError as exc:
         raise MessagingError("REPLY_MESSAGE_ID_INVALID") from exc
     message_id = int(cursor.lastrowid)
+    if media is not None:
+        _store_message_media(connection, message_id=message_id, media=media)
     row = connection.execute(
         "SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at FROM messages WHERE id = ?",
         (message_id,),
     ).fetchone()
     if row is None:
         raise RuntimeError("Message disappeared after insertion")
-    message = _message_row(row)
+    message = _message_row(row, connection)
 
     members = connection.execute(
         "SELECT user_id FROM peer_memberships WHERE peer_id = ? AND left_at IS NULL", (peer_id,)
@@ -929,7 +932,7 @@ def forward_messages(
         """,
         (source_peer_id, *message_ids),
     ).fetchall()
-    messages_by_id = {int(row["id"]): _message_row(row) for row in source_rows}
+    messages_by_id = {int(row["id"]): _message_row(row, connection) for row in source_rows}
     if len(messages_by_id) != len(set(message_ids)):
         raise MessagingError("MESSAGE_ID_INVALID")
     forwarded: list[dict[str, Any]] = []
@@ -979,7 +982,7 @@ def edit_message(
     ).fetchone()
     if updated is None:
         raise RuntimeError("Edited message disappeared")
-    message = _message_row(updated)
+    message = _message_row(updated, connection)
     emitted = [
         append_update(
             connection,
@@ -1138,7 +1141,7 @@ connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | 
             """,
             (peer_id, before_id, limit),
         ).fetchall()
-    return [_message_row(row) for row in reversed(rows)]
+    return [_message_row(row, connection) for row in reversed(rows)]
 
 
 def get_dialogs(connection: sqlite3.Connection, *, user_id: int, offset: int, limit: int) -> list[dict[str, Any]]:
@@ -1181,8 +1184,47 @@ def get_dialogs(connection: sqlite3.Connection, *, user_id: int, offset: int, li
     ]
 
 
-def _message_row(row: sqlite3.Row) -> dict[str, Any]:
+def _store_message_media(connection: sqlite3.Connection, *, message_id: int, media: dict[str, Any]) -> None:
+    connection.execute(
+        """
+        INSERT INTO message_media(message_id, file_id, kind, filename, mime_type, size, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message_id,
+            int(media["file_id"]),
+            str(media["kind"]),
+            str(media.get("filename") or "attachment"),
+            str(media.get("mime_type") or "application/octet-stream"),
+            int(media.get("size") or 0),
+            int(media.get("date") or now_unix()),
+        ),
+    )
+
+
+def _load_message_media(connection: sqlite3.Connection, message_id: int) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT mm.file_id, mm.kind, mm.filename, mm.mime_type, mm.size, mm.created_at
+        FROM message_media mm
+        WHERE mm.message_id = ?
+        """,
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        return None
     return {
+        "kind": str(row["kind"]),
+        "file_id": int(row["file_id"]),
+        "filename": str(row["filename"]),
+        "mime_type": str(row["mime_type"]),
+        "size": int(row["size"]),
+        "date": int(row["created_at"]),
+    }
+
+
+def _message_row(row: sqlite3.Row, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
+    message = {
         "id": int(row["id"]),
         "peer_id": int(row["peer_id"]),
         "sender_user_id": int(row["sender_user_id"]),
@@ -1192,3 +1234,8 @@ def _message_row(row: sqlite3.Row) -> dict[str, Any]:
         "edited_at": int(row["edited_at"]) if row["edited_at"] is not None else None,
         "deleted_at": int(row["deleted_at"]) if row["deleted_at"] is not None else None,
     }
+    if connection is not None:
+        media = _load_message_media(connection, int(row["id"]))
+        if media is not None:
+            message["media"] = media
+    return message
