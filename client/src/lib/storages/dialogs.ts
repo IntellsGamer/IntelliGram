@@ -492,7 +492,7 @@ export default class DialogsStorage extends AppManager {
     }
 
     if(id === FOLDER_ID_ALL) {
-      this.ensureSelfDialogInRoot();
+      this.reconcileRootDialogs();
     }
 
     const folder = this.getFolder(id);
@@ -789,36 +789,39 @@ export default class DialogsStorage extends AppManager {
   }
 
   /**
-   * Web K normally indexes the account's Saved Messages dialog through the
-   * ordinary folder-0 path. In IntelliGram's durable self-peer model, a
-   * fresh root bootstrap can retain that dialog in `this.dialogs` while the
-   * root folder array remains incomplete. Reconcile the actual storage index
-   * after normal save processing; this is not a separate visual list.
+   * Web K normally indexes every ordinary folder-0 dialog as it is saved.
+   * In IntelliGram's durable model a fresh bootstrap can retain valid dialogs
+   * in `this.dialogs` while the root folder array is incomplete. Reconcile
+   * that real storage projection after normal save processing; this is not a
+   * separate visual list and never changes server data.
    */
-  private ensureSelfDialogInRoot() {
-    const selfPeerId = this.appUsersManager.getSelf().id.toPeerId(false);
-    const dialog = this.getDialogOnly(selfPeerId);
-    if(!dialog || dialog.folder_id !== FOLDER_ID_ALL) {
-      return;
-    }
-
+  private reconcileRootDialogs() {
     const folder = this.getFolder(FOLDER_ID_ALL);
-    if(folder.dialogs.some((item) => item.peerId === selfPeerId)) {
-      return;
-    }
-
+    const filter = this.filtersStorage.getFilter(FOLDER_ID_ALL);
     const indexKey = this.getDialogIndexKeyByFilterId(FOLDER_ID_ALL);
-    let index = this.getDialogIndex(dialog, indexKey);
-    if(index === undefined) {
-      index = this.generateIndexForDialog(dialog, true);
-      setDialogIndex(dialog, indexKey, index);
-    }
 
-    const insertAt = folder.dialogs.findIndex((item) => {
-      const itemIndex = this.getDialogIndex(item, indexKey) ?? this.generateIndexForDialog(item, true);
-      return itemIndex < index;
-    });
-    folder.dialogs.splice(insertAt === -1 ? folder.dialogs.length : insertAt, 0, dialog);
+    for(const dialog of Object.values(this.dialogs)) {
+      if(
+        dialog.folder_id !== FOLDER_ID_ALL ||
+        dialog.migratedTo !== undefined ||
+        !this.filtersStorage.testDialogForFilter(dialog, filter) ||
+        folder.dialogs.some((item) => item.peerId === dialog.peerId)
+      ) {
+        continue;
+      }
+
+      let index = this.getDialogIndex(dialog, indexKey);
+      if(index === undefined) {
+        index = this.generateIndexForDialog(dialog, true);
+        setDialogIndex(dialog, indexKey, index);
+      }
+
+      const insertAt = folder.dialogs.findIndex((item) => {
+        const itemIndex = this.getDialogIndex(item, indexKey) ?? this.generateIndexForDialog(item, true);
+        return itemIndex < index;
+      });
+      folder.dialogs.splice(insertAt === -1 ? folder.dialogs.length : insertAt, 0, dialog);
+    }
   }
 
   public prepareDialogUnreadCountModifying(dialog: AnyDialog, toggle?: boolean) {
@@ -1780,7 +1783,7 @@ export default class DialogsStorage extends AppManager {
     });
 
     if(_isDialog) {
-      this.ensureSelfDialogInRoot();
+      this.reconcileRootDialogs();
     }
 
     if(isTopic) {
