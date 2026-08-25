@@ -491,6 +491,10 @@ export default class DialogsStorage extends AppManager {
       return this.getCachedDialogs(skipMigrated);
     }
 
+    if(id === FOLDER_ID_ALL) {
+      this.ensureSelfDialogInRoot();
+    }
+
     const folder = this.getFolder(id);
     const filterType = this.getFilterType(id);
     if(filterType === FilterType.Forum) {
@@ -782,6 +786,39 @@ export default class DialogsStorage extends AppManager {
     }
 
     return true;
+  }
+
+  /**
+   * Web K normally indexes the account's Saved Messages dialog through the
+   * ordinary folder-0 path. In IntelliGram's durable self-peer model, a
+   * fresh root bootstrap can retain that dialog in `this.dialogs` while the
+   * root folder array remains incomplete. Reconcile the actual storage index
+   * after normal save processing; this is not a separate visual list.
+   */
+  private ensureSelfDialogInRoot() {
+    const selfPeerId = this.appUsersManager.getSelf().id.toPeerId(false);
+    const dialog = this.getDialogOnly(selfPeerId);
+    if(!dialog || dialog.folder_id !== FOLDER_ID_ALL) {
+      return;
+    }
+
+    const folder = this.getFolder(FOLDER_ID_ALL);
+    if(folder.dialogs.some((item) => item.peerId === selfPeerId)) {
+      return;
+    }
+
+    const indexKey = this.getDialogIndexKeyByFilterId(FOLDER_ID_ALL);
+    let index = this.getDialogIndex(dialog, indexKey);
+    if(index === undefined) {
+      index = this.generateIndexForDialog(dialog, true);
+      setDialogIndex(dialog, indexKey, index);
+    }
+
+    const insertAt = folder.dialogs.findIndex((item) => {
+      const itemIndex = this.getDialogIndex(item, indexKey) ?? this.generateIndexForDialog(item, true);
+      return itemIndex < index;
+    });
+    folder.dialogs.splice(insertAt === -1 ? folder.dialogs.length : insertAt, 0, dialog);
   }
 
   public prepareDialogUnreadCountModifying(dialog: AnyDialog, toggle?: boolean) {
@@ -1741,6 +1778,10 @@ export default class DialogsStorage extends AppManager {
       ignoreOffsetDate,
       saveGlobalOffset
     });
+
+    if(_isDialog) {
+      this.ensureSelfDialogInRoot();
+    }
 
     if(isTopic) {
       this.processTopicUpdate(dialog, wasDialogBefore as ForumTopic);

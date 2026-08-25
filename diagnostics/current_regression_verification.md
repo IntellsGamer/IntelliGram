@@ -23,3 +23,37 @@ Because the browser upload bridge cannot target Web K’s hidden attachment inpu
 ## 2026-08-25 — Native voice clean reload
 
 A cache-busting full document reload into Saved Messages cleared the normal Web K in-memory view and rehydrated history from IntelliGram. The same media entry remained a native voice bubble with its play control and **0:02** duration. This confirms the persisted `documentAttributeAudio` metadata is usable after reload. A failed keyboard reload shortcut inserted a single `R` into the controlled composer; it was removed through the active composer’s ordinary input event, and no message was sent by that cleanup.
+
+## 2026-08-25 — Fresh-load dialog-list anomaly
+
+After the browser session reset to `about:blank`, reopening the normal Web K origin produced a clean shell without a white screen. However, the sidebar listed the persisted broadcast channel while **Saved Messages was absent**, despite the controlled account having durable Saved Messages text and voice rows earlier in the session. This is a reproducible-looking dialog hydration/listing anomaly and is under investigation; it must not be treated as a successful fresh-load result.
+
+### Confirmation
+
+A second cache-busting root load was allowed to settle and still showed only the broadcast channel. A cache-busting direct load to `#1` immediately restored Saved Messages, its text history, and native 0:02 voice bubble. The defect is therefore **root dialog-list hydration** rather than data loss or message-history failure.
+
+### Root dialog-list diagnosis
+
+A live raw `messages.getDialogs` request with Web K’s normal `folder_id=0`, empty offsets, and `limit=20` returned `messages.dialogsSlice` with `count=2`, two dialogs (`peerUser(user_id=1)` and `peerChannel(channel_id=2)`), two top messages, one user, and one chat. The server response is structurally complete. The live client dialog store also reports entries for peer IDs `1` and `-2`, while the root visual list renders only the channel. This narrows the defect to Web K’s folder/index classification or UI projection of the stored self dialog; it is not data loss, getDialogs response truncation, or history hydration failure.
+
+### Client-storage inspection note
+
+The page-to-worker bridge exposes `dialogsStorage.getFolderDialogs(...)` as a `Promise`, even though the imported source returns an array in-worker. Two un-awaited probes therefore failed with `map is not a function`; this is a bridge-shape limitation, not new client evidence. The raw server response and visual root omission remain the relevant facts.
+
+### Root folder projection diagnosis
+
+Awaited client inspection shows `getFolderDialogs(0)` contains only the channel. `getDialogOnly(1)` and `getDialogOnly(-2)` both exist and each reports `folder_id=0`; the self top message is finalized (`{out: true, unread: true}`), so temporary-send state is not the cause. The client’s `canSaveDialog` predicate accepts the self user. The page-to-worker bridge does not expose the internal root index values, so no additional conclusion is drawn from that inspection. The visible root omission is confirmed and requires a compatibility repair or a narrowly documented client-side projection adjustment.
+
+### Final root-list diagnostic
+
+Clearing only the controlled client’s local dialog cache and reloading the normal 20-item dialog page still returned one visible channel despite a server count of two. Calling Web K’s own `processDialogForFilter(selfDialog, filter0)` reported `changed=true` but left `getFolderDialogs(0)` with only the channel. This establishes a root self-dialog index/projection quirk in the current client behavior. A narrow Web K source repair is required to assign a visible root index to the self dialog when normal filtering fails.
+
+### Root-list guard retest
+
+After the client guard was built, a fresh root load created a second sidebar row where Saved Messages was previously absent. However, after settling it remained an unlabeled skeleton rather than a usable Saved Messages item. The guard changes the projection state but does not complete entity/title hydration, so this is **not** a verified fix and further diagnosis continues.
+
+### Root dialog-list repair verified
+
+A fresh cache-busting root load in normal SharedWorker mode now visibly renders **both** durable sidebar dialogs: `Saved Messages` (with the expected `Voice message` preview) and `Web K Channel Identity Probe`. Selecting the actual `#1` Saved Messages sidebar row navigated normally and opened its three-message history, including the persisted `0:02` native voice bubble. The repair is a narrow imported-Web-K storage reconciliation: it obtains the canonical self dialog from Web K's own account/dialog stores and inserts it into the real root folder array with a valid normal dialog index, including when a pre-existing root entry lacks an index. This is not a substitute UI or server-data rewrite.
+
+A second independent cache-busting root load after reopening Saved Messages remained visually correct. Its live SharedWorker root folder contained exactly peer `1` (Saved Messages, top message `5`) and peer `-2` (the broadcast channel, top message `4294967300`), both with `folder_id=0`.
