@@ -317,9 +317,24 @@ def get_password_srp_state(
         """,
         (auth_key_id, now),
     ).fetchone()
-    if context is None:
-        raise AccountAuthError("SESSION_PASSWORD_NEEDED")
-    user_id = int(context["user_id"])
+    if context is not None:
+        user_id = int(context["user_id"])
+    else:
+        # A signed-in Web K session also requests account.getPassword while
+        # rendering Privacy and Security. The same durable MTProto key binding
+        # is sufficient proof of account ownership; do not require a recovery
+        # login context for an already authenticated key.
+        binding = connection.execute(
+            """
+            SELECT user_id FROM auth_keys
+            WHERE auth_key_id = ? AND revoked_at IS NULL
+            AND (expires_at IS NULL OR expires_at >= ?)
+            """,
+            (auth_key_id, now),
+        ).fetchone()
+        if binding is None:
+            raise AccountAuthError("SESSION_PASSWORD_NEEDED")
+        user_id = int(binding["user_id"])
     verifier = connection.execute(
         "SELECT salt1, salt2, verifier FROM password_srp_verifiers WHERE user_id = ?",
         (user_id,),

@@ -2962,6 +2962,13 @@ def test_web_k_password_fallback_uses_srp_and_authorizes_over_encrypted_mtproto(
     assert int(challenge["attempts"]) == 1
     assert context is None
 
+    # Privacy and Security requests the same password state from an already
+    # authenticated MTProto key, without another sendCode/login context.
+    reader = invoke(struct.pack("<I", ACCOUNT_GET_PASSWORD_CONSTRUCTOR), 4)
+    assert reader.uint32() == ACCOUNT_PASSWORD_CONSTRUCTOR
+    assert reader.uint32() == 1 << 2
+    assert reader.uint32() == PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR
+
 
 def test_device_login_invalidates_a_six_digit_code_after_five_bad_attempts(tmp_path) -> None:
     """Code delivery remains one-time and invalidates on the documented limit."""
