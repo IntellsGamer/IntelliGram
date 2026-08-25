@@ -356,6 +356,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
                COALESCE(cs.noforwards, 0) AS noforwards,
                COALESCE(cs.join_request_enabled, 0) AS join_request_enabled,
                COALESCE(cs.is_broadcast, 0) AS is_broadcast,
+               COALESCE(cs.signatures_enabled, 0) AS signatures_enabled,
                COALESCE(crs.mode, 'none') AS reaction_mode,
                COALESCE(crs.allow_custom, 0) AS reaction_allow_custom,
                COALESCE(crs.emoticons_json, '[]') AS reaction_emoticons_json
@@ -365,7 +366,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
         LEFT JOIN channel_reaction_settings crs ON crs.peer_id = p.id
         WHERE p.id = ? AND p.kind = 'channel'
         GROUP BY p.id, p.title, p.about, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards,
-                 cs.join_request_enabled, cs.is_broadcast, crs.mode, crs.allow_custom, crs.emoticons_json
+                 cs.join_request_enabled, cs.is_broadcast, cs.signatures_enabled, crs.mode, crs.allow_custom, crs.emoticons_json
         """,
         (channel_id,),
     ).fetchone()
@@ -374,7 +375,7 @@ def get_channel_details(connection: sqlite3.Connection, *, channel_id: int, user
     details = {
         key: (
             int(row[key])
-            if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds", "noforwards", "join_request_enabled", "is_broadcast", "reaction_allow_custom"}
+            if key in {"id", "created_at", "created_by_user_id", "participants_count", "admins_count", "slowmode_seconds", "noforwards", "join_request_enabled", "is_broadcast", "signatures_enabled", "reaction_allow_custom"}
             else row[key]
         )
         for key in row.keys()
@@ -488,6 +489,27 @@ def set_channel_join_request(
     connection.execute(
         "INSERT INTO channel_settings(peer_id, join_request_enabled) VALUES (?, ?) "
         "ON CONFLICT(peer_id) DO UPDATE SET join_request_enabled = excluded.join_request_enabled",
+        (channel_id, int(enabled)),
+    )
+    details = get_channel_details(connection, channel_id=channel_id, user_id=actor_user_id)
+    emitted = [
+        append_update(connection, user_id=member_id, kind="updateChannel", payload={"channel_id": channel_id})
+        for member_id in _active_member_ids(connection, peer_id=channel_id)
+    ]
+    return details, emitted
+
+
+def set_channel_signatures(
+    connection: sqlite3.Connection, *, channel_id: int, actor_user_id: int, enabled: bool
+) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
+    membership = _require_active_membership(connection, channel_id, actor_user_id)
+    if str(membership["kind"]) != "channel":
+        raise MessagingError("CHANNEL_INVALID")
+    if str(membership["role"]) not in {"owner", "admin"}:
+        raise MessagingError("CHAT_ADMIN_REQUIRED")
+    connection.execute(
+        "INSERT INTO channel_settings(peer_id, signatures_enabled) VALUES (?, ?) "
+        "ON CONFLICT(peer_id) DO UPDATE SET signatures_enabled = excluded.signatures_enabled",
         (channel_id, int(enabled)),
     )
     details = get_channel_details(connection, channel_id=channel_id, user_id=actor_user_id)

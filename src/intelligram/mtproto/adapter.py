@@ -65,6 +65,7 @@ from intelligram.services.messaging import (
     set_channel_join_request,
     set_channel_reactions,
     set_channel_slow_mode,
+    set_channel_signatures,
     update_channel_username,
     read_history,
     send_message,
@@ -401,6 +402,12 @@ class MTProtoSessionAdapter:
         if request.name == "channels_toggle_slow_mode":
             return self._handle_channels_toggle_slow_mode(
                 message, channel=request.fields["channel"], seconds=int(request.fields["seconds"])
+            )
+        if request.name == "channels_toggle_signatures":
+            return self._handle_channels_toggle_signatures(
+                message,
+                channel=request.fields["channel"],
+                enabled=bool(request.fields["signatures_enabled"]),
             )
         if request.name == "channels_toggle_join_request":
             return self._handle_channels_toggle_join_request(
@@ -1036,13 +1043,14 @@ class MTProtoSessionAdapter:
                    COALESCE(cs.noforwards, 0) AS noforwards,
                    COALESCE(cs.join_request_enabled, 0) AS join_request_enabled,
                    COALESCE(cs.is_broadcast, 0) AS is_broadcast,
+                   COALESCE(cs.signatures_enabled, 0) AS signatures_enabled,
                    pp.default_banned_rights_flags
             FROM peers p
             JOIN peer_memberships pm ON pm.peer_id = p.id AND pm.left_at IS NULL
             LEFT JOIN channel_settings cs ON cs.peer_id = p.id
             LEFT JOIN peer_permissions pp ON pp.peer_id = p.id
             WHERE p.kind IN ('chat', 'channel') AND p.id IN ({placeholders})
-            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, cs.join_request_enabled, cs.is_broadcast, pp.default_banned_rights_flags
+            GROUP BY p.id, p.kind, p.title, p.username, p.created_at, p.created_by_user_id, cs.slowmode_seconds, cs.noforwards, cs.join_request_enabled, cs.is_broadcast, cs.signatures_enabled, pp.default_banned_rights_flags
             ORDER BY p.id
             """,
             sorted(chat_ids),
@@ -1059,6 +1067,7 @@ class MTProtoSessionAdapter:
                 noforwards=bool(int(row["noforwards"])),
                 join_request_enabled=bool(int(row["join_request_enabled"])),
                 broadcast=bool(int(row["is_broadcast"])),
+                signatures=bool(int(row["signatures_enabled"])),
                 default_banned_rights_flags=(
                     int(row["default_banned_rights_flags"])
                     if row["default_banned_rights_flags"] is not None else None
@@ -1934,6 +1943,7 @@ class MTProtoSessionAdapter:
             noforwards=bool(int(channel["noforwards"])),
             join_request_enabled=bool(int(channel["join_request_enabled"])),
             broadcast=bool(int(channel.get("is_broadcast") or 0)),
+            signatures=bool(int(channel.get("signatures_enabled") or 0)),
         )
         return encode_updates(
             updates=[encode_update_channel(channel_id=int(channel["id"]))],
@@ -2451,6 +2461,27 @@ class MTProtoSessionAdapter:
                 )
                 self.pending_update_envelopes.extend(emitted)
                 result = encode_bool(True)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_channels_toggle_signatures(
+        self, message: EncryptedMessage, *, channel: dict[str, object], enabled: bool
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            channel_id = self._validate_input_channel(channel)
+            with database.transaction(immediate=True) as connection:
+                details, emitted = set_channel_signatures(
+                    connection, channel_id=channel_id, actor_user_id=self_user_id, enabled=enabled
+                )
+                self.pending_update_envelopes.extend(emitted)
+                result = self._channel_updates_result(
+                    connection=connection, self_user_id=self_user_id, channel=details, emitted=emitted
+                )
         except MessagingError as exc:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(message, result)

@@ -201,6 +201,7 @@ INPUT_CHAT_UPLOADED_PHOTO_CONSTRUCTOR = 0xBDCDAEC0  # -1110593856
 INPUT_CHAT_PHOTO_CONSTRUCTOR = 0x8953AD37  # -1991004873
 CHANNELS_TOGGLE_SLOW_MODE_CONSTRUCTOR = 0xEDD49EF0
 CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR = 0x0ECC2618
+CHANNELS_TOGGLE_SIGNATURES_CONSTRUCTOR = 0x418D549C
 MESSAGES_EDIT_CHAT_DEFAULT_BANNED_RIGHTS_CONSTRUCTOR = 0xA5866B41
 CHAT_BANNED_RIGHTS_CONSTRUCTOR = 0x9F120418
 MESSAGES_SET_CHAT_AVAILABLE_REACTIONS_CONSTRUCTOR = 0x864B2581
@@ -1068,6 +1069,15 @@ def parse_request(data: bytes) -> TLRequest:
             "channel": _read_input_channel(reader),
             "seconds": reader.int32(),
         })
+    elif constructor_id == CHANNELS_TOGGLE_SIGNATURES_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b11:
+            raise TLDecodeError("Unsupported channels.toggleSignatures flags")
+        request = TLRequest(constructor_id, "channels_toggle_signatures", {
+            "signatures_enabled": bool(flags & 1),
+            "profiles_enabled": bool(flags & 2),
+            "channel": _read_input_channel(reader),
+        })
     elif constructor_id == CHANNELS_TOGGLE_JOIN_REQUEST_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b11:
@@ -1791,6 +1801,7 @@ def encode_channel(
     join_request_enabled: bool = False,
     default_banned_rights_flags: int | None = None,
     broadcast: bool = False,
+    signatures: bool = False,
 ) -> bytes:
     flags = (1 << 13) | (1 << 17)
     if broadcast:
@@ -1801,6 +1812,8 @@ def encode_channel(
         flags |= 1
     if username:
         flags |= 1 << 6
+    if signatures:
+        flags |= 1 << 11
     if slowmode_enabled:
         flags |= 1 << 22
     if noforwards:

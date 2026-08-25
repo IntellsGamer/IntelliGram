@@ -136,7 +136,8 @@ class Database:
                     slowmode_seconds INTEGER NOT NULL DEFAULT 0 CHECK(slowmode_seconds IN (0, 5, 10, 30, 60, 300, 900, 3600)),
                     noforwards INTEGER NOT NULL DEFAULT 0 CHECK(noforwards IN (0, 1)),
                     join_request_enabled INTEGER NOT NULL DEFAULT 0 CHECK(join_request_enabled IN (0, 1)),
-                    is_broadcast INTEGER NOT NULL DEFAULT 0 CHECK(is_broadcast IN (0, 1))
+                    is_broadcast INTEGER NOT NULL DEFAULT 0 CHECK(is_broadcast IN (0, 1)),
+                    signatures_enabled INTEGER NOT NULL DEFAULT 0 CHECK(signatures_enabled IN (0, 1))
                 );
 
                 CREATE TABLE IF NOT EXISTS peer_permissions (
@@ -328,6 +329,8 @@ class Database:
                 connection.execute("ALTER TABLE channel_settings ADD COLUMN join_request_enabled INTEGER NOT NULL DEFAULT 0")
             if "is_broadcast" not in channel_settings_columns:
                 connection.execute("ALTER TABLE channel_settings ADD COLUMN is_broadcast INTEGER NOT NULL DEFAULT 0")
+            if "signatures_enabled" not in channel_settings_columns:
+                connection.execute("ALTER TABLE channel_settings ADD COLUMN signatures_enabled INTEGER NOT NULL DEFAULT 0")
             peer_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(peers)").fetchall()
