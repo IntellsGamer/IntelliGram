@@ -134,6 +134,7 @@ CHANNEL_CONSTRUCTOR = 0xD49F34C6
 CHANNEL_FULL_CONSTRUCTOR = 0xA04E8D3A
 CHAT_PHOTO_EMPTY_CONSTRUCTOR = 0x37C1011C
 PHOTO_EMPTY_CONSTRUCTOR = 0x2331B22D
+USER_PROFILE_PHOTO_CONSTRUCTOR = 0x82D1F706
 MESSAGES_INVITED_USERS_CONSTRUCTOR = 0x7F5DEFA6
 MESSAGES_CREATE_CHAT_CONSTRUCTOR = 0x92CEDDD4
 ACCOUNT_UPDATE_PROFILE_CONSTRUCTOR = 0x78515775
@@ -147,6 +148,7 @@ PHOTO_SIZE_CONSTRUCTOR = 0x75C78E60
 PHOTOS_PHOTO_CONSTRUCTOR = 0x20212CA8
 UPLOAD_GET_FILE_CONSTRUCTOR = 0xBE5335BE
 INPUT_PHOTO_FILE_LOCATION_CONSTRUCTOR = 0x40181FFE
+INPUT_PEER_PHOTO_FILE_LOCATION_CONSTRUCTOR = 0x37257E99
 STORAGE_FILE_UNKNOWN_CONSTRUCTOR = 0xAA963B05
 UPLOAD_FILE_CONSTRUCTOR = 0x096A18D5
 UPDATES_GET_DIFFERENCE_CONSTRUCTOR = 0x19C2F763
@@ -600,6 +602,14 @@ def _read_input_file_location(reader: TLReader) -> dict[str, Any]:
             "access_hash": reader.int64(),
             "file_reference": reader.bytes(),
             "thumb_size": reader.bytes().decode("utf-8"),
+        }
+    if constructor_id == INPUT_PEER_PHOTO_FILE_LOCATION_CONSTRUCTOR:
+        flags = reader.uint32()
+        return {
+            "kind": "peer_photo",
+            "big": bool(flags & 1),
+            "peer": _read_input_peer(reader),
+            "photo_id": reader.int64(),
         }
     if constructor_id == INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR:
         return {
@@ -1536,12 +1546,24 @@ def encode_user_empty(*, user_id: int) -> bytes:
     return encode_uint32(USER_EMPTY_CONSTRUCTOR) + encode_int64(user_id)
 
 
+def encode_user_profile_photo(*, photo_id: int, dc_id: int = 1) -> bytes:
+    """Encode the Layer 228 metadata required to resolve a user's profile photo."""
+
+    return (
+        encode_uint32(USER_PROFILE_PHOTO_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int64(photo_id)
+        + encode_int32(dc_id)
+    )
+
+
 def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contact: bool = False) -> bytes:
     user_id = int(user["id"])
     first_name = str(user.get("first_name") or "")
     last_name = str(user.get("last_name") or "")
     username = user.get("username")
     phone = user.get("phone")
+    profile_photo_id = user.get("profile_photo_id")
     flags = 1  # access_hash
     if first_name:
         flags |= 1 << 1
@@ -1551,6 +1573,8 @@ def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contac
         flags |= 1 << 3
     if phone:
         flags |= 1 << 4
+    if profile_photo_id is not None:
+        flags |= 1 << 5
     if self_user_id == user_id:
         flags |= 1 << 10
     elif contact:
@@ -1570,6 +1594,8 @@ def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contac
         result += encode_tl_string(str(username))
     if flags & (1 << 4):
         result += encode_tl_string(str(phone))
+    if flags & (1 << 5):
+        result += encode_user_profile_photo(photo_id=int(profile_photo_id))
     return result
 
 
@@ -1610,7 +1636,9 @@ def encode_photo_size(*, type_: str, width: int, height: int, size: int) -> byte
     )
 
 
-def encode_photo(*, photo_id: int, file_reference: bytes, date: int, size: int, dc_id: int = 1) -> bytes:
+def encode_photo(
+    *, photo_id: int, file_reference: bytes, date: int, size: int, dc_id: int = 1, width: int = 0, height: int = 0,
+) -> bytes:
     return (
         encode_uint32(PHOTO_CONSTRUCTOR)
         + encode_uint32(0)
@@ -1618,7 +1646,7 @@ def encode_photo(*, photo_id: int, file_reference: bytes, date: int, size: int, 
         + encode_int64((photo_id << 32) | 1)
         + encode_tl_bytes(file_reference)
         + encode_int32(date)
-        + encode_vector([encode_photo_size(type_="m", width=0, height=0, size=size)])
+        + encode_vector([encode_photo_size(type_="m", width=width, height=height, size=size)])
         + encode_int32(dc_id)
     )
 

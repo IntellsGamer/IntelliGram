@@ -842,16 +842,21 @@ def test_web_k_profile_photo_upload_assembles_staged_file_parts(tmp_path) -> Non
     from intelligram.mtproto.tl import (
         BOOL_TRUE_CONSTRUCTOR,
         INPUT_FILE_CONSTRUCTOR,
+        INPUT_USER_SELF_CONSTRUCTOR,
         PHOTOS_PHOTO_CONSTRUCTOR,
         PHOTOS_UPLOAD_PROFILE_PHOTO_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
         UPLOAD_SAVE_FILE_PART_CONSTRUCTOR,
+        USER_CONSTRUCTOR,
+        USER_PROFILE_PHOTO_CONSTRUCTOR,
+        USERS_GET_USERS_CONSTRUCTOR,
         encode_int32,
         encode_int64,
         encode_tl_bytes,
         encode_tl_string,
         encode_uint32,
+        encode_vector,
     )
     from intelligram.services.accounts import register_password_account
 
@@ -916,6 +921,35 @@ def test_web_k_profile_photo_upload_assembles_staged_file_parts(tmp_path) -> Non
     assert photo["filename"] == "avatar.png"
     assert bytes(photo["content"]) == content
     assert user is not None and user["profile_photo_id"] is not None
+    profile_photo_id = int(user["profile_photo_id"])
+
+    users_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 8,
+        seq_no=5,
+        body=encode_uint32(USERS_GET_USERS_CONSTRUCTOR) + encode_vector([encode_uint32(INPUT_USER_SELF_CONSTRUCTOR)]),
+    ))
+    assert users_response is not None
+    _, _, _, _, users_body = _decrypt_server(auth_key, users_response)
+    user_reader = TLReader(users_body)
+    assert user_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert user_reader.int64() == message_id + 8
+    assert user_reader.vector_count() == 1
+    assert user_reader.uint32() == USER_CONSTRUCTOR
+    flags = user_reader.uint32()
+    assert flags & (1 << 5)
+    assert flags & (1 << 10)
+    assert user_reader.uint32() == 0  # flags2
+    assert user_reader.int64() == issued.user_id
+    user_reader.int64()  # access_hash
+    assert user_reader.bytes() == b"Photo"
+    assert user_reader.bytes() == b"+15550000141"
+    assert user_reader.uint32() == USER_PROFILE_PHOTO_CONSTRUCTOR
+    assert user_reader.uint32() == 0  # profile-photo flags
+    assert user_reader.int64() == profile_photo_id
+    assert user_reader.int32() == 1  # dc_id
 
 
 def test_web_k_upload_get_file_returns_persisted_profile_photo_bytes(tmp_path) -> None:

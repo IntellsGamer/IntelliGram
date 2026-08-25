@@ -897,7 +897,7 @@ class MTProtoSessionAdapter:
             raise RuntimeError("Database is required for a signed-in user")
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT id, phone, username, first_name, last_name, about FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         if row is None:
@@ -964,7 +964,7 @@ class MTProtoSessionAdapter:
             return {}
         placeholders = ",".join("?" for _ in user_ids)
         rows = connection.execute(
-            f"SELECT id, phone, username, first_name, last_name, about FROM users WHERE id IN ({placeholders})",
+            f"SELECT id, phone, username, first_name, last_name, about, profile_photo_id FROM users WHERE id IN ({placeholders})",
             sorted(user_ids),
         ).fetchall()
         return {int(row["id"]): dict(row) for row in rows}
@@ -1112,23 +1112,44 @@ class MTProtoSessionAdapter:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
             return authenticated
-        database, _self_user_id = authenticated
-        if not isinstance(location, dict) or location.get("kind") not in {"photo", "document"}:
+        database, self_user_id = authenticated
+        if not isinstance(location, dict):
+            return self._encrypt_rpc_error(message, "LOCATION_INVALID")
+        location_kind = str(location.get("kind") or "")
+        if location_kind not in {"photo", "document", "peer_photo"}:
             return self._encrypt_rpc_error(message, "LOCATION_INVALID")
         file_id = int(location.get("photo_id") or location.get("document_id") or 0)
-        expected_access_hash = (file_id << 32) | 1
-        if file_id <= 0 or int(location.get("access_hash", 0)) != expected_access_hash:
+        if file_id <= 0:
             return self._encrypt_rpc_error(message, "FILE_REFERENCE_INVALID")
         if offset < 0 or limit <= 0 or limit > 1_048_576:
             return self._encrypt_rpc_error(message, "OFFSET_INVALID")
         with database.transaction() as connection:
-            stored = connection.execute(
-                "SELECT content, created_at FROM profile_photos WHERE id = ?", (file_id,)
-            ).fetchone()
-            if stored is None:
+            if location_kind == "peer_photo":
+                peer = location.get("peer")
+                if not isinstance(peer, dict):
+                    return self._encrypt_rpc_error(message, "LOCATION_INVALID")
+                peer_kind = str(peer.get("kind") or "")
+                if peer_kind == "self":
+                    profile_user_id = self_user_id
+                elif peer_kind == "user":
+                    profile_user_id = int(peer.get("user_id") or 0)
+                else:
+                    return self._encrypt_rpc_error(message, "LOCATION_INVALID")
                 stored = connection.execute(
-                    "SELECT content, created_at FROM stored_files WHERE id = ?", (file_id,)
+                    "SELECT content, created_at FROM profile_photos WHERE id = ? AND user_id = ?",
+                    (file_id, profile_user_id),
                 ).fetchone()
+            else:
+                expected_access_hash = (file_id << 32) | 1
+                if int(location.get("access_hash", 0)) != expected_access_hash:
+                    return self._encrypt_rpc_error(message, "FILE_REFERENCE_INVALID")
+                stored = connection.execute(
+                    "SELECT content, created_at FROM profile_photos WHERE id = ?", (file_id,)
+                ).fetchone()
+                if stored is None:
+                    stored = connection.execute(
+                        "SELECT content, created_at FROM stored_files WHERE id = ?", (file_id,)
+                    ).fetchone()
         if stored is None:
             return self._encrypt_rpc_error(message, "LOCATION_INVALID")
         content = bytes(stored["content"])[offset:offset + limit]
@@ -1210,7 +1231,10 @@ class MTProtoSessionAdapter:
             file_reference=f"intelligram-photo:{photo_id}".encode("ascii"),
             date=now,
             size=len(content),
+            width=320,
+            height=320,
         )
+
         return self._encrypt_result(message, encode_photos_photo(photo=encoded_photo, users=[]))
 
     def _handle_account_update_profile(
@@ -1246,7 +1270,7 @@ class MTProtoSessionAdapter:
                     [*updates.values(), int(time.time()), self_user_id],
                 )
             user = connection.execute(
-                "SELECT id, phone, username, first_name, last_name, about FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id FROM users WHERE id = ?",
                 (self_user_id,),
             ).fetchone()
         if user is None:
