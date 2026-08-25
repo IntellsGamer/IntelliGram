@@ -659,6 +659,8 @@ def _read_document_attribute(reader: TLReader) -> dict[str, Any]:
     if constructor_id == DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR:
         flags = reader.uint32()
         attribute = {"kind": "audio", "duration": reader.int32()}
+        if flags & (1 << 10):
+            attribute["voice"] = True
         if flags & 1:
             attribute["title"] = reader.bytes().decode("utf-8")
         if flags & 2:
@@ -1918,8 +1920,39 @@ def encode_document_attribute_filename(*, file_name: str) -> bytes:
     return encode_uint32(DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR) + encode_tl_string(file_name)
 
 
+def encode_document_attribute_audio(*, attribute: dict[str, Any]) -> bytes:
+    """Encode Layer 228 documentAttributeAudio, including the voice-note bit."""
+
+    flags = 0
+    title = attribute.get("title")
+    performer = attribute.get("performer")
+    waveform = attribute.get("waveform")
+    if attribute.get("voice"):
+        flags |= 1 << 10
+    if isinstance(title, str) and title:
+        flags |= 1
+    if isinstance(performer, str) and performer:
+        flags |= 1 << 1
+    if isinstance(waveform, bytes) and waveform:
+        flags |= 1 << 2
+    return (
+        encode_uint32(DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_int32(max(0, int(attribute.get("duration") or 0)))
+        + (encode_tl_string(title) if flags & 1 else b"")
+        + (encode_tl_string(performer) if flags & (1 << 1) else b"")
+        + (encode_tl_bytes(waveform) if flags & (1 << 2) else b"")
+    )
+
+
 def encode_document(*, media: dict[str, Any]) -> bytes:
     file_id = int(media["file_id"])
+    attributes = [
+        encode_document_attribute_filename(file_name=str(media.get("filename") or "attachment")),
+    ]
+    for attribute in media.get("attributes") or []:
+        if isinstance(attribute, dict) and attribute.get("kind") == "audio":
+            attributes.append(encode_document_attribute_audio(attribute=attribute))
     return (
         encode_uint32(DOCUMENT_CONSTRUCTOR)
         + encode_uint32(0)
@@ -1930,9 +1963,7 @@ def encode_document(*, media: dict[str, Any]) -> bytes:
         + encode_tl_string(str(media.get("mime_type") or "application/octet-stream"))
         + encode_int64(int(media.get("size") or 0))
         + encode_int32(1)
-        + encode_vector([
-            encode_document_attribute_filename(file_name=str(media.get("filename") or "attachment")),
-        ])
+        + encode_vector(attributes)
     )
 
 
@@ -1963,7 +1994,13 @@ def encode_message_media(media: dict[str, Any] | None) -> bytes | None:
     return None
 
 
-def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: bool) -> bytes:
+def encode_message(
+    *,
+    message: dict[str, Any],
+    recipient_peer: bytes,
+    outgoing: bool,
+    sender_peer: bytes | None = None,
+) -> bytes:
     reply_to_message_id = message.get("reply_to_message_id")
     edited_at = message.get("edited_at")
     encoded_media = encode_message_media(message.get("media") if isinstance(message.get("media"), dict) else None)
@@ -1979,7 +2016,7 @@ def encode_message(*, message: dict[str, Any], recipient_peer: bytes, outgoing: 
         + encode_uint32(flags)
         + encode_uint32(0)  # flags2
         + encode_int32(int(message["id"]))
-        + encode_peer_user(user_id=int(message["sender_user_id"]))
+        + (sender_peer if sender_peer is not None else encode_peer_user(user_id=int(message["sender_user_id"])))
         + recipient_peer
         + (encode_message_reply_header(reply_to_message_id=int(reply_to_message_id)) if reply_to_message_id is not None else b"")
         + encode_int32(int(message["sent_at"]))

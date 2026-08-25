@@ -245,7 +245,8 @@ class Database:
                     filename TEXT NOT NULL,
                     mime_type TEXT NOT NULL,
                     size INTEGER NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    attributes_json TEXT NOT NULL DEFAULT '[]'
                 );
 
                 CREATE INDEX IF NOT EXISTS profile_photos_user_created_idx
@@ -344,6 +345,12 @@ class Database:
             }
             if "user_id" not in upload_part_columns:
                 connection.execute("ALTER TABLE upload_parts ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+            message_media_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(message_media)").fetchall()
+            }
+            if "attributes_json" not in message_media_columns:
+                connection.execute("ALTER TABLE message_media ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '[]'")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import json
 import re
 import secrets
@@ -1392,11 +1393,48 @@ def get_dialogs(connection: sqlite3.Connection, *, user_id: int, offset: int, li
     ]
 
 
+def _stored_media_attributes(media: dict[str, Any]) -> str:
+    """Serialize safe document attributes while preserving binary waveforms."""
+
+    stored: list[dict[str, Any]] = []
+    for attribute in media.get("attributes") or []:
+        if not isinstance(attribute, dict):
+            continue
+        item = dict(attribute)
+        waveform = item.pop("waveform", None)
+        if isinstance(waveform, bytes):
+            item["waveform_b64"] = base64.b64encode(waveform).decode("ascii")
+        stored.append(item)
+    return json.dumps(stored, separators=(",", ":"), sort_keys=True)
+
+
+def _loaded_media_attributes(value: object) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    attributes: list[dict[str, Any]] = []
+    for candidate in parsed:
+        if not isinstance(candidate, dict):
+            continue
+        item = dict(candidate)
+        waveform_b64 = item.pop("waveform_b64", None)
+        if isinstance(waveform_b64, str):
+            try:
+                item["waveform"] = base64.b64decode(waveform_b64.encode("ascii"), validate=True)
+            except (ValueError, UnicodeError):
+                pass
+        attributes.append(item)
+    return attributes
+
+
 def _store_message_media(connection: sqlite3.Connection, *, message_id: int, media: dict[str, Any]) -> None:
     connection.execute(
         """
-        INSERT INTO message_media(message_id, file_id, kind, filename, mime_type, size, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO message_media(message_id, file_id, kind, filename, mime_type, size, created_at, attributes_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             message_id,
@@ -1406,6 +1444,7 @@ def _store_message_media(connection: sqlite3.Connection, *, message_id: int, med
             str(media.get("mime_type") or "application/octet-stream"),
             int(media.get("size") or 0),
             int(media.get("date") or now_unix()),
+            _stored_media_attributes(media),
         ),
     )
 
@@ -1413,7 +1452,7 @@ def _store_message_media(connection: sqlite3.Connection, *, message_id: int, med
 def _load_message_media(connection: sqlite3.Connection, message_id: int) -> dict[str, Any] | None:
     row = connection.execute(
         """
-        SELECT mm.file_id, mm.kind, mm.filename, mm.mime_type, mm.size, mm.created_at
+        SELECT mm.file_id, mm.kind, mm.filename, mm.mime_type, mm.size, mm.created_at, mm.attributes_json
         FROM message_media mm
         WHERE mm.message_id = ?
         """,
@@ -1428,6 +1467,7 @@ def _load_message_media(connection: sqlite3.Connection, message_id: int) -> dict
         "mime_type": str(row["mime_type"]),
         "size": int(row["size"]),
         "date": int(row["created_at"]),
+        "attributes": _loaded_media_attributes(row["attributes_json"]),
     }
 
 

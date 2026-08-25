@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import base64
+import json
 import logging
 import secrets
 import time
@@ -625,11 +626,10 @@ class MTProtoSessionAdapter:
                                 peer_id=int(stored["peer_id"]),
                                 user_id=self_user_id,
                             )
-                            recipient_peer = self._encode_peer(summary)
                             encoded_messages.append(
-                                encode_message(
-                                    message=stored,
-                                    recipient_peer=recipient_peer,
+                                self._encode_stored_message(
+                                    stored=stored,
+                                    summary=summary,
                                     outgoing=bool(envelope.payload.get("is_outgoing")),
                                 )
                             )
@@ -653,9 +653,9 @@ class MTProtoSessionAdapter:
                                 peer_id=int(stored["peer_id"]),
                                 user_id=self_user_id,
                             )
-                            encoded = encode_message(
-                                message=stored,
-                                recipient_peer=self._encode_peer(summary),
+                            encoded = self._encode_stored_message(
+                                stored=stored,
+                                summary=summary,
                                 outgoing=bool(envelope.payload.get("is_outgoing")),
                             )
                             if str(summary.get("kind")) == "channel":
@@ -906,13 +906,30 @@ class MTProtoSessionAdapter:
     def _load_row_media(connection: object, message_id: int) -> dict[str, object] | None:
         row = connection.execute(
             """
-            SELECT file_id, kind, filename, mime_type, size, created_at
+            SELECT file_id, kind, filename, mime_type, size, created_at, attributes_json
             FROM message_media WHERE message_id = ?
             """,
             (message_id,),
         ).fetchone()
         if row is None:
             return None
+        attributes: list[dict[str, object]] = []
+        try:
+            raw_attributes = json.loads(str(row["attributes_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw_attributes = []
+        if isinstance(raw_attributes, list):
+            for candidate in raw_attributes:
+                if not isinstance(candidate, dict):
+                    continue
+                attribute = dict(candidate)
+                waveform_b64 = attribute.pop("waveform_b64", None)
+                if isinstance(waveform_b64, str):
+                    try:
+                        attribute["waveform"] = base64.b64decode(waveform_b64.encode("ascii"), validate=True)
+                    except (ValueError, UnicodeError):
+                        pass
+                attributes.append(attribute)
         return {
             "kind": str(row["kind"]),
             "file_id": int(row["file_id"]),
@@ -920,6 +937,7 @@ class MTProtoSessionAdapter:
             "mime_type": str(row["mime_type"]),
             "size": int(row["size"]),
             "date": int(row["created_at"]),
+            "attributes": attributes,
         }
 
     @staticmethod
@@ -975,6 +993,28 @@ class MTProtoSessionAdapter:
         if kind == "channel":
             return encode_peer_channel(channel_id=int(summary["peer_id"]))
         raise MessagingError("PEER_ID_INVALID")
+
+    def _encode_stored_message(
+        self,
+        *,
+        stored: dict[str, object],
+        summary: dict[str, object],
+        outgoing: bool,
+    ) -> bytes:
+        """Encode a durable message with its correct public sender identity.
+
+        A broadcast-channel post remains attributable to its acting user in
+        SQLite for authorization and auditing, but Layer 228 must expose the
+        channel as ``from_id``. Otherwise Web K renders that post as ``You``.
+        """
+
+        is_channel = str(summary.get("kind")) == "channel"
+        return encode_message(
+            message=stored,
+            recipient_peer=self._encode_peer(summary),
+            outgoing=outgoing and not is_channel,
+            sender_peer=encode_peer_channel(channel_id=int(summary["peer_id"])) if is_channel else None,
+        )
 
     def _encode_users(self, users: dict[int, dict[str, object]], *, self_user_id: int) -> list[bytes]:
         return [
@@ -1278,9 +1318,9 @@ class MTProtoSessionAdapter:
                     stored = self._message_from_row(row, connection)
                     user_ids.add(int(stored["sender_user_id"]))
                     encoded_messages.append(
-                        encode_message(
-                            message=stored,
-                            recipient_peer=peer,
+                        self._encode_stored_message(
+                            stored=stored,
+                            summary=dialog,
                             outgoing=int(stored["sender_user_id"]) == self_user_id,
                         )
                     )
@@ -1429,9 +1469,9 @@ class MTProtoSessionAdapter:
                 actor_update = next((item for item in emitted if item.user_id == self_user_id), None)
                 if actor_update is None:
                     raise RuntimeError("Message edit produced no actor update")
-                encoded_message = encode_message(
-                    message=stored,
-                    recipient_peer=self._encode_peer(summary),
+                encoded_message = self._encode_stored_message(
+                    stored=stored,
+                    summary=summary,
                     outgoing=True,
                 )
                 user_ids = {self_user_id, int(stored["sender_user_id"])}
@@ -1499,18 +1539,31 @@ class MTProtoSessionAdapter:
                 ]
                 if any(item is None for item in sender_updates):
                     raise RuntimeError("Forwarding produced no sender update")
-                encoded_peer = self._encode_peer(destination_summary)
                 updates: list[bytes] = []
+                destination_is_channel = str(destination_summary.get("kind")) == "channel"
                 for stored, random_id, sender_update in zip(forwarded, random_ids, sender_updates, strict=True):
                     assert sender_update is not None
-                    encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
-                    updates.extend([
-                        encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
-                        encode_update_new_message(
+                    encoded_message = self._encode_stored_message(
+                        stored=stored,
+                        summary=destination_summary,
+                        outgoing=True,
+                    )
+                    message_update = (
+                        encode_update_new_channel_message(
                             message=encoded_message,
                             pts=sender_update.pts - sender_update.pts_count,
                             pts_count=0,
-                        ),
+                        )
+                        if destination_is_channel
+                        else encode_update_new_message(
+                            message=encoded_message,
+                            pts=sender_update.pts - sender_update.pts_count,
+                            pts_count=0,
+                        )
+                    )
+                    updates.extend([
+                        encode_update_message_id(message_id=int(stored["id"]), random_id=random_id),
+                        message_update,
                     ])
                 user_ids = {self_user_id}
                 chat_ids: set[int] = set()
@@ -2436,7 +2489,8 @@ class MTProtoSessionAdapter:
                             message=encode_message(
                                 message=anchor,
                                 recipient_peer=encode_peer_channel(channel_id=channel_id),
-                                outgoing=True,
+                                outgoing=False,
+                                sender_peer=encode_peer_channel(channel_id=channel_id),
                             ),
                             pts=owner_update.pts,
                             pts_count=owner_update.pts_count,
@@ -2882,7 +2936,6 @@ class MTProtoSessionAdapter:
                     before_id=offset_id if offset_id > 0 else None,
                     limit=min(max(limit, 1), 100),
                 )
-                encoded_peer = self._encode_peer(summary)
                 user_ids = {self_user_id, *(int(item["sender_user_id"]) for item in stored_messages)}
                 if summary.get("direct_user_id") is not None:
                     user_ids.add(int(summary["direct_user_id"]))
@@ -2893,9 +2946,9 @@ class MTProtoSessionAdapter:
                     self_user_id=self_user_id,
                 )
                 encoded_messages = [
-                    encode_message(
-                        message=stored,
-                        recipient_peer=encoded_peer,
+                    self._encode_stored_message(
+                        stored=stored,
+                        summary=summary,
                         outgoing=int(stored["sender_user_id"]) == self_user_id,
                     )
                     for stored in stored_messages
@@ -3121,13 +3174,30 @@ class MTProtoSessionAdapter:
         )
         sender_update = next((update for update in emitted if update.user_id == self_user_id), None)
         if sender_update is None:
-            raise RuntimeError("Sender update was not emitted")
-        encoded_peer = self._encode_peer(summary)
+            # A repeat of the same client random_id is a valid MTProto retry:
+            # storage returns the already-durable message and emits no second
+            # update. Acknowledge that stable message instead of converting the
+            # retry into a transport failure that Web K will retry again.
+            state = get_state(connection, self_user_id)
+            response_pts = int(state["pts"])
+            response_date = int(state["date"])
+            response_seq = int(state["seq"])
+        else:
+            # Web K clears the temporary optimistic bubble when the immediate
+            # mapping/final message use the pre-send PTS. The durable ledger
+            # keeps the real increment for getDifference and reconnects.
+            response_pts = sender_update.pts - sender_update.pts_count
+            response_date = sender_update.date
+            response_seq = sender_update.seq
         user_ids = {self_user_id, int(stored["sender_user_id"])}
         if summary.get("direct_user_id") is not None:
             user_ids.add(int(summary["direct_user_id"]))
         users = self._load_users(connection, user_ids)
-        encoded_message = encode_message(message=stored, recipient_peer=encoded_peer, outgoing=True)
+        encoded_message = self._encode_stored_message(
+            stored=stored,
+            summary=summary,
+            outgoing=True,
+        )
         encoded_chats = self._encode_chats(
             connection,
             chat_ids={int(summary["peer_id"])} if str(summary.get("kind")) in {"chat", "channel"} else set(),
@@ -3136,15 +3206,16 @@ class MTProtoSessionAdapter:
         new_message_update = (
             encode_update_new_channel_message(
                 message=encoded_message,
-                pts=sender_update.pts,
-                pts_count=sender_update.pts_count,
+                pts=response_pts,
+                pts_count=0,
             )
             if str(summary.get("kind")) == "channel"
             else encode_update_new_message(
                 message=encoded_message,
-                pts=sender_update.pts,
-                pts_count=sender_update.pts_count,
+                pts=response_pts,
+                pts_count=0,
             )
+
         )
         return self._encrypt_result(
             message,
@@ -3155,8 +3226,8 @@ class MTProtoSessionAdapter:
                 ],
                 users=self._encode_users(users, self_user_id=self_user_id),
                 chats=encoded_chats,
-                date=sender_update.date,
-                seq=sender_update.seq,
+                date=response_date,
+                seq=response_seq,
             ),
         )
 
@@ -3178,6 +3249,11 @@ class MTProtoSessionAdapter:
                 if isinstance(attribute, dict) and attribute.get("kind") == "filename" and attribute.get("file_name"):
                     filename = str(attribute["file_name"])
                     break
+            attributes = [
+                dict(attribute)
+                for attribute in media.get("attributes") or []
+                if isinstance(attribute, dict)
+            ]
             return {
                 "kind": "photo" if kind == "uploaded_photo" else "document",
                 "file_id": int(assembled["id"]),
@@ -3185,6 +3261,7 @@ class MTProtoSessionAdapter:
                 "mime_type": str(media.get("mime_type") or assembled["mime_type"]),
                 "size": int(assembled["size"]),
                 "date": int(assembled["created_at"]),
+                "attributes": attributes,
             }
         if kind in {"photo", "document"}:
             file_id = int(media.get("id") or 0)

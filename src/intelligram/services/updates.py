@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import json
 import sqlite3
 from typing import Any
@@ -27,6 +28,25 @@ class UpdateEnvelope:
             "date": self.date,
             "payload": self.payload,
         }
+
+
+_BYTES_MARKER = "__intelligram_bytes_b64__"
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, bytes):
+        return {_BYTES_MARKER: base64.b64encode(value).decode("ascii")}
+    raise TypeError(f"Unsupported update payload value: {type(value).__name__}")
+
+
+def _json_object_hook(value: dict[str, Any]) -> object:
+    encoded = value.get(_BYTES_MARKER)
+    if len(value) == 1 and isinstance(encoded, str):
+        try:
+            return base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, UnicodeError):
+            return value
+    return value
 
 
 def _state_for_update(connection: sqlite3.Connection, user_id: int) -> sqlite3.Row:
@@ -66,14 +86,28 @@ def append_update(
         INSERT INTO updates(user_id, pts, pts_count, seq, date, kind, payload_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, pts, pts_count, seq, now, kind, json.dumps(payload, separators=(",", ":"), sort_keys=True), now),
+        (
+            user_id,
+            pts,
+            pts_count,
+            seq,
+            now,
+            kind,
+            json.dumps(payload, default=_json_default, separators=(",", ":"), sort_keys=True),
+            now,
+        ),
     )
     connection.execute(
         """
         INSERT INTO outbox(aggregate_type, aggregate_id, event_type, payload_json, created_at)
         VALUES ('user_update', ?, ?, ?, ?)
         """,
-        (str(user_id), kind, json.dumps({"user_id": user_id, "pts": pts, "payload": payload}), now),
+        (
+            str(user_id),
+            kind,
+            json.dumps({"user_id": user_id, "pts": pts, "payload": payload}, default=_json_default),
+            now,
+        ),
     )
     return UpdateEnvelope(user_id, pts, pts_count, seq, now, kind, payload)
 
@@ -104,7 +138,7 @@ def get_difference(connection: sqlite3.Connection, *, user_id: int, after_pts: i
             seq=int(row["seq"]),
             date=int(row["date"]),
             kind=str(row["kind"]),
-            payload=json.loads(row["payload_json"]),
+            payload=json.loads(row["payload_json"], object_hook=_json_object_hook),
         )
         for row in rows
     ]

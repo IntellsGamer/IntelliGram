@@ -630,8 +630,8 @@ def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
     assert first_reader.bytes() == b"Reply target"
     first_pts = first_reader.int32()
     first_pts_count = first_reader.int32()
-    assert first_pts > 0
-    assert first_pts_count > 0
+    assert first_pts == 0  # pre-send PTS finalizes Web K's optimistic message
+    assert first_pts_count == 0
     with database.transaction() as connection:
         target = connection.execute("SELECT id FROM messages WHERE client_random_id = ?", ("1001",)).fetchone()
         assert target is not None
@@ -3450,3 +3450,292 @@ def test_web_k_creates_broadcast_channel_and_shows_permanent_invite(tmp_path) ->
     encoded_message = TLReader(edit_body[message_offset:])
     assert encoded_message.uint32() == MESSAGE_CONSTRUCTOR
     assert encoded_message.uint32() & (1 << 15)  # edit_date / edited badge
+
+
+def test_channel_post_uses_channel_author_and_idempotent_retry_acknowledges(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_CHANNEL_CONSTRUCTOR,
+        MESSAGE_CONSTRUCTOR,
+        MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
+        PEER_CHANNEL_CONSTRUCTOR,
+        RPC_ERROR_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATE_MESSAGE_ID_CONSTRUCTOR,
+        UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR,
+        UPDATES_CONSTRUCTOR,
+        channel_access_hash,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import create_channel
+
+    auth_key = bytes(range(256))
+    salt, session_id = 707, 31337
+    database = Database(tmp_path / "channel-post-retry.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        owner = register_password_account(
+            connection,
+            phone="+15550000501",
+            password="correct-horse-battery-staple",
+            first_name="Owner",
+            device_label="Owner",
+        )
+        channel, _ = create_channel(
+            connection,
+            owner_user_id=owner.user_id,
+            title="Broadcast identity test",
+            broadcast=True,
+        )
+    channel_id = int(channel["id"])
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=owner.user_id)
+    request_message_id = (int(time.time()) << 32) + 4
+    query = (
+        encode_uint32(MESSAGES_SEND_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_CHANNEL_CONSTRUCTOR)
+        + encode_int64(channel_id)
+        + encode_int64(channel_access_hash(channel_id))
+        + encode_tl_string("A channel post, not a personal message")
+        + encode_int64(424242)
+    )
+
+    response = adapter.handle_encrypted(
+        _encrypt_client(auth_key, salt=salt, session_id=session_id, msg_id=request_message_id, seq_no=1, body=query)
+    )
+    assert response is not None
+    _, _, _, _, first_body = _decrypt_server(auth_key, response)
+    assert RPC_ERROR_CONSTRUCTOR.to_bytes(4, "little") not in first_body
+    assert UPDATE_MESSAGE_ID_CONSTRUCTOR.to_bytes(4, "little") in first_body
+    assert UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR.to_bytes(4, "little") in first_body
+    message_offset = first_body.index(encode_uint32(MESSAGE_CONSTRUCTOR))
+    encoded = TLReader(first_body[message_offset:])
+    assert encoded.uint32() == MESSAGE_CONSTRUCTOR
+    assert not encoded.uint32() & (1 << 1)  # channel post is not a personal outgoing “You” message
+    encoded.uint32()  # flags2
+    encoded.int32()   # message id
+    assert encoded.uint32() == PEER_CHANNEL_CONSTRUCTOR
+    assert encoded.int64() == channel_id
+
+    retry = adapter.handle_encrypted(
+        _encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id + 4,
+            seq_no=3,
+            body=query,
+        )
+    )
+    assert retry is not None
+    _, _, _, _, retry_body = _decrypt_server(auth_key, retry)
+    retry_reader = TLReader(retry_body)
+    assert retry_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    retry_reader.int64()
+    assert retry_reader.uint32() == UPDATES_CONSTRUCTOR
+    assert UPDATE_MESSAGE_ID_CONSTRUCTOR.to_bytes(4, "little") in retry_body
+    assert UPDATE_NEW_CHANNEL_MESSAGE_CONSTRUCTOR.to_bytes(4, "little") in retry_body
+    with database.transaction() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE sender_user_id = ? AND client_random_id = ?",
+            (owner.user_id, "424242"),
+        ).fetchone()
+    assert int(count["count"]) == 1
+
+
+def test_web_k_uploaded_voice_note_preserves_native_metadata_and_downloads(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR,
+        DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR,
+        INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR,
+        INPUT_FILE_CONSTRUCTOR,
+        INPUT_MEDIA_UPLOADED_DOCUMENT_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGE_MEDIA_DOCUMENT_CONSTRUCTOR,
+        MESSAGES_GET_HISTORY_CONSTRUCTOR,
+        MESSAGES_SEND_MEDIA_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        STORAGE_FILE_UNKNOWN_CONSTRUCTOR,
+        TLReader,
+        UPLOAD_FILE_CONSTRUCTOR,
+        UPLOAD_GET_FILE_CONSTRUCTOR,
+        UPLOAD_SAVE_FILE_PART_CONSTRUCTOR,
+        VECTOR_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_tl_string,
+        encode_uint32,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 808, 41414
+    database = Database(tmp_path / "voice-note.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection,
+            phone="+15550000511",
+            password="correct-horse-battery-staple",
+            first_name="Alice",
+            device_label="Alice",
+        )
+        bob = register_password_account(
+            connection,
+            phone="+15550000512",
+            password="correct-horse-battery-staple",
+            first_name="Bob",
+            device_label="Bob",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    request_message_id = (int(time.time()) << 32) + 4
+    upload_id = 888_515
+    voice_bytes = b"OggS-intelligram-controlled-voice-note"
+    waveform = b"\x10\x20\x30\x40"
+
+    save_part = (
+        encode_uint32(UPLOAD_SAVE_FILE_PART_CONSTRUCTOR)
+        + encode_int64(upload_id)
+        + encode_int32(0)
+        + encode_tl_bytes(voice_bytes)
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(auth_key, salt=salt, session_id=session_id, msg_id=request_message_id, seq_no=1, body=save_part)
+    )
+    assert response is not None
+    _, _, _, _, saved_part_body = _decrypt_server(auth_key, response)
+    saved_part_reader = TLReader(saved_part_body)
+    assert saved_part_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    saved_part_reader.int64()
+    assert saved_part_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    audio_attribute = (
+        encode_uint32(DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR)
+        + encode_uint32((1 << 10) | 1 | (1 << 2))
+        + encode_int32(7)
+        + encode_tl_string("Controlled voice")
+        + encode_tl_bytes(waveform)
+    )
+    filename_attribute = encode_uint32(DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR) + encode_tl_string("audio.ogg")
+    send_voice = (
+        encode_uint32(MESSAGES_SEND_MEDIA_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_uint32(INPUT_MEDIA_UPLOADED_DOCUMENT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_FILE_CONSTRUCTOR)
+        + encode_int64(upload_id)
+        + encode_int32(1)
+        + encode_tl_string("audio.ogg")
+        + encode_tl_string("")
+        + encode_tl_string("audio/ogg")
+        + encode_uint32(VECTOR_CONSTRUCTOR)
+        + encode_int32(2)
+        + filename_attribute
+        + audio_attribute
+        + encode_tl_string("")
+        + encode_int64(515151)
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id + 4,
+            seq_no=3,
+            body=send_voice,
+        )
+    )
+    assert response is not None
+    _, _, _, _, sent_body = _decrypt_server(auth_key, response)
+    assert MESSAGE_MEDIA_DOCUMENT_CONSTRUCTOR.to_bytes(4, "little") in sent_body
+    audio_offset = sent_body.index(encode_uint32(DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR))
+    audio_reader = TLReader(sent_body[audio_offset:])
+    assert audio_reader.uint32() == DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR
+    assert audio_reader.uint32() & (1 << 10)
+    assert audio_reader.int32() == 7
+    assert audio_reader.bytes() == b"Controlled voice"
+    assert audio_reader.bytes() == waveform
+
+    with database.transaction() as connection:
+        row = connection.execute(
+            "SELECT mm.file_id, mm.mime_type, mm.attributes_json FROM message_media mm ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None
+    assert str(row["mime_type"]) == "audio/ogg"
+    assert '"voice":true' in str(row["attributes_json"])
+    file_id = int(row["file_id"])
+
+    get_file = (
+        encode_uint32(UPLOAD_GET_FILE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR)
+        + encode_int64(file_id)
+        + encode_int64((file_id << 32) | 1)
+        + encode_tl_bytes(f"intelligram-file:{file_id}".encode("ascii"))
+        + encode_tl_string("")
+        + encode_int64(0)
+        + encode_int32(len(voice_bytes))
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id + 8,
+            seq_no=5,
+            body=get_file,
+        )
+    )
+    assert response is not None
+    _, _, _, _, file_body = _decrypt_server(auth_key, response)
+    file_reader = TLReader(file_body)
+    assert file_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    file_reader.int64()
+    assert file_reader.uint32() == UPLOAD_FILE_CONSTRUCTOR
+    assert file_reader.uint32() == STORAGE_FILE_UNKNOWN_CONSTRUCTOR
+    file_reader.int32()
+    assert file_reader.bytes() == voice_bytes
+
+    history = (
+        encode_uint32(MESSAGES_GET_HISTORY_CONSTRUCTOR)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int32(20)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int64(0)
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id + 12,
+            seq_no=7,
+            body=history,
+        )
+    )
+    assert response is not None
+    _, _, _, _, history_body = _decrypt_server(auth_key, response)
+    history_audio_offset = history_body.index(encode_uint32(DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR))
+    history_audio = TLReader(history_body[history_audio_offset:])
+    assert history_audio.uint32() == DOCUMENT_ATTRIBUTE_AUDIO_CONSTRUCTOR
+    assert history_audio.uint32() & (1 << 10)
+    assert history_audio.int32() == 7
+    assert history_audio.bytes() == b"Controlled voice"
+    assert history_audio.bytes() == waveform
