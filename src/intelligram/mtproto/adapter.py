@@ -1264,17 +1264,40 @@ class MTProtoSessionAdapter:
         with database.transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT DISTINCT CASE WHEN dpu.user_low_id = ? THEN dpu.user_high_id ELSE dpu.user_low_id END AS user_id
-                FROM direct_peer_users dpu
-                JOIN peer_memberships pm ON pm.peer_id = dpu.peer_id
-                WHERE pm.user_id = ? AND pm.left_at IS NULL
-                AND (dpu.user_low_id = ? OR dpu.user_high_id = ?)
+                WITH contact_candidates AS (
+                    SELECT c.contact_user_id AS user_id,
+                           EXISTS(
+                               SELECT 1
+                               FROM contacts reciprocal
+                               WHERE reciprocal.user_id = c.contact_user_id
+                                 AND reciprocal.contact_user_id = c.user_id
+                           ) AS mutual
+                    FROM contacts c
+                    WHERE c.user_id = ?
+
+                    UNION ALL
+
+                    SELECT DISTINCT CASE WHEN dpu.user_low_id = ? THEN dpu.user_high_id ELSE dpu.user_low_id END AS user_id,
+                           1 AS mutual
+                    FROM direct_peer_users dpu
+                    JOIN peer_memberships pm ON pm.peer_id = dpu.peer_id
+                    WHERE pm.user_id = ? AND pm.left_at IS NULL
+                    AND (dpu.user_low_id = ? OR dpu.user_high_id = ?)
+                )
+                SELECT user_id, MAX(mutual) AS mutual
+                FROM contact_candidates
+                GROUP BY user_id
+                ORDER BY user_id
                 """,
-                (self_user_id, self_user_id, self_user_id, self_user_id),
+                (self_user_id, self_user_id, self_user_id, self_user_id, self_user_id),
             ).fetchall()
             contact_ids = {int(row["user_id"]) for row in rows if int(row["user_id"]) != self_user_id}
             users = self._load_users(connection, contact_ids)
-        contacts = [encode_contact(user_id=user_id, mutual=True) for user_id in sorted(users)]
+        contacts = [
+            encode_contact(user_id=int(row["user_id"]), mutual=bool(row["mutual"]))
+            for row in rows
+            if int(row["user_id"]) in users
+        ]
         return self._encrypt_result(
             message,
             encode_contacts_contacts(contacts=contacts, users=self._encode_users(users, self_user_id=self_user_id)),

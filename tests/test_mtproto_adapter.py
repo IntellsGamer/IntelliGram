@@ -2648,10 +2648,13 @@ def test_web_k_forwards_text_message_into_saved_messages(tmp_path) -> None:
 def test_web_k_contacts_import_and_search_are_durable(tmp_path) -> None:
     from intelligram.database import Database
     from intelligram.mtproto.tl import (
+        CONTACTS_CONTACTS_CONSTRUCTOR,
         CONTACTS_FOUND_CONSTRUCTOR,
+        CONTACTS_GET_CONTACTS_CONSTRUCTOR,
         CONTACTS_IMPORT_CONTACTS_CONSTRUCTOR,
         CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR,
         CONTACTS_SEARCH_CONSTRUCTOR,
+        CONTACT_CONSTRUCTOR,
         IMPORTED_CONTACT_CONSTRUCTOR,
         INPUT_PHONE_CONTACT_CONSTRUCTOR,
         PEER_USER_CONSTRUCTOR,
@@ -2711,19 +2714,40 @@ def test_web_k_contacts_import_and_search_are_durable(tmp_path) -> None:
         ).fetchone()
         assert contact is not None and int(contact["client_id"]) == 7001
 
-    search_response = adapter.handle_encrypted(_encrypt_client(
+    contacts_response = adapter.handle_encrypted(_encrypt_client(
         auth_key,
         salt=salt,
         session_id=session_id,
         msg_id=message_id + 4,
         seq_no=3,
+        body=encode_uint32(CONTACTS_GET_CONTACTS_CONSTRUCTOR) + encode_int64(0),
+    ))
+    assert contacts_response is not None
+    _, _, _, _, contacts_body = _decrypt_server(auth_key, contacts_response)
+    reader = TLReader(contacts_body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id + 4
+    assert reader.uint32() == CONTACTS_CONTACTS_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == CONTACT_CONSTRUCTOR
+    assert reader.int64() == bob.user_id
+    reader.uint32()  # mutual flag
+    assert reader.int32() == 0  # saved_count
+    assert reader.vector_count() == 1
+
+    search_response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id + 8,
+        seq_no=5,
         body=encode_uint32(CONTACTS_SEARCH_CONSTRUCTOR) + encode_uint32(0) + encode_tl_string("bob") + encode_int32(20),
     ))
     assert search_response is not None
     _, _, _, _, search_body = _decrypt_server(auth_key, search_response)
     reader = TLReader(search_body)
     assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
-    assert reader.int64() == message_id + 4
+    assert reader.int64() == message_id + 8
     assert reader.uint32() == CONTACTS_FOUND_CONSTRUCTOR
     assert reader.vector_count() == 1
     assert reader.uint32() == PEER_USER_CONSTRUCTOR
