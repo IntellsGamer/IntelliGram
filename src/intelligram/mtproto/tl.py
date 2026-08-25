@@ -73,6 +73,7 @@ CONTACTS_CONTACTS_CONSTRUCTOR = 0xEAE87E42
 MESSAGES_DIALOGS_CONSTRUCTOR = 0x15BA6C40
 MESSAGES_DIALOGS_SLICE_CONSTRUCTOR = 0x71E094F3
 MESSAGES_MESSAGES_CONSTRUCTOR = 0x1D73E7EA
+MESSAGES_MESSAGES_SLICE_CONSTRUCTOR = 0x5F206716
 MESSAGES_PEER_DIALOGS_CONSTRUCTOR = 0x3371C354
 USER_FULL_CONSTRUCTOR = 0x06CBE645
 USERS_USER_FULL_CONSTRUCTOR = 0x3B6D152E
@@ -2111,6 +2112,21 @@ def encode_messages_dialogs_slice(
 def encode_messages_messages(*, messages: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes]) -> bytes:
     return (
         encode_uint32(MESSAGES_MESSAGES_CONSTRUCTOR)
+        + encode_vector(messages)
+        + encode_vector([])  # topics
+        + encode_vector(chats)
+        + encode_vector(users)
+    )
+
+
+def encode_messages_messages_slice(
+    *, count: int, messages: Iterable[bytes], chats: Iterable[bytes], users: Iterable[bytes],
+) -> bytes:
+    """Encode a counted history result for messages.getHistory-style calls."""
+    return (
+        encode_uint32(MESSAGES_MESSAGES_SLICE_CONSTRUCTOR)
+        + encode_uint32(0)  # flags: exact count, no next-rate or offset correction
+        + encode_int32(count)
         + encode_vector(messages)
         + encode_vector([])  # topics
         + encode_vector(chats)

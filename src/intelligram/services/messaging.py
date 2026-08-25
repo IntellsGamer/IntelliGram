@@ -1353,6 +1353,14 @@ connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | 
     return [_message_row(row, connection) for row in reversed(rows)]
 
 
+def get_history_count(connection: sqlite3.Connection, *, peer_id: int) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) AS count FROM messages WHERE peer_id = ? AND deleted_at IS NULL",
+        (peer_id,),
+    ).fetchone()
+    return int(row["count"])
+
+
 def get_dialogs(connection: sqlite3.Connection, *, user_id: int, offset: int, limit: int) -> list[dict[str, Any]]:
     if offset < 0 or limit < 1 or limit > 100:
         raise MessagingError("OFFSET_OR_LIMIT_INVALID")

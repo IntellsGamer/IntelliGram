@@ -415,7 +415,7 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
         MESSAGES_DIALOGS_SLICE_CONSTRUCTOR,
         MESSAGES_GET_DIALOGS_CONSTRUCTOR,
         MESSAGES_GET_HISTORY_CONSTRUCTOR,
-        MESSAGES_MESSAGES_CONSTRUCTOR,
+        MESSAGES_MESSAGES_SLICE_CONSTRUCTOR,
         MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
@@ -530,7 +530,9 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
         + struct.pack("<iiiiii", 0, 0, 0, 30, 0, 0)
         + encode_int64(0)
     )
-    assert history_reader.uint32() == MESSAGES_MESSAGES_CONSTRUCTOR
+    assert history_reader.uint32() == MESSAGES_MESSAGES_SLICE_CONSTRUCTOR
+    assert history_reader.uint32() == 0
+    assert history_reader.int32() == 1
     assert history_reader.uint32() == 0x1CB5C415
     assert history_reader.int32() == 1
 
@@ -554,7 +556,7 @@ def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
         MESSAGE_CONSTRUCTOR,
         MESSAGE_REPLY_HEADER_CONSTRUCTOR,
         MESSAGES_GET_HISTORY_CONSTRUCTOR,
-        MESSAGES_MESSAGES_CONSTRUCTOR,
+        MESSAGES_MESSAGES_SLICE_CONSTRUCTOR,
         MESSAGES_SEND_MESSAGE_CONSTRUCTOR,
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
@@ -683,7 +685,9 @@ def test_web_k_persists_and_hydrates_ordinary_message_replies(tmp_path) -> None:
     history_reader = TLReader(history_body)
     assert history_reader.uint32() == RPC_RESULT_CONSTRUCTOR
     history_reader.int64()
-    assert history_reader.uint32() == MESSAGES_MESSAGES_CONSTRUCTOR
+    assert history_reader.uint32() == MESSAGES_MESSAGES_SLICE_CONSTRUCTOR
+    assert history_reader.uint32() == 0
+    assert history_reader.int32() == 2
     reply_header_offset = history_body.index(encode_uint32(MESSAGE_REPLY_HEADER_CONSTRUCTOR))
     hydrated_header = TLReader(history_body[reply_header_offset:])
     assert hydrated_header.uint32() == 0x1B97DD66

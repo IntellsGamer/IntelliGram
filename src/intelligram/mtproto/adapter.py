@@ -50,6 +50,7 @@ from intelligram.services.messaging import (
     get_dialogs,
     get_channel_details,
     get_history,
+    get_history_count,
     list_exported_chat_invites,
     get_or_create_direct_peer,
     get_peer,
@@ -114,6 +115,7 @@ from intelligram.mtproto.tl import (
     encode_messages_dialogs_slice,
     encode_messages_invited_users,
     encode_messages_messages,
+    encode_messages_messages_slice,
     encode_messages_peer_dialogs,
     encode_peer_channel,
     encode_peer_chat,
@@ -2929,13 +2931,15 @@ class MTProtoSessionAdapter:
         try:
             with database.transaction(immediate=True) as connection:
                 summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                peer_id = int(summary["peer_id"])
                 stored_messages = get_history(
                     connection,
-                    peer_id=int(summary["peer_id"]),
+                    peer_id=peer_id,
                     user_id=self_user_id,
                     before_id=offset_id if offset_id > 0 else None,
                     limit=min(max(limit, 1), 100),
                 )
+                history_count = get_history_count(connection, peer_id=peer_id)
                 user_ids = {self_user_id, *(int(item["sender_user_id"]) for item in stored_messages)}
                 if summary.get("direct_user_id") is not None:
                     user_ids.add(int(summary["direct_user_id"]))
@@ -2957,7 +2961,8 @@ class MTProtoSessionAdapter:
             return self._encrypt_rpc_error(message, str(exc))
         return self._encrypt_result(
             message,
-            encode_messages_messages(
+            encode_messages_messages_slice(
+                count=history_count,
                 messages=encoded_messages,
                 chats=encoded_chats,
                 users=self._encode_users(users, self_user_id=self_user_id),
