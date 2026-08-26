@@ -132,7 +132,9 @@ from intelligram.mtproto.tl import (
     encode_update_message_id,
     encode_emoji_keywords_difference,
     encode_message_media,
+    encode_messages_all_stickers,
     encode_messages_all_stickers_not_modified,
+    encode_messages_emoji_groups,
     encode_messages_emoji_groups_not_modified,
     encode_messages_sticker_set_not_modified,
     encode_update_new_channel_message,
@@ -530,9 +532,21 @@ class MTProtoSessionAdapter:
             "messages_get_emoji_status_groups",
             "messages_get_emoji_profile_photo_groups",
         }:
-            return self._encrypt_result(message, encode_messages_emoji_groups_not_modified())
+            hash_value = int(request.fields["hash"])
+            result = (
+                encode_messages_emoji_groups(hash_value=0)
+                if hash_value == 0
+                else encode_messages_emoji_groups_not_modified()
+            )
+            return self._encrypt_result(message, result)
         if request.name in {"messages_get_all_stickers", "messages_get_emoji_stickers"}:
-            return self._encrypt_result(message, encode_messages_all_stickers_not_modified())
+            hash_value = int(request.fields["hash"])
+            result = (
+                encode_messages_all_stickers(hash_value=0)
+                if hash_value == 0
+                else encode_messages_all_stickers_not_modified()
+            )
+            return self._encrypt_result(message, result)
         if request.name == "messages_get_sticker_set":
             return self._encrypt_result(message, encode_messages_sticker_set_not_modified())
         if request.name == "messages_get_emoji_keywords_difference":

@@ -660,7 +660,7 @@ export default class AudioElement extends HTMLElement {
       imgs.forEach((img) => img.classList.add('audio-thumb'));
     }
 
-    if(!isOutgoing) {
+    if(!uploadingFileName) {
       let preloader: ProgressivePreloader = this.preloader;
 
       const autoDownload = doc.type !== 'audio'/*  || !this.noAutoDownload */;

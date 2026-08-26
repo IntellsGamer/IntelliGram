@@ -115,7 +115,9 @@ MESSAGES_GET_ALL_STICKERS_CONSTRUCTOR = 0xB8A0A1A8
 MESSAGES_GET_STICKER_SET_CONSTRUCTOR = 0xC8A0EC74
 MESSAGES_GET_EMOJI_STICKERS_CONSTRUCTOR = 0xFBFCA18F
 MESSAGES_GET_EMOJI_KEYWORDS_DIFFERENCE_CONSTRUCTOR = 0x1508B6AF
+MESSAGES_EMOJI_GROUPS_CONSTRUCTOR = 0x881FB94B
 MESSAGES_EMOJI_GROUPS_NOT_MODIFIED_CONSTRUCTOR = 0x6FB4AD87
+MESSAGES_ALL_STICKERS_CONSTRUCTOR = 0xCDBBCEBB
 MESSAGES_ALL_STICKERS_NOT_MODIFIED_CONSTRUCTOR = 0xE86602C3
 MESSAGES_STICKER_SET_NOT_MODIFIED_CONSTRUCTOR = 0xD3F924EB
 EMOJI_KEYWORDS_DIFFERENCE_CONSTRUCTOR = 0x5CC761BD
@@ -2077,8 +2079,24 @@ def encode_update_new_channel_message(*, message: bytes, pts: int, pts_count: in
     )
 
 
+def encode_messages_emoji_groups(*, hash_value: int = 0, groups: Iterable[bytes] = ()) -> bytes:
+    return (
+        encode_uint32(MESSAGES_EMOJI_GROUPS_CONSTRUCTOR)
+        + encode_int32(hash_value)
+        + encode_vector(groups)
+    )
+
+
 def encode_messages_emoji_groups_not_modified() -> bytes:
     return encode_uint32(MESSAGES_EMOJI_GROUPS_NOT_MODIFIED_CONSTRUCTOR)
+
+
+def encode_messages_all_stickers(*, hash_value: int = 0, sets: Iterable[bytes] = ()) -> bytes:
+    return (
+        encode_uint32(MESSAGES_ALL_STICKERS_CONSTRUCTOR)
+        + encode_int64(hash_value)
+        + encode_vector(sets)
+    )
 
 
 def encode_messages_all_stickers_not_modified() -> bytes:

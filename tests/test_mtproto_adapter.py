@@ -136,6 +136,47 @@ def test_web_k_chat_startup_compatibility_calls_return_valid_results() -> None:
             assert reader.int32() == 0
 
 
+def test_web_k_initial_emoji_catalogue_requests_receive_full_empty_results() -> None:
+    from intelligram.mtproto.tl import (
+        MESSAGES_ALL_STICKERS_CONSTRUCTOR,
+        MESSAGES_EMOJI_GROUPS_CONSTRUCTOR,
+        MESSAGES_GET_EMOJI_GROUPS_CONSTRUCTOR,
+        MESSAGES_GET_EMOJI_STICKERS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        VECTOR_CONSTRUCTOR,
+    )
+
+    auth_key = bytes(range(256))
+    salt, session_id = 91, 17
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt)
+    base_message_id = (int(time.time()) << 32) + 4
+    requests = [
+        (struct.pack("<Ii", MESSAGES_GET_EMOJI_GROUPS_CONSTRUCTOR, 0), MESSAGES_EMOJI_GROUPS_CONSTRUCTOR, "int"),
+        (struct.pack("<Iq", MESSAGES_GET_EMOJI_STICKERS_CONSTRUCTOR, 0), MESSAGES_ALL_STICKERS_CONSTRUCTOR, "long"),
+    ]
+
+    for index, (request_body, expected_constructor, hash_width) in enumerate(requests):
+        request_message_id = base_message_id + index * 4
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id,
+            seq_no=index * 2 + 1,
+            body=request_body,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == request_message_id
+        assert reader.uint32() == expected_constructor
+        assert (reader.int32() if hash_width == "int" else reader.int64()) == 0
+        assert reader.uint32() == VECTOR_CONSTRUCTOR
+        assert reader.int32() == 0
+
+
 def _tl_bytes(value: bytes) -> bytes:
     if len(value) < 254:
         encoded = bytes([len(value)]) + value
