@@ -656,6 +656,23 @@ class MTProtoSessionAdapter:
                                     outgoing=bool(envelope.payload.get("is_outgoing")),
                                 )
                             )
+                            # The client can be synchronizing when its first
+                            # post-refresh send response arrives, which makes
+                            # it ignore the immediate updateMessageID. Replaying
+                            # this durable sender-only mapping before the final
+                            # message lets Web K reconcile the optimistic random
+                            # ID instead of rendering a second history bubble.
+                            client_random_id = envelope.payload.get("client_random_id")
+                            try:
+                                random_id = int(client_random_id) if client_random_id is not None else None
+                            except (TypeError, ValueError):
+                                random_id = None
+                            if random_id is not None:
+                                other_updates.append(
+                                    encode_update_message_id(
+                                        message_id=int(stored["id"]), random_id=random_id
+                                    )
+                                )
                             user_ids.add(int(stored["sender_user_id"]))
                             if summary.get("direct_user_id") is not None:
                                 user_ids.add(int(summary["direct_user_id"]))

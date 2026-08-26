@@ -523,7 +523,17 @@ class ApiUpdatesManager {
     const log = this.log.bindPrefix(`processUpdate${channelId ? `-${channelId}` : ''}`);
     log('process', curState.pts, copy(update));
 
-    if(curState.syncLoading && !options.ignoreSyncLoading) {
+    // A local send RPC carries updateMessageID followed by a zero-count final
+    // message update. During the first refresh synchronization, dropping that
+    // pair loses the only random-id → server-id mapping for the optimistic
+    // bubble; history can then render the durable message separately and an
+    // immediate edit is deferred forever against the stale temporary ID.
+    // These updates do not advance durable PTS, so they are safe to reconcile
+    // immediately while all ordinary PTS-bearing updates remain held back.
+    const isOptimisticSendAcknowledgement = update._ === 'updateMessageID' || (
+      (update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage') && pts_count === 0
+    );
+    if(curState.syncLoading && !options.ignoreSyncLoading && !isOptimisticSendAcknowledgement) {
       log('ignoring update, sync loading');
       return false;
     } else if(curState.syncLoading) {

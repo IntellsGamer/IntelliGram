@@ -1064,9 +1064,11 @@ def test_web_k_updates_get_difference_replays_durable_message(tmp_path) -> None:
     from intelligram.mtproto.tl import (
         RPC_RESULT_CONSTRUCTOR,
         TLReader,
+        UPDATE_MESSAGE_ID_CONSTRUCTOR,
         UPDATES_DIFFERENCE_CONSTRUCTOR,
         UPDATES_GET_DIFFERENCE_CONSTRUCTOR,
         encode_int32,
+        encode_int64,
         encode_uint32,
     )
     from intelligram.services.accounts import register_password_account
@@ -1092,12 +1094,12 @@ def test_web_k_updates_get_difference_replays_durable_message(tmp_path) -> None:
             device_label="Bob device",
         )
         peer_id = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
-        send_message(
+        stored, _ = send_message(
             connection,
             peer_id=peer_id,
             sender_user_id=alice.user_id,
             body="durable difference message",
-            client_random_id="difference-1",
+            client_random_id="424242",
         )
     adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=bob.user_id)
     message_id = (int(time.time()) << 32) + 4
@@ -1119,6 +1121,25 @@ def test_web_k_updates_get_difference_replays_durable_message(tmp_path) -> None:
     assert reader.uint32() == UPDATES_DIFFERENCE_CONSTRUCTOR
     assert reader.uint32() == 0x1CB5C415
     assert reader.int32() == 1
+
+    # During a first post-refresh sender sync, Web K can discard the immediate
+    # RPC result while applying its durable difference. The difference must
+    # replay the random-id mapping before it replays the outgoing message so
+    # the optimistic bubble is finalized instead of duplicated.
+    sender_adapter = MTProtoSessionAdapter(
+        auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id
+    )
+    sender_response = sender_adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=get_difference,
+    ))
+    assert sender_response is not None
+    _, _, _, _, sender_body = _decrypt_server(auth_key, sender_response)
+    assert encode_uint32(UPDATE_MESSAGE_ID_CONSTRUCTOR) in sender_body
+    assert (
+        encode_uint32(UPDATE_MESSAGE_ID_CONSTRUCTOR)
+        + encode_int32(int(stored["id"]))
+        + encode_int64(424242)
+    ) in sender_body
 
 
 def test_web_k_messages_get_full_chat_returns_durable_members(tmp_path) -> None:
@@ -2552,6 +2573,7 @@ def test_web_k_message_edit_and_revoke_delete_are_durable_and_replayable(tmp_pat
         stored, _ = send_message(
             connection, peer_id=peer_id, sender_user_id=alice.user_id, body="Before edit", client_random_id="lifecycle-1",
         )
+    assert MESSAGES_EDIT_MESSAGE_CONSTRUCTOR == 0xB106E66C
     adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
     input_bob = encode_uint32(INPUT_PEER_USER_CONSTRUCTOR) + encode_int64(bob.user_id) + encode_int64(user_access_hash(bob.user_id))
     message_id = (int(time.time()) << 32) + 4

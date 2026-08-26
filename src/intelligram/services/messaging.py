@@ -1132,12 +1132,19 @@ def send_message(
             0 if recipient_user_id == sender_user_id else 1,
             read_outbox_max_id=message_id if recipient_user_id == sender_user_id else 0,
         )
+        payload = {"message": message, "is_outgoing": recipient_user_id == sender_user_id}
+        # A first post-refresh `updates.getDifference` can supersede the
+        # immediate RPC result while Web K is synchronizing. Persist the
+        # sender-only random-id mapping with the durable envelope so that
+        # difference replay can still finalize the optimistic message.
+        if recipient_user_id == sender_user_id:
+            payload["client_random_id"] = client_random_id
         emitted.append(
             append_update(
                 connection,
                 user_id=recipient_user_id,
                 kind="updateNewMessage",
-                payload={"message": message, "is_outgoing": recipient_user_id == sender_user_id},
+                payload=payload,
             )
         )
     return message, emitted

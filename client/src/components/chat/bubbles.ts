@@ -925,7 +925,15 @@ export default class ChatBubbles {
       const fullMid = makeFullMid(message);
 
       let _bubble = this.getBubble(fullTempMid);
-      if(_bubble) {
+      const finalBubble = this.getBubble(fullMid);
+      if(_bubble && finalBubble && finalBubble !== _bubble) {
+        // The final message can be rendered by history_update before this
+        // optimistic finalizer runs. Keep that authoritative server bubble and
+        // unmount the old temporary one instead of overwriting the lookup and
+        // leaving two DOM rows with the same final message ID.
+        this.bubbleGroups.removeAndUnmountBubble(_bubble);
+        _bubble = finalBubble;
+      } else if(_bubble) {
         const bubble = _bubble;
         delete this.bubbles[fullTempMid];
         this.bubbles[fullMid] = bubble;

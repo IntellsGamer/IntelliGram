@@ -1753,7 +1753,14 @@ export class AppMessagesManager extends AppManager {
 
     const {mid, peerId} = message;
 
-    if(message.pFlags.is_outgoing) {
+    // A message can briefly retain the local outgoing marker after its final
+    // ID has already been reconciled (notably when the first post-refresh
+    // send races the initial updates difference). Only defer an edit while the
+    // corresponding optimistic send is actually pending; otherwise this
+    // callback has no future finalization event and the native editor appears
+    // to submit while never issuing messages.editMessage.
+    const pendingRandomId = message.random_id;
+    if(message.pFlags.is_outgoing && message.id <= 0 && pendingRandomId && this.pendingByRandomId[pendingRandomId]) {
       return this.invokeAfterMessageIsSent(mid, 'edit', (message) => {
         // this.log('invoke editMessage callback', message);
         return this.editMessage(message, text, options);
