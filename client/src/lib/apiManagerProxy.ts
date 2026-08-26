@@ -827,15 +827,23 @@ class ApiManagerProxy extends MTProtoMessagePort {
     if(!('serviceWorker' in navigator)) return;
 
     if(Modes.noServiceWorker) {
-      navigator.serviceWorker.getRegistrations().then(regs => {
-        for(const reg of regs) {
-          reg.unregister().then((success) => {
-            success &&
-              window.location.reload();
-          });
+      // HTTP compatibility keeps the MTProto/crypto modules in-process. A page
+      // upgraded from an earlier HTTP build can still be controlled by that
+      // origin's previously registered worker. Remove it once, then navigate
+      // once into the fallback; the session guard prevents the historical
+      // unregister/reload loop on every HTTP startup.
+      this.log('Service Worker disabled by HTTP compatibility bootstrap');
+      const migrationKey = 'intelligram-http-sw-fallback-migrated';
+      navigator.serviceWorker.getRegistrations().then(async(registrations) => {
+        if(!registrations.length) return;
+        await Promise.all(registrations.map((registration) => registration.unregister()));
+        if(navigator.serviceWorker.controller && window.sessionStorage.getItem(migrationKey) !== location.origin) {
+          window.sessionStorage.setItem(migrationKey, location.origin);
+          window.location.reload();
         }
+      }).catch((error) => {
+        this.log.warn('HTTP fallback could not clear an obsolete Service Worker', error);
       });
-
       return;
     }
 
