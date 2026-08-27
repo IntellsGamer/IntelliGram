@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IntelliGram Owner Console</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #17212b; color: #eef5fb; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 10% 10%, #2a5275, transparent 38%), #17212b; }
+    main { width: min(920px, calc(100% - 32px)); margin: 32px auto; }
+    .card { background: #202b36; border: 1px solid #344453; border-radius: 14px; padding: 24px; box-shadow: 0 18px 60px #0007; }
+    h1 { margin: 0 0 6px; font-size: 24px; } p { color: #afc1cf; line-height: 1.45; } form { display: grid; gap: 12px; max-width: 440px; }
+    label { display: grid; gap: 6px; color: #c8d6e2; font-size: 14px; } input { padding: 11px 12px; border: 1px solid #4a5e6e; border-radius: 8px; background: #17212b; color: #fff; font: inherit; }
+    button { border: 0; border-radius: 8px; padding: 10px 14px; font: inherit; font-weight: 650; background: #2ea6ff; color: #07131d; cursor: pointer; } button.secondary { background: #40515f; color: #eff7ff; } button.danger { background: #e85d75; color: #fff; }
+    .hidden { display: none; } #status { min-height: 22px; margin-top: 14px; } .error { color: #ff9eac; } .ok { color: #8ce0b2; }
+    table { width: 100%; border-collapse: collapse; margin-top: 18px; } th, td { text-align: left; border-bottom: 1px solid #344453; padding: 12px 8px; vertical-align: middle; } th { color: #9cb3c5; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; } .pill { border-radius: 999px; padding: 4px 8px; font-size: 12px; background: #3a4a57; } .pill.premium { background: #8b68d8; color: #fff; }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="loginCard" class="card">
+      <h1>IntelliGram Owner Console</h1>
+      <p>Sign in with the IntelliGram account whose phone number matches the server’s <code>INTELLIGRAM_ADMIN_PHONE</code>. This panel never grants access based on a client-provided role.</p>
+      <form id="loginForm">
+        <label>Owner phone number <input id="phone" name="phone" autocomplete="username" required></label>
+        <label>IntelliGram password <input id="password" name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in with IntelliGram</button>
+      </form>
+      <div id="status" role="status"></div>
+    </section>
+    <section id="consoleCard" class="card hidden">
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:start;flex-wrap:wrap">
+        <div><h1>Owner Console</h1><p id="owner"></p></div>
+        <button id="signOut" class="secondary">Sign out</button>
+      </div>
+      <div id="users"></div>
+    </section>
+  </main>
+  <script>
+    const tokenKey = 'intelligram.owner-console.token';
+    const status = document.getElementById('status');
+    const loginCard = document.getElementById('loginCard');
+    const consoleCard = document.getElementById('consoleCard');
+    const authHeaders = () => ({Authorization: `Bearer ${sessionStorage.getItem(tokenKey) || ''}`, 'Content-Type': 'application/json'});
+    function setStatus(message, error = false) { status.textContent = message; status.className = message ? (error ? 'error' : 'ok') : ''; }
+    async function request(path, options = {}) {
+      const response = await fetch(path, {...options, headers: {...authHeaders(), ...(options.headers || {})}});
+      const body = await response.json().catch(() => ({}));
+      if(!response.ok) throw new Error(body.detail || 'Request failed');
+      return body;
+    }
+    function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value ?? ''); return node.innerHTML; }
+    async function renderConsole() {
+      const [session, result] = await Promise.all([request('/v1/admin/session'), request('/v1/admin/users')]);
+      document.getElementById('owner').textContent = `Signed in as ${session.owner.first_name} ${session.owner.last_name || ''}`.trim();
+      document.getElementById('users').innerHTML = `<table><thead><tr><th>Account</th><th>Premium</th><th>Sessions</th><th>Control</th></tr></thead><tbody>${result.users.map((user) => `<tr><td><strong>${escapeHtml(user.first_name)} ${escapeHtml(user.last_name)}</strong><br><small>@${escapeHtml(user.username || 'no username')} · #${user.id}</small></td><td><span class="pill ${user.premium ? 'premium' : ''}">${user.premium ? 'Premium' : 'Standard'}</span></td><td>${user.active_authorizations}</td><td><div class="controls"><button data-user="${user.id}" data-premium="${user.premium ? 0 : 1}">${user.premium ? 'Remove Premium' : 'Grant Premium'}</button></div></td></tr>`).join('')}</tbody></table>`;
+      document.querySelectorAll('[data-user]').forEach((button) => button.addEventListener('click', async () => {
+        button.disabled = true;
+        try { await request(`/v1/admin/users/${button.dataset.user}/premium`, {method: 'POST', body: JSON.stringify({premium: button.dataset.premium === '1'})}); await renderConsole(); }
+        catch(error) { setStatus(error.message, true); }
+        finally { button.disabled = false; }
+      }));
+      loginCard.classList.add('hidden'); consoleCard.classList.remove('hidden');
+    }
+    document.getElementById('loginForm').addEventListener('submit', async (event) => {
+      event.preventDefault(); setStatus('Signing in…');
+      const form = new FormData(event.currentTarget);
+      try { const result = await request('/v1/admin/login', {method: 'POST', body: JSON.stringify({phone: form.get('phone'), password: form.get('password')})}); sessionStorage.setItem(tokenKey, result.access_token); setStatus(''); await renderConsole(); }
+      catch(error) { setStatus(error.message === 'ADMIN_LOGIN_INVALID' ? 'Owner sign-in was not accepted.' : error.message, true); }
+    });
+    document.getElementById('signOut').addEventListener('click', () => { sessionStorage.removeItem(tokenKey); consoleCard.classList.add('hidden'); loginCard.classList.remove('hidden'); setStatus('Signed out.'); });
+    if(sessionStorage.getItem(tokenKey)) renderConsole().catch(() => { sessionStorage.removeItem(tokenKey); });
+  </script>
+</body>
+</html>

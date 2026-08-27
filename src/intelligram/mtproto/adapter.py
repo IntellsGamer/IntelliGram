@@ -26,7 +26,9 @@ from intelligram.services.accounts import (
     get_password_srp_state,
     normalize_phone,
     register_password_account,
+    revoke_other_authorizations,
     start_device_login,
+    update_password_from_srp,
 )
 from intelligram.services.messaging import (
     MessagingError,
@@ -266,6 +268,12 @@ class MTProtoSessionAdapter:
             return self._handle_auth_send_code(message, phone_number=str(request.fields["phone_number"]))
         if request.name == "account_get_password":
             return self._handle_account_get_password(message)
+        if request.name == "account_update_password_settings":
+            return self._handle_account_update_password_settings(
+                message,
+                current_password=request.fields["current_password"],
+                new_settings=request.fields["new_settings"],
+            )
         if request.name == "auth_check_password":
             return self._handle_auth_check_password(
                 message,
@@ -620,6 +628,8 @@ class MTProtoSessionAdapter:
             return self._handle_account_get_authorizations(message)
         if request.name == "account_reset_authorization":
             return self._handle_account_reset_authorization(message, key_id=int(request.fields["hash"]))
+        if request.name == "auth_reset_authorizations":
+            return self._handle_auth_reset_authorizations(message)
         LOGGER.warning("Unsupported MTProto encrypted request: %s (0x%08x)", request.name, request.constructor_id)
         return self._encrypt_rpc_error(message, "METHOD_INVALID")
 
@@ -861,6 +871,34 @@ class MTProtoSessionAdapter:
         self._associate_auth_key(issued.user_id)
         return self._encrypt_result(message, encode_auth_authorization(user=self._load_user(issued.user_id)))
 
+    def _handle_account_update_password_settings(
+        self,
+        message: EncryptedMessage,
+        *,
+        current_password: object,
+        new_settings: object,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        if not isinstance(current_password, dict) or not isinstance(new_settings, dict):
+            return self._encrypt_rpc_error(message, "PASSWORD_HASH_INVALID")
+        try:
+            with database.transaction(immediate=True) as connection:
+                update_password_from_srp(
+                    connection,
+                    user_id=self_user_id,
+                    auth_key_id=str(auth_key_id(self.auth_key)),
+                    srp_id=int(current_password["srp_id"]),
+                    client_A=bytes(current_password["A"]),
+                    client_M1=bytes(current_password["M1"]),
+                    new_settings=new_settings,
+                )
+        except (AccountAuthError, KeyError, TypeError, ValueError) as exc:
+            return self._encrypt_rpc_error(message, str(exc) if isinstance(exc, AccountAuthError) else "PASSWORD_HASH_INVALID")
+        return self._encrypt_result(message, encode_bool(True))
+
     def _handle_auth_sign_up(
         self,
         message: EncryptedMessage,
@@ -928,6 +966,35 @@ class MTProtoSessionAdapter:
     def _require_authenticated(self, message: EncryptedMessage) -> tuple[Database, int] | bytes:
         if self.database is None or self.user_id is None:
             return self._encrypt_rpc_error(message, "AUTH_KEY_UNREGISTERED")
+        # A WebSocket may remain physically connected after another session
+        # revokes its MTProto key. Revalidate durable key ownership for every
+        # protected request so the native Active Sessions removal control has
+        # immediate security effect instead of merely changing its list UI.
+        key_id = str(auth_key_id(self.auth_key))
+        with self.database.transaction() as connection:
+            binding = connection.execute(
+                """
+                SELECT user_id FROM auth_keys
+                WHERE auth_key_id = ? AND user_id = ? AND revoked_at IS NULL
+                AND (expires_at IS NULL OR expires_at >= ?)
+                """,
+                (key_id, self.user_id, now_unix()),
+            ).fetchone()
+            any_key = connection.execute(
+                "SELECT 1 FROM auth_keys WHERE auth_key_id = ?",
+                (key_id,),
+            ).fetchone()
+        if binding is None and any_key is None:
+            # Trusted in-process adapters (including encrypted regression
+            # fixtures) may be created with an already authenticated user id
+            # before their MTProto key is first associated. A network-created
+            # adapter never receives user_id this way; persist that initial
+            # binding, then enforce revocation on all later requests.
+            self._associate_auth_key(self.user_id)
+            return self.database, self.user_id
+        if binding is None:
+            self.user_id = None
+            return self._encrypt_rpc_error(message, "AUTH_KEY_UNREGISTERED")
         return self.database, self.user_id
 
     def _load_user(self, user_id: int) -> dict[str, object]:
@@ -935,7 +1002,7 @@ class MTProtoSessionAdapter:
             raise RuntimeError("Database is required for a signed-in user")
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         if row is None:
@@ -1002,7 +1069,7 @@ class MTProtoSessionAdapter:
             return {}
         placeholders = ",".join("?" for _ in user_ids)
         rows = connection.execute(
-            f"SELECT id, phone, username, first_name, last_name, about, profile_photo_id FROM users WHERE id IN ({placeholders})",
+            f"SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service FROM users WHERE id IN ({placeholders})",
             sorted(user_ids),
         ).fetchall()
         return {int(row["id"]): dict(row) for row in rows}
@@ -1310,7 +1377,7 @@ class MTProtoSessionAdapter:
                     [*updates.values(), int(time.time()), self_user_id],
                 )
             user = connection.execute(
-                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service FROM users WHERE id = ?",
                 (self_user_id,),
             ).fetchone()
         if user is None:
@@ -1766,6 +1833,19 @@ class MTProtoSessionAdapter:
                 )
         return self._encrypt_result(message, encode_bool(bool(changed)))
 
+    def _handle_auth_reset_authorizations(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        with database.transaction(immediate=True) as connection:
+            revoke_other_authorizations(
+                connection,
+                user_id=self_user_id,
+                current_auth_key_id=str(auth_key_id(self.auth_key)),
+            )
+        return self._encrypt_result(message, encode_bool(True))
+
     def _handle_auth_log_out(self, message: EncryptedMessage) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
@@ -1937,7 +2017,7 @@ class MTProtoSessionAdapter:
         with database.transaction() as connection:
             target = connection.execute(
                 """
-                SELECT id, phone, username, first_name, last_name, about, profile_photo_id
+                SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service
                 FROM users WHERE lower(username) = ?
                 """,
                 (normalized,),
@@ -3357,7 +3437,12 @@ class MTProtoSessionAdapter:
             file = media.get("file")
             if not isinstance(file, dict):
                 raise MessagingError("PHOTO_FILE_MISSING")
-            assembled = self._assemble_uploaded_file(connection, user_id=user_id, file=file)
+            assembled = self._assemble_uploaded_file(
+                connection,
+                user_id=user_id,
+                file=file,
+                requested_mime_type=str(media.get("mime_type") or "") or None,
+            )
             filename = str(assembled["filename"])
             for attribute in media.get("attributes") or []:
                 if isinstance(attribute, dict) and attribute.get("kind") == "filename" and attribute.get("file_name"):
@@ -3372,7 +3457,7 @@ class MTProtoSessionAdapter:
                 "kind": "photo" if kind == "uploaded_photo" else "document",
                 "file_id": int(assembled["id"]),
                 "filename": filename,
-                "mime_type": str(media.get("mime_type") or assembled["mime_type"]),
+                "mime_type": str(assembled["mime_type"]),
                 "size": int(assembled["size"]),
                 "date": int(assembled["created_at"]),
                 "attributes": attributes,
@@ -3396,7 +3481,12 @@ class MTProtoSessionAdapter:
         raise MessagingError("MEDIA_INVALID")
 
     def _assemble_uploaded_file(
-        self, connection: object, *, user_id: int, file: dict[str, object]
+        self,
+        connection: object,
+        *,
+        user_id: int,
+        file: dict[str, object],
+        requested_mime_type: str | None = None,
     ) -> dict[str, object]:
         file_id = int(file.get("file_id", 0))
         parts = int(file.get("parts", 0))
@@ -3417,10 +3507,18 @@ class MTProtoSessionAdapter:
         if not content or len(content) > 20 * 1024 * 1024:
             raise MessagingError("FILE_TOO_BIG")
         now = int(time.time())
-        mime_type = "application/octet-stream"
-        lowered = filename.lower()
-        if lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-            mime_type = "image/jpeg" if lowered.endswith((".jpg", ".jpeg")) else f"image/{lowered.rsplit('.', 1)[-1]}"
+        # `inputMediaUploadedDocument` carries the browser-detected MIME type.
+        # Preserve it on the durable stored file as well as the immediate
+        # message projection; otherwise generic attachments rehydrate as an
+        # unknown octet stream despite Web K supplying e.g. application/pdf.
+        candidate_mime_type = (requested_mime_type or "").strip().lower()
+        if candidate_mime_type and "/" in candidate_mime_type and len(candidate_mime_type) <= 255:
+            mime_type = candidate_mime_type
+        else:
+            mime_type = "application/octet-stream"
+            lowered = filename.lower()
+            if lowered.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                mime_type = "image/jpeg" if lowered.endswith((".jpg", ".jpeg")) else f"image/{lowered.rsplit('.', 1)[-1]}"
         stored = connection.execute(
             """
             INSERT INTO stored_files(owner_user_id, source_file_id, filename, mime_type, content, created_at)
@@ -3472,7 +3570,11 @@ class MTProtoSessionAdapter:
         return self._encrypt_response(response_body)
 
     def _encrypt_rpc_error(self, request: EncryptedMessage, message: str) -> bytes:
-        return self._encrypt_result(request, encode_rpc_error(code=400, message=message))
+        # MTProto clients distinguish an unauthenticated/revoked key from a
+        # malformed authenticated request. In particular, Active Sessions must
+        # make a live removed device receive the normal 401 authorization error.
+        code = 401 if message == "AUTH_KEY_UNREGISTERED" else 400
+        return self._encrypt_result(request, encode_rpc_error(code=code, message=message))
 
     def _encrypt_response(self, body: bytes) -> bytes:
         if self.session_id is None:

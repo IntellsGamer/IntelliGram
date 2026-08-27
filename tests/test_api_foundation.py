@@ -8,7 +8,7 @@ from intelligram.api.app import create_app
 from intelligram.config import Settings
 
 
-def _client(tmp_path: Path) -> TestClient:
+def _client(tmp_path: Path, *, admin_owner_phone: str | None = None) -> TestClient:
     settings = Settings(
         database_path=tmp_path / "test.sqlite3",
         host="127.0.0.1",
@@ -21,6 +21,7 @@ def _client(tmp_path: Path) -> TestClient:
         mtproto_port=10443,
         mtproto_rsa_private_key_path=tmp_path / "mtproto_private.pem",
         mtproto_rsa_public_key_path=tmp_path / "mtproto_public.pem",
+        admin_owner_phone=admin_owner_phone,
     )
     return TestClient(create_app(settings))
 
@@ -38,6 +39,103 @@ def _register_and_login(client: TestClient, phone: str, first_name: str) -> tupl
     assert response.status_code == 201, response.text
     body = response.json()
     return body["user_id"], {"Authorization": f"Bearer {body['access_token']}"}
+
+
+def test_owner_console_rejects_non_owner_and_grants_premium(tmp_path: Path) -> None:
+    owner_phone = "+15550000901"
+    client = _client(tmp_path, admin_owner_phone=owner_phone)
+    owner_id, owner_headers = _register_and_login(client, owner_phone, "Owner")
+    member_id, member_headers = _register_and_login(client, "+15550000902", "Member")
+
+    # A valid ordinary IntelliGram password can never obtain an owner-console
+    # token merely by knowing the endpoint.
+    rejected = client.post(
+        "/v1/admin/login",
+        json={"phone": "+15550000902", "password": "correct-horse-battery-staple"},
+    )
+    assert rejected.status_code == 401
+    assert rejected.json()["detail"] == "ADMIN_LOGIN_INVALID"
+    assert client.get("/v1/admin/session", headers=member_headers).status_code == 403
+
+    login = client.post(
+        "/v1/admin/login",
+        json={"phone": owner_phone, "password": "correct-horse-battery-staple"},
+    )
+    assert login.status_code == 200, login.text
+    admin_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    session = client.get("/v1/admin/session", headers=admin_headers)
+    assert session.status_code == 200
+    assert session.json()["owner"]["id"] == owner_id
+    assert client.get("/admin").status_code == 200
+
+    granted = client.post(
+        f"/v1/admin/users/{member_id}/premium",
+        headers=admin_headers,
+        json={"premium": True},
+    )
+    assert granted.status_code == 200
+    users = client.get("/v1/admin/users", headers=admin_headers)
+    assert users.status_code == 200
+    member = next(item for item in users.json()["users"] if item["id"] == member_id)
+    assert member["premium"] == 1
+    assert client.post(
+        f"/v1/admin/users/{owner_id}/premium",
+        headers=member_headers,
+        json={"premium": True},
+    ).status_code == 403
+
+
+def test_shared_in_app_login_code_is_invalidated_and_service_identity_is_protected(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    phone = "+15550000911"
+    registration = client.post(
+        "/v1/auth/register",
+        json={
+            "phone": phone,
+            "password": "correct-horse-battery-staple",
+            "first_name": "Code Owner",
+        },
+    )
+    assert registration.status_code == 201
+    owner_headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+
+    started = client.post("/v1/auth/login/start", json={"phone": phone, "device_label": "Second browser"})
+    assert started.status_code == 200
+    challenge_id = started.json()["challenge_id"]
+    updates = client.get("/v1/updates/difference?after_pts=0", headers=owner_headers).json()["updates"]
+    login_update = next(item for item in updates if item["@type"] == "updateIntelliGramLoginCode")
+    code = login_update["payload"]["code"]
+    dialogs = client.get("/v1/dialogs", headers=owner_headers).json()["dialogs"]
+    service_dialog = next(item for item in dialogs if item["title"] == "IntelliGram Official")
+
+    shared = client.post(
+        "/v1/messages",
+        headers=owner_headers,
+        json={
+            "peer_id": service_dialog["peer_id"],
+            "body": f"Forwarding this elsewhere: {code}",
+            "client_random_id": "controlled-shared-login-code",
+        },
+    )
+    assert shared.status_code == 201, shared.text
+    rejected = client.post(
+        "/v1/auth/login/complete",
+        json={"phone": phone, "challenge_id": challenge_id, "code": code, "device_label": "Second browser"},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "PHONE_CODE_SHARED"
+
+    with client.app.state.database.transaction() as connection:
+        service = connection.execute(
+            "SELECT first_name, username, verified, is_service FROM users WHERE username = 'intelligram_login'"
+        ).fetchone()
+    assert service is not None
+    assert dict(service) == {
+        "first_name": "IntelliGram Official",
+        "username": "intelligram_login",
+        "verified": 1,
+        "is_service": 1,
+    }
 
 
 def test_dialog_history_and_difference_recover_after_offline_period(tmp_path: Path) -> None:

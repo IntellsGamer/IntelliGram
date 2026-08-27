@@ -41,6 +41,9 @@ class Database:
                     last_name TEXT NOT NULL DEFAULT '',
                     about TEXT NOT NULL DEFAULT '',
                     password_hash TEXT,
+                    premium INTEGER NOT NULL DEFAULT 0 CHECK(premium IN (0, 1)),
+                    verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0, 1)),
+                    is_service INTEGER NOT NULL DEFAULT 0 CHECK(is_service IN (0, 1)),
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -77,6 +80,7 @@ class Database:
                     approved_at INTEGER,
                     completed_at INTEGER,
                     denied_at INTEGER,
+                    denial_reason TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
                 );
 
@@ -299,7 +303,7 @@ class Database:
                     delivered_at INTEGER
                 );
 
-                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '12')
+                INSERT INTO schema_meta(key, value) VALUES ('schema_version', '15')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                 """
             )
@@ -319,6 +323,18 @@ class Database:
                 connection.execute("ALTER TABLE users ADD COLUMN about TEXT NOT NULL DEFAULT ''")
             if "profile_photo_id" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN profile_photo_id INTEGER")
+            if "premium" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN premium INTEGER NOT NULL DEFAULT 0")
+            if "verified" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+            if "is_service" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0")
+            login_challenge_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(login_challenges)").fetchall()
+            }
+            if "denial_reason" not in login_challenge_columns:
+                connection.execute("ALTER TABLE login_challenges ADD COLUMN denial_reason TEXT")
             channel_settings_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(channel_settings)").fetchall()

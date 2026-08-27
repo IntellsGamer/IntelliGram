@@ -11,10 +11,13 @@ from typing import Literal
 
 from intelligram.auth.tokens import create_session_id
 from intelligram.database import now_unix
+from intelligram.services.login_security import challenge_code_hash
 from intelligram.services.messaging import create_user, get_or_create_direct_peer, send_message
 from intelligram.services.srp import (
     CHALLENGE_LIFETIME_SECONDS as SRP_CHALLENGE_LIFETIME_SECONDS,
+    G,
     MAX_PASSWORD_ATTEMPTS,
+    P_BYTES,
     make_challenge,
     make_password_verifier,
     verify_proof,
@@ -192,7 +195,7 @@ def start_device_login(
         INSERT INTO login_challenges(id, user_id, requested_device_label, code_hash, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (challenge_id, user_id, _normalize_device_label(device_label), _challenge_code_hash(challenge_id, code), now, expires_at),
+        (challenge_id, user_id, _normalize_device_label(device_label), challenge_code_hash(challenge_id, code), now, expires_at),
     )
     # Preserve the machine-readable update for the self-hosted REST surface,
     # and also deliver the secret through an ordinary incoming dialog/message.
@@ -249,12 +252,25 @@ def _deliver_login_code_message(
         service_user_id = create_user(
             connection,
             phone=LOGIN_SERVICE_PHONE,
-            first_name="IntelliGram",
+            first_name="IntelliGram Official",
             last_name="",
             username=LOGIN_SERVICE_USERNAME,
+            verified=True,
+            is_service=True,
         )
     else:
         service_user_id = int(service["id"])
+        # Upgrade the stable service account in existing self-hosted databases
+        # without changing its internal routing phone or username.
+        connection.execute(
+            """
+            UPDATE users
+            SET first_name = 'IntelliGram Official', last_name = '',
+                verified = 1, is_service = 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (now_unix(), service_user_id),
+        )
     peer_id = get_or_create_direct_peer(
         connection,
         user_id=user_id,
@@ -486,7 +502,7 @@ def complete_device_login(
     now = now_unix()
     challenge = connection.execute(
         """
-        SELECT c.id, c.user_id, c.code_hash, c.expires_at, c.completed_at, c.denied_at, c.attempts
+        SELECT c.id, c.user_id, c.code_hash, c.expires_at, c.completed_at, c.denied_at, c.denial_reason, c.attempts
         FROM login_challenges c
         JOIN users u ON u.id = c.user_id
         WHERE c.id = ? AND u.phone = ?
@@ -495,13 +511,17 @@ def complete_device_login(
     ).fetchone()
     if challenge is None:
         raise AccountAuthError("PHONE_CODE_INVALID")
-    if challenge["completed_at"] is not None or challenge["denied_at"] is not None or int(challenge["expires_at"]) < now:
+    if challenge["completed_at"] is not None or int(challenge["expires_at"]) < now:
+        raise AccountAuthError("PHONE_CODE_EXPIRED")
+    if challenge["denied_at"] is not None:
+        if challenge["denial_reason"] == "shared":
+            raise AccountAuthError("PHONE_CODE_SHARED")
         raise AccountAuthError("PHONE_CODE_EXPIRED")
     attempts = int(challenge["attempts"])
     if attempts >= MAX_LOGIN_CODE_ATTEMPTS:
         connection.execute("UPDATE login_challenges SET denied_at = ? WHERE id = ?", (now, challenge_id))
         raise AccountAuthError("PHONE_CODE_INVALID")
-    if not hmac.compare_digest(str(challenge["code_hash"]), _challenge_code_hash(challenge_id, code)):
+    if not hmac.compare_digest(str(challenge["code_hash"]), challenge_code_hash(challenge_id, code)):
         next_attempts = attempts + 1
         connection.execute(
             "UPDATE login_challenges SET attempts = ?, denied_at = ? WHERE id = ?",
@@ -510,6 +530,127 @@ def complete_device_login(
         raise AccountAuthError("PHONE_CODE_INVALID")
     connection.execute("UPDATE login_challenges SET completed_at = ? WHERE id = ?", (now, challenge_id))
     return _issue_session(connection, user_id=int(challenge["user_id"]), device_label=device_label, now=now)
+
+
+def update_password_from_srp(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    auth_key_id: str,
+    srp_id: int,
+    client_A: bytes,
+    client_M1: bytes,
+    new_settings: dict[str, object],
+) -> None:
+    """Replace a signed-in account's password verifier using Web K SRP data.
+
+    The native `account.updatePasswordSettings` request does not expose the new
+    password text. Its `new_password_hash` is already the SRP verifier, so it
+    can be stored directly after the *current* password proof is validated.
+    The older REST-only scrypt hash is cleared rather than retaining a password
+    which the user has just replaced; native code/SRP authentication remains
+    available for the new password.
+    """
+
+    now = now_unix()
+    row = connection.execute(
+        """
+        SELECT c.private_b, c.srp_B, c.expires_at, c.completed_at, c.attempts,
+               v.salt1, v.salt2, v.verifier
+        FROM password_srp_challenges c
+        JOIN password_srp_verifiers v ON v.user_id = c.user_id
+        WHERE c.srp_id = ? AND c.auth_key_id = ? AND c.user_id = ?
+        """,
+        (srp_id, auth_key_id, user_id),
+    ).fetchone()
+    if row is None or row["completed_at"] is not None or int(row["expires_at"]) < now:
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+    attempts = int(row["attempts"])
+    if attempts >= MAX_PASSWORD_ATTEMPTS:
+        connection.execute(
+            "UPDATE password_srp_challenges SET completed_at = ? WHERE srp_id = ?",
+            (now, srp_id),
+        )
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+    accepted = verify_proof(
+        salt1=bytes(row["salt1"]),
+        salt2=bytes(row["salt2"]),
+        verifier=bytes(row["verifier"]),
+        private_b=bytes(row["private_b"]),
+        srp_B=bytes(row["srp_B"]),
+        client_A=client_A,
+        client_M1=client_M1,
+    )
+    if not accepted:
+        next_attempts = attempts + 1
+        connection.execute(
+            "UPDATE password_srp_challenges SET attempts = ?, completed_at = ? WHERE srp_id = ?",
+            (next_attempts, now if next_attempts >= MAX_PASSWORD_ATTEMPTS else None, srp_id),
+        )
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+
+    salt1 = new_settings.get("salt1")
+    salt2 = new_settings.get("salt2")
+    verifier = new_settings.get("verifier")
+    if (
+        not isinstance(salt1, bytes)
+        or not isinstance(salt2, bytes)
+        or not isinstance(verifier, bytes)
+        or len(salt1) < 8
+        or len(salt2) < 8
+        or len(verifier) != 256
+        or int(new_settings.get("g", 0)) != G
+        or new_settings.get("p") != P_BYTES
+    ):
+        raise AccountAuthError("PASSWORD_HASH_INVALID")
+
+    connection.execute("UPDATE password_srp_challenges SET completed_at = ? WHERE srp_id = ?", (now, srp_id))
+    connection.execute(
+        """
+        UPDATE password_srp_verifiers
+        SET salt1 = ?, salt2 = ?, verifier = ?, updated_at = ?
+        WHERE user_id = ?
+        """,
+        (salt1, salt2, verifier, now, user_id),
+    )
+    # Never leave the old plaintext-verifiable hash active after a native SRP
+    # update whose new password text is intentionally unavailable to the server.
+    connection.execute("UPDATE users SET password_hash = NULL, updated_at = ? WHERE id = ?", (now, user_id))
+    connection.execute(
+        """
+        UPDATE password_srp_challenges
+        SET completed_at = ?
+        WHERE user_id = ? AND srp_id != ? AND completed_at IS NULL
+        """,
+        (now, user_id, srp_id),
+    )
+
+
+def revoke_other_authorizations(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    current_auth_key_id: str,
+) -> int:
+    """Revoke every active MTProto/browser session except the caller's key."""
+
+    now = now_unix()
+    changed = connection.execute(
+        """
+        UPDATE auth_keys SET revoked_at = ?
+        WHERE user_id = ? AND auth_key_id != ? AND revoked_at IS NULL
+        """,
+        (now, user_id, current_auth_key_id),
+    ).rowcount
+    if changed:
+        connection.execute(
+            """
+            UPDATE sessions SET revoked_at = ?
+            WHERE user_id = ? AND auth_key_id != ? AND revoked_at IS NULL
+            """,
+            (now, user_id, current_auth_key_id),
+        )
+    return int(changed)
 
 
 def active_login_challenges(connection: sqlite3.Connection, *, user_id: int) -> list[dict[str, int | str]]:
@@ -597,10 +738,6 @@ def _issue_session(connection: sqlite3.Connection, *, user_id: int, device_label
         (session_id, user_id, _normalize_device_label(device_label), now, now, expires_at),
     )
     return IssuedSession(session_id=session_id, user_id=user_id, expires_at=expires_at)
-
-
-def _challenge_code_hash(challenge_id: str, code: str) -> str:
-    return hashlib.sha256(f"{challenge_id}:{code}".encode("utf-8")).hexdigest()
 
 
 def _normalize_device_label(value: str) -> str:

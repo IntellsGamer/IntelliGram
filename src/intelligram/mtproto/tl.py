@@ -268,7 +268,10 @@ ACCOUNT_AUTHORIZATION_CONSTRUCTOR = 0xAD01D61D
 ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR = 0x4BFF8EA0
 ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR = 0xE320C158
 ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR = 0xDF77F3BC
+AUTH_RESET_AUTHORIZATIONS_CONSTRUCTOR = 0x9FAB0D1A
 ACCOUNT_GET_PASSWORD_CONSTRUCTOR = 0x548A30F5
+ACCOUNT_UPDATE_PASSWORD_SETTINGS_CONSTRUCTOR = 0xA59B102F
+ACCOUNT_PASSWORD_INPUT_SETTINGS_CONSTRUCTOR = 0xC23727C9
 AUTH_CHECK_PASSWORD_CONSTRUCTOR = 0xD18B4D16
 ACCOUNT_PASSWORD_CONSTRUCTOR = 0x957B50FB
 PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR = 0x3A912D4A
@@ -829,6 +832,40 @@ def parse_request(data: bytes) -> TLRequest:
         })
     elif constructor_id == ACCOUNT_GET_PASSWORD_CONSTRUCTOR:
         request = TLRequest(constructor_id, "account_get_password", {})
+    elif constructor_id == ACCOUNT_UPDATE_PASSWORD_SETTINGS_CONSTRUCTOR:
+        password_constructor = reader.uint32()
+        if password_constructor != INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR:
+            raise TLDecodeError("Expected inputCheckPasswordSRP")
+        current_password = {
+            "srp_id": reader.int64(),
+            "A": reader.bytes(),
+            "M1": reader.bytes(),
+        }
+        if reader.uint32() != ACCOUNT_PASSWORD_INPUT_SETTINGS_CONSTRUCTOR:
+            raise TLDecodeError("Expected account.passwordInputSettings")
+        settings_flags = reader.uint32()
+        if settings_flags & ~0b111:
+            raise TLDecodeError("Unsupported account.passwordInputSettings optional fields")
+        new_settings: dict[str, Any] = {}
+        if settings_flags & 1:
+            if reader.uint32() != PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR:
+                raise TLDecodeError("Unsupported new password KDF algorithm")
+            new_settings["salt1"] = reader.bytes()
+            new_settings["salt2"] = reader.bytes()
+            new_settings["g"] = reader.int32()
+            new_settings["p"] = reader.bytes()
+            new_settings["verifier"] = reader.bytes()
+            new_settings["hint"] = reader.bytes().decode("utf-8")
+        if settings_flags & 2:
+            new_settings["email"] = reader.bytes().decode("utf-8")
+        if settings_flags & 4:
+            # Secure-value settings have no IntelliGram counterpart yet, but
+            # consume neither partial nor unknown payloads silently.
+            raise TLDecodeError("Secure password settings are not supported")
+        request = TLRequest(constructor_id, "account_update_password_settings", {
+            "current_password": current_password,
+            "new_settings": new_settings,
+        })
     elif constructor_id == AUTH_CHECK_PASSWORD_CONSTRUCTOR:
         password_constructor = reader.uint32()
         if password_constructor != INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR:
@@ -880,6 +917,8 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "account_get_authorizations", {})
     elif constructor_id == ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR:
         request = TLRequest(constructor_id, "account_reset_authorization", {"hash": reader.int64()})
+    elif constructor_id == AUTH_RESET_AUTHORIZATIONS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "auth_reset_authorizations", {})
     elif constructor_id == MESSAGES_GET_DIALOGS_CONSTRUCTOR:
         flags = reader.uint32()
         if flags & ~0b11:
@@ -1576,6 +1615,12 @@ def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contac
     username = user.get("username")
     phone = user.get("phone")
     profile_photo_id = user.get("profile_photo_id")
+    # Service routing identifiers are durable implementation details. The
+    # official account should present like Telegram's verified notifications
+    # peer, not expose a sign-in phone or public username to chat recipients.
+    if user.get("is_service"):
+        username = None
+        phone = None
     flags = 1  # access_hash
     if first_name:
         flags |= 1 << 1
@@ -1587,6 +1632,10 @@ def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contac
         flags |= 1 << 4
     if profile_photo_id is not None:
         flags |= 1 << 5
+    if user.get("verified"):
+        flags |= 1 << 17
+    if user.get("premium"):
+        flags |= 1 << 28
     if self_user_id == user_id:
         flags |= 1 << 10
     elif contact:

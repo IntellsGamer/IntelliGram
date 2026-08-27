@@ -9,6 +9,7 @@ import sqlite3
 from typing import Any
 
 from intelligram.database import now_unix
+from intelligram.services.login_security import invalidate_codes_shared_by_owner
 from intelligram.services.updates import UpdateEnvelope, append_update
 
 
@@ -31,7 +32,16 @@ def _require_active_membership(connection: sqlite3.Connection, peer_id: int, use
     return row
 
 
-def create_user(connection: sqlite3.Connection, *, phone: str, first_name: str, last_name: str = "", username: str | None = None) -> int:
+def create_user(
+    connection: sqlite3.Connection,
+    *,
+    phone: str,
+    first_name: str,
+    last_name: str = "",
+    username: str | None = None,
+    verified: bool = False,
+    is_service: bool = False,
+) -> int:
     phone = phone.strip()
     first_name = first_name.strip()
     if not phone or not first_name:
@@ -40,10 +50,19 @@ def create_user(connection: sqlite3.Connection, *, phone: str, first_name: str, 
     try:
         cursor = connection.execute(
             """
-            INSERT INTO users(phone, username, first_name, last_name, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO users(phone, username, first_name, last_name, verified, is_service, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (phone, username.strip().lstrip("@") if username else None, first_name, last_name.strip(), now, now),
+            (
+                phone,
+                username.strip().lstrip("@") if username else None,
+                first_name,
+                last_name.strip(),
+                int(verified),
+                int(is_service),
+                now,
+                now,
+            ),
         )
     except sqlite3.IntegrityError as exc:
         raise MessagingError("PHONE_OR_USERNAME_OCCUPIED") from exc
@@ -1095,6 +1114,15 @@ def send_message(
     ).fetchone()
     if existing is not None:
         return _message_row(existing, connection), []
+
+    # Match only active challenge-bound digests, never persisted plaintext
+    # codes. This executes in the caller's message transaction so a code is
+    # unusable as soon as its owner posts it in any ordinary IntelliGram peer.
+    invalidate_codes_shared_by_owner(
+        connection,
+        owner_user_id=sender_user_id,
+        body=body,
+    )
 
     now = now_unix()
     try:

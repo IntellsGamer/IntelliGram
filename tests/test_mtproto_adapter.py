@@ -416,8 +416,8 @@ def test_web_k_existing_session_login_uses_durable_in_app_code(tmp_path) -> None
             (issued.user_id,),
         ).fetchone()
     assert delivered is not None
-    assert str(delivered["sender_name"]) == "IntelliGram"
-    assert str(delivered["peer_title"]) == "IntelliGram"
+    assert str(delivered["sender_name"]) == "IntelliGram Official"
+    assert str(delivered["peer_title"]) == "IntelliGram Official"
     assert f"login code is: {code}" in str(delivered["body"])
     assert incoming_update is not None
 
@@ -1126,14 +1126,15 @@ def test_web_k_updates_get_difference_replays_durable_message(tmp_path) -> None:
     # RPC result while applying its durable difference. The difference must
     # replay the random-id mapping before it replays the outgoing message so
     # the optimistic bubble is finalized instead of duplicated.
+    sender_auth_key = bytes(reversed(range(256)))
     sender_adapter = MTProtoSessionAdapter(
-        auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id
+        auth_key=sender_auth_key, server_salt=salt, database=database, user_id=alice.user_id
     )
     sender_response = sender_adapter.handle_encrypted(_encrypt_client(
-        auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=get_difference,
+        sender_auth_key, salt=salt, session_id=session_id, msg_id=message_id + 4, seq_no=3, body=get_difference,
     ))
     assert sender_response is not None
-    _, _, _, _, sender_body = _decrypt_server(auth_key, sender_response)
+    _, _, _, _, sender_body = _decrypt_server(sender_auth_key, sender_response)
     assert encode_uint32(UPDATE_MESSAGE_ID_CONSTRUCTOR) in sender_body
     assert (
         encode_uint32(UPDATE_MESSAGE_ID_CONSTRUCTOR)
@@ -3950,3 +3951,411 @@ def test_web_k_persists_channel_signatures_after_encrypted_toggle(tmp_path) -> N
     reloaded_channel = TLReader(full_body[full_channel_offset:])
     assert reloaded_channel.uint32() == CHANNEL_CONSTRUCTOR
     assert reloaded_channel.uint32() & (1 << 11)
+
+
+def test_web_k_send_media_uploaded_document_preserves_mime_and_downloads(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR,
+        INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR,
+        INPUT_FILE_CONSTRUCTOR,
+        INPUT_MEDIA_UPLOADED_DOCUMENT_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGE_MEDIA_DOCUMENT_CONSTRUCTOR,
+        MESSAGES_SEND_MEDIA_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        STORAGE_FILE_UNKNOWN_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        UPLOAD_FILE_CONSTRUCTOR,
+        UPLOAD_GET_FILE_CONSTRUCTOR,
+        UPLOAD_SAVE_FILE_PART_CONSTRUCTOR,
+        VECTOR_CONSTRUCTOR,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_tl_string,
+        encode_uint32,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 818, 51515
+    database = Database(tmp_path / "document-note.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection,
+            phone="+15550000521",
+            password="correct-horse-battery-staple",
+            first_name="Alice",
+            device_label="Alice",
+        )
+        bob = register_password_account(
+            connection,
+            phone="+15550000522",
+            password="correct-horse-battery-staple",
+            first_name="Bob",
+            device_label="Bob",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    request_message_id = (int(time.time()) << 32) + 4
+    upload_id = 888_521
+    document_bytes = b"%PDF-1.7\n%IntelliGram controlled document\n"
+
+    save_part = (
+        encode_uint32(UPLOAD_SAVE_FILE_PART_CONSTRUCTOR)
+        + encode_int64(upload_id)
+        + encode_int32(0)
+        + encode_tl_bytes(document_bytes)
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(auth_key, salt=salt, session_id=session_id, msg_id=request_message_id, seq_no=1, body=save_part)
+    )
+    assert response is not None
+    _, _, _, _, saved_part_body = _decrypt_server(auth_key, response)
+    saved_part_reader = TLReader(saved_part_body)
+    assert saved_part_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    saved_part_reader.int64()
+    assert saved_part_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    filename = "controlled-report.pdf"
+    filename_attribute = (
+        encode_uint32(DOCUMENT_ATTRIBUTE_FILENAME_CONSTRUCTOR)
+        + encode_tl_string(filename)
+    )
+    send_document = (
+        encode_uint32(MESSAGES_SEND_MEDIA_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(bob.user_id)
+        + encode_int64(user_access_hash(bob.user_id))
+        + encode_uint32(INPUT_MEDIA_UPLOADED_DOCUMENT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_FILE_CONSTRUCTOR)
+        + encode_int64(upload_id)
+        + encode_int32(1)
+        + encode_tl_string(filename)
+        + encode_tl_string("")
+        + encode_tl_string("application/pdf")
+        + encode_uint32(VECTOR_CONSTRUCTOR)
+        + encode_int32(1)
+        + filename_attribute
+        + encode_tl_string("Controlled document")
+        + encode_int64(521521)
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id + 4,
+            seq_no=3,
+            body=send_document,
+        )
+    )
+    assert response is not None
+    _, _, _, _, sent_body = _decrypt_server(auth_key, response)
+    sent_reader = TLReader(sent_body)
+    assert sent_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    sent_reader.int64()
+    assert sent_reader.uint32() == UPDATES_CONSTRUCTOR
+    assert sent_reader.vector_count() == 2
+    # updateMessageID then updateNewMessage with messageMediaDocument.
+    sent_reader.uint32()
+    stored_message_id = sent_reader.int32()
+    sent_reader.int64()
+    assert MESSAGE_MEDIA_DOCUMENT_CONSTRUCTOR.to_bytes(4, "little") in sent_body
+
+    with database.transaction() as connection:
+        media = connection.execute(
+            "SELECT file_id, kind, filename, mime_type FROM message_media WHERE message_id = ?",
+            (stored_message_id,),
+        ).fetchone()
+        assert media is not None
+        stored = connection.execute(
+            "SELECT mime_type, content FROM stored_files WHERE id = ?",
+            (int(media["file_id"]),),
+        ).fetchone()
+    assert str(media["kind"]) == "document"
+    assert str(media["filename"]) == filename
+    assert str(media["mime_type"]) == "application/pdf"
+    assert stored is not None
+    assert str(stored["mime_type"]) == "application/pdf"
+    assert bytes(stored["content"]) == document_bytes
+
+    file_id = int(media["file_id"])
+    get_file = (
+        encode_uint32(UPLOAD_GET_FILE_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_DOCUMENT_FILE_LOCATION_CONSTRUCTOR)
+        + encode_int64(file_id)
+        + encode_int64((file_id << 32) | 1)
+        + encode_tl_bytes(f"intelligram-file:{file_id}".encode("ascii"))
+        + encode_tl_string("")
+        + encode_int64(0)
+        + encode_int32(len(document_bytes))
+    )
+    response = adapter.handle_encrypted(
+        _encrypt_client(
+            auth_key,
+            salt=salt,
+            session_id=session_id,
+            msg_id=request_message_id + 8,
+            seq_no=5,
+            body=get_file,
+        )
+    )
+    assert response is not None
+    _, _, _, _, file_body = _decrypt_server(auth_key, response)
+    file_reader = TLReader(file_body)
+    assert file_reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    file_reader.int64()
+    assert file_reader.uint32() == UPLOAD_FILE_CONSTRUCTOR
+    assert file_reader.uint32() == STORAGE_FILE_UNKNOWN_CONSTRUCTOR
+    file_reader.int32()
+    assert file_reader.bytes() == document_bytes
+
+
+def test_web_k_update_password_settings_replaces_srp_verifier(tmp_path) -> None:
+    import hashlib
+    import time
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_GET_PASSWORD_CONSTRUCTOR,
+        ACCOUNT_PASSWORD_CONSTRUCTOR,
+        ACCOUNT_PASSWORD_INPUT_SETTINGS_CONSTRUCTOR,
+        ACCOUNT_UPDATE_PASSWORD_SETTINGS_CONSTRUCTOR,
+        AUTH_AUTHORIZATION_CONSTRUCTOR,
+        AUTH_CHECK_PASSWORD_CONSTRUCTOR,
+        BOOL_TRUE_CONSTRUCTOR,
+        INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR,
+        PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        SECURE_PASSWORD_KDF_ALGO_UNKNOWN_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_tl_string,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.srp import G, P, P_BYTES
+
+    auth_key = bytes(range(255, -1, -1))
+    salt, session_id = 919, 61616
+    old_password = "correct-horse-battery-staple"
+    new_password = "new-native-srp-password"
+    database = Database(tmp_path / "update-password.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15550000531",
+            password=old_password,
+            first_name="Password Owner",
+            device_label="Primary device",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=issued.user_id)
+    # Real signed-in MTProto sessions persist this binding at authorization;
+    # this focused fixture begins from a trusted direct adapter instead.
+    adapter._associate_auth_key(issued.user_id)
+    first_message_id = (int(time.time()) << 32) + 4
+
+    def invoke(query: bytes, index: int) -> TLReader:
+        request_message_id = first_message_id + index * 4
+        response = adapter.handle_encrypted(
+            _encrypt_client(
+                auth_key,
+                salt=salt,
+                session_id=session_id,
+                msg_id=request_message_id,
+                seq_no=index * 2 + 1,
+                body=query,
+            )
+        )
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == request_message_id
+        return reader
+
+    def read_password_state(index: int) -> tuple[bytes, bytes, bytes, int]:
+        reader = invoke(encode_uint32(ACCOUNT_GET_PASSWORD_CONSTRUCTOR), index)
+        assert reader.uint32() == ACCOUNT_PASSWORD_CONSTRUCTOR
+        assert reader.uint32() == 1 << 2
+        assert reader.uint32() == PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR
+        salt1 = reader.bytes()
+        salt2 = reader.bytes()
+        assert reader.int32() == G
+        assert reader.bytes() == P_BYTES
+        srp_B = reader.bytes()
+        srp_id = reader.int64()
+        assert reader.uint32() == PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR
+        reader.bytes()
+        reader.bytes()
+        reader.int32()
+        reader.bytes()
+        assert reader.uint32() == SECURE_PASSWORD_KDF_ALGO_UNKNOWN_CONSTRUCTOR
+        reader.bytes()
+        return salt1, salt2, srp_B, srp_id
+
+    def proof(password: str, salt1: bytes, salt2: bytes, srp_B: bytes) -> tuple[bytes, bytes]:
+        def sha(value: bytes) -> bytes:
+            return hashlib.sha256(value).digest()
+
+        def pad(value: int) -> bytes:
+            return value.to_bytes(256, "big")
+
+        first_hash = sha(salt1 + password.encode() + salt1)
+        second_hash = sha(salt2 + first_hash + salt2)
+        stretched = hashlib.pbkdf2_hmac("sha512", second_hash, salt1, 100_000, dklen=64)
+        x = int.from_bytes(sha(salt2 + stretched + salt2), "big")
+        private_a = 0xA5A5A5A5A5A5A5
+        public_A = pow(G, private_a, P)
+        public_B = int.from_bytes(srp_B, "big")
+        multiplier = int.from_bytes(sha(pad(P) + pad(G)), "big")
+        scrambling = int.from_bytes(sha(pad(public_A) + pad(public_B)), "big")
+        shared_secret = pow((public_B - multiplier * pow(G, x, P)) % P, private_a + scrambling * x, P)
+        session_key = sha(pad(shared_secret))
+        hash_prime_xor_generator = bytes(left ^ right for left, right in zip(sha(pad(P)), sha(pad(G)), strict=True))
+        m1 = sha(
+            hash_prime_xor_generator + sha(salt1) + sha(salt2)
+            + pad(public_A) + pad(public_B) + session_key
+        )
+        return pad(public_A), m1
+
+    salt1, salt2, srp_B, srp_id = read_password_state(0)
+    client_A, client_M1 = proof(old_password, salt1, salt2, srp_B)
+    new_salt1 = salt1 + b"\x81" * 32
+    new_first = hashlib.sha256(new_salt1 + new_password.encode() + new_salt1).digest()
+    new_second = hashlib.sha256(salt2 + new_first + salt2).digest()
+    new_stretched = hashlib.pbkdf2_hmac("sha512", new_second, new_salt1, 100_000, dklen=64)
+    new_x = int.from_bytes(hashlib.sha256(salt2 + new_stretched + salt2).digest(), "big")
+    new_verifier = pow(G, new_x, P).to_bytes(256, "big")
+    update_request = (
+        encode_uint32(ACCOUNT_UPDATE_PASSWORD_SETTINGS_CONSTRUCTOR)
+        + encode_uint32(INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR)
+        + encode_int64(srp_id)
+        + encode_tl_bytes(client_A)
+        + encode_tl_bytes(client_M1)
+        + encode_uint32(ACCOUNT_PASSWORD_INPUT_SETTINGS_CONSTRUCTOR)
+        + encode_uint32(1)
+        + encode_uint32(PASSWORD_KDF_ALGO_SRP_CONSTRUCTOR)
+        + encode_tl_bytes(new_salt1)
+        + encode_tl_bytes(salt2)
+        + encode_int32(G)
+        + encode_tl_bytes(P_BYTES)
+        + encode_tl_bytes(new_verifier)
+        + encode_tl_string("updated natively")
+    )
+    reader = invoke(update_request, 1)
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    refreshed_salt1, refreshed_salt2, refreshed_B, refreshed_id = read_password_state(2)
+    assert refreshed_salt1 == new_salt1
+    assert refreshed_salt2 == salt2
+    new_A, new_M1 = proof(new_password, refreshed_salt1, refreshed_salt2, refreshed_B)
+    reader = invoke(
+        encode_uint32(AUTH_CHECK_PASSWORD_CONSTRUCTOR)
+        + encode_uint32(INPUT_CHECK_PASSWORD_SRP_CONSTRUCTOR)
+        + encode_int64(refreshed_id)
+        + encode_tl_bytes(new_A)
+        + encode_tl_bytes(new_M1),
+        3,
+    )
+    assert reader.uint32() == AUTH_AUTHORIZATION_CONSTRUCTOR
+
+    with database.transaction() as connection:
+        legacy_hash = connection.execute("SELECT password_hash FROM users WHERE id = ?", (issued.user_id,)).fetchone()
+    assert legacy_hash is not None and legacy_hash["password_hash"] is None
+
+
+def test_web_k_authorization_removal_revokes_live_other_adapters(tmp_path) -> None:
+    import time
+
+    from intelligram.database import Database
+    from intelligram.mtproto.crypto import auth_key_id
+    from intelligram.mtproto.tl import (
+        ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR,
+        ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR,
+        AUTH_RESET_AUTHORIZATIONS_CONSTRUCTOR,
+        BOOL_TRUE_CONSTRUCTOR,
+        RPC_ERROR_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int64,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    database = Database(tmp_path / "authorization-revocation.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection,
+            phone="+15550000541",
+            password="correct-horse-battery-staple",
+            first_name="Session Owner",
+            device_label="Primary REST session",
+        )
+    salt, session_id = 1001, 71717
+    primary_key = bytes(range(256))
+    removed_key = bytes(reversed(range(256)))
+    all_reset_key = bytes((value ^ 0x55) for value in range(256))
+    primary = MTProtoSessionAdapter(auth_key=primary_key, server_salt=salt, database=database, user_id=issued.user_id)
+    removed = MTProtoSessionAdapter(auth_key=removed_key, server_salt=salt, database=database, user_id=issued.user_id)
+    all_reset = MTProtoSessionAdapter(auth_key=all_reset_key, server_salt=salt, database=database, user_id=issued.user_id)
+    for adapter in (primary, removed, all_reset):
+        adapter._associate_auth_key(issued.user_id)
+    first_message_id = (int(time.time()) << 32) + 4
+
+    def invoke(adapter: MTProtoSessionAdapter, key: bytes, query: bytes, index: int) -> TLReader:
+        request_message_id = first_message_id + index * 4
+        response = adapter.handle_encrypted(
+            _encrypt_client(
+                key,
+                salt=salt,
+                session_id=session_id,
+                msg_id=request_message_id,
+                seq_no=index * 2 + 1,
+                body=query,
+            )
+        )
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == request_message_id
+        return reader
+
+    removed_key_id = auth_key_id(removed_key)
+    signed_removed_key_id = removed_key_id if removed_key_id < (1 << 63) else removed_key_id - (1 << 64)
+    reader = invoke(
+        primary,
+        primary_key,
+        encode_uint32(ACCOUNT_RESET_AUTHORIZATION_CONSTRUCTOR) + encode_int64(signed_removed_key_id),
+        0,
+    )
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    reader = invoke(removed, removed_key, encode_uint32(ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR), 1)
+    assert reader.uint32() == RPC_ERROR_CONSTRUCTOR
+    assert reader.int32() == 401
+    assert reader.bytes() == b"AUTH_KEY_UNREGISTERED"
+
+    reader = invoke(primary, primary_key, encode_uint32(AUTH_RESET_AUTHORIZATIONS_CONSTRUCTOR), 2)
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    reader = invoke(all_reset, all_reset_key, encode_uint32(ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR), 3)
+    assert reader.uint32() == RPC_ERROR_CONSTRUCTOR
+    assert reader.int32() == 401
+    assert reader.bytes() == b"AUTH_KEY_UNREGISTERED"
+
+    reader = invoke(primary, primary_key, encode_uint32(ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR), 4)
+    # The current device remains authorized and returns account.authorizations.
+    assert reader.uint32() != RPC_ERROR_CONSTRUCTOR

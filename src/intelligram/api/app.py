@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import struct
 from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from intelligram.auth.tokens import TokenError, create_session_id, issue_token, verify_token
@@ -23,6 +25,7 @@ from intelligram.services.accounts import (
     AccountAuthError,
     active_login_challenges,
     complete_device_login,
+    normalize_phone,
     password_login,
     register_password_account,
     start_device_login,
@@ -38,6 +41,7 @@ from intelligram.services.updates import UpdateEnvelope, get_difference, get_sta
 
 
 LOGGER = logging.getLogger("uvicorn.error")
+ADMIN_PANEL_PATH = Path(__file__).with_name("admin.html")
 
 
 class RegisterAccountRequest(BaseModel):
@@ -65,6 +69,16 @@ class CompleteDeviceLoginRequest(BaseModel):
     challenge_id: str = Field(min_length=16, max_length=255)
     code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
     device_label: str = Field(default="IntelliGram Web K", min_length=1, max_length=255)
+
+
+class AdminLoginRequest(BaseModel):
+    phone: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=1, max_length=1024)
+    device_label: str = Field(default="IntelliGram Owner Console", min_length=1, max_length=255)
+
+
+class PremiumGrantRequest(BaseModel):
+    premium: bool
 
 
 class CreateGroupRequest(BaseModel):
@@ -238,9 +252,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not settings.development_mode:
             raise HTTPException(status_code=404, detail="NOT_FOUND")
 
+    def require_owner(user_id: int = Depends(current_user_id)) -> int:
+        # The configured phone is server-side deployment configuration. Never
+        # accept an owner marker, role, or phone comparison from the browser.
+        if settings.admin_owner_phone is None:
+            raise HTTPException(status_code=404, detail="NOT_FOUND")
+        with database.transaction() as connection:
+            owner = connection.execute(
+                "SELECT 1 FROM users WHERE id = ? AND phone = ?",
+                (user_id, settings.admin_owner_phone),
+            ).fetchone()
+        if owner is None:
+            raise HTTPException(status_code=403, detail="OWNER_REQUIRED")
+        return user_id
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {"status": "ok", "service": "intelligram-server", "development_mode": settings.development_mode}
+
+    @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+    def admin_panel() -> HTMLResponse:
+        return HTMLResponse(ADMIN_PANEL_PATH.read_text(encoding="utf-8"))
 
     @app.get("/v1/bootstrap")
     def bootstrap() -> dict[str, Any]:
@@ -345,6 +377,75 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except AccountAuthError as exc:
             status = 401 if str(exc) in {"PHONE_CODE_INVALID", "PHONE_CODE_EXPIRED"} else 400
             raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/login")
+    async def admin_login(request: AdminLoginRequest) -> dict[str, Any]:
+        if settings.admin_owner_phone is None:
+            raise HTTPException(status_code=404, detail="NOT_FOUND")
+        try:
+            requested_phone = normalize_phone(request.phone)
+        except AccountAuthError as exc:
+            raise HTTPException(status_code=401, detail="ADMIN_LOGIN_INVALID") from exc
+        # Reject before invoking the generic sign-in path, so no non-owner can
+        # obtain an owner-console session even with valid IntelliGram credentials.
+        if requested_phone != settings.admin_owner_phone:
+            raise HTTPException(status_code=401, detail="ADMIN_LOGIN_INVALID")
+        try:
+            with database.transaction(immediate=True) as connection:
+                issued = password_login(
+                    connection,
+                    phone=requested_phone,
+                    password=request.password,
+                    device_label=request.device_label,
+                )
+            return session_payload(issued.session_id, issued.user_id, issued.expires_at)
+        except AccountAuthError as exc:
+            raise HTTPException(status_code=401, detail="ADMIN_LOGIN_INVALID") from exc
+
+    @app.get("/v1/admin/session")
+    def admin_session(user_id: int = Depends(require_owner)) -> dict[str, Any]:
+        with database.transaction() as connection:
+            owner = connection.execute(
+                "SELECT id, first_name, last_name, username, phone FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        assert owner is not None
+        return {"owner": dict(owner)}
+
+    @app.get("/v1/admin/users")
+    def admin_users(user_id: int = Depends(require_owner)) -> dict[str, Any]:
+        with database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT u.id, u.first_name, u.last_name, u.username, u.premium,
+                       u.created_at,
+                       COUNT(ak.auth_key_id) AS active_authorizations
+                FROM users u
+                LEFT JOIN auth_keys ak ON ak.user_id = u.id
+                    AND ak.revoked_at IS NULL
+                    AND (ak.expires_at IS NULL OR ak.expires_at >= ?)
+                GROUP BY u.id
+                ORDER BY u.id ASC
+                LIMIT 500
+                """,
+                (now_unix(),),
+            ).fetchall()
+        return {"users": [dict(row) for row in rows]}
+
+    @app.post("/v1/admin/users/{target_user_id}/premium")
+    def admin_set_premium(
+        target_user_id: int,
+        request: PremiumGrantRequest,
+        _owner_user_id: int = Depends(require_owner),
+    ) -> dict[str, Any]:
+        with database.transaction(immediate=True) as connection:
+            changed = connection.execute(
+                "UPDATE users SET premium = ?, updated_at = ? WHERE id = ?",
+                (int(request.premium), now_unix(), target_user_id),
+            ).rowcount
+        if not changed:
+            raise HTTPException(status_code=404, detail="USER_ID_INVALID")
+        return {"user_id": target_user_id, "premium": request.premium}
 
     @app.get("/v1/auth/login-challenges")
     def login_challenges(user_id: int = Depends(current_user_id)) -> dict[str, Any]:

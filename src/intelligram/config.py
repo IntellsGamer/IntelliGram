@@ -10,6 +10,39 @@ from urllib.parse import urlsplit
 DEFAULT_PUBLIC_LINK_BASE_URL = "https://intelligram.local"
 
 
+def _load_local_dotenv() -> None:
+    """Load simple local `.env` assignments without overriding real environment.
+
+    IntelliGram intentionally avoids a dotenv runtime dependency. This tiny
+    parser accepts the deployment convention needed for self-hosted local use
+    while shell/service-manager variables always take precedence.
+    """
+
+    path = Path.cwd() / ".env"
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if value[:1] == value[-1:] and value[:1] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key.replace("_", "").isalnum() and key not in os.environ:
+            os.environ[key] = value
+
+
+def _normalize_admin_phone(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    digits = "".join(character for character in value if character.isdigit())
+    if not 3 <= len(digits) <= 15:
+        raise ValueError("INTELLIGRAM_ADMIN_PHONE must contain 3 to 15 digits")
+    return f"+{digits}"
+
+
 def _normalize_public_link_base_url(value: str) -> str:
     normalized = value.strip().rstrip("/")
     parsed = urlsplit(normalized)
@@ -42,9 +75,12 @@ class Settings:
     # External, user-visible base for public usernames and server-generated invite links.
     # This is intentionally separate from `public_base_url`, which identifies the HTTP API.
     public_link_base_url: str = DEFAULT_PUBLIC_LINK_BASE_URL
+    # Optional, server-side-only phone identity permitted to use the owner portal.
+    admin_owner_phone: str | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
+        _load_local_dotenv()
         development_mode = os.getenv("INTELLIGRAM_DEVELOPMENT_MODE", "true").lower() == "true"
         token_secret_text = os.getenv("INTELLIGRAM_TOKEN_SECRET")
         if token_secret_text:
@@ -79,6 +115,7 @@ class Settings:
             public_link_base_url=_normalize_public_link_base_url(
                 os.getenv("INTELLIGRAM_PUBLIC_LINK_BASE_URL", DEFAULT_PUBLIC_LINK_BASE_URL)
             ),
+            admin_owner_phone=_normalize_admin_phone(os.getenv("INTELLIGRAM_ADMIN_PHONE")),
         )
 
     def ensure_directories(self) -> None:
