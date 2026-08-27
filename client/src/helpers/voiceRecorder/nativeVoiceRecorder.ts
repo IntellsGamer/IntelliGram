@@ -48,6 +48,50 @@ const ENCODER_SAMPLE_RATE = 48000;
 const DEFAULT_BITRATE = 32000;
 const DEFAULT_FRAME_DURATION_US = 20000;
 const DEFAULT_OPUS_FRAME_SAMPLES = (DEFAULT_FRAME_DURATION_US * ENCODER_SAMPLE_RATE) / 1_000_000;
+const STARTUP_TIMEOUT_MS = 10_000;
+const AUDIO_PIPELINE_TIMEOUT_MS = 2_000;
+
+class RecorderStartupTimeoutError extends Error {
+  constructor(stage: string, timeoutMs = STARTUP_TIMEOUT_MS) {
+    super(`${stage} did not become ready within ${timeoutMs / 1000} seconds`);
+    this.name = 'TimeoutError';
+  }
+}
+
+// Browser media APIs are permitted to leave requests pending indefinitely (for
+// example after a device-driver restart or a stuck worklet module load). Do not
+// leave the composer permanently locked in that case. A late media stream is
+// immediately stopped, so a timed-out request cannot retain the microphone.
+function awaitStartup<T>(
+  promise: Promise<T>,
+  stage: string,
+  disposeLateValue?: (value: T) => void,
+  timeoutMs = STARTUP_TIMEOUT_MS
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if(settled) return;
+      settled = true;
+      reject(new RecorderStartupTimeoutError(stage, timeoutMs));
+    }, timeoutMs);
+
+    promise.then((value) => {
+      if(settled) {
+        disposeLateValue?.(value);
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve(value);
+    }, (error) => {
+      if(settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+}
 
 export interface NativeVoiceRecorderConfig {
   encoderSampleRate?: number;
@@ -75,6 +119,10 @@ export default class NativeVoiceRecorder {
   private stream: MediaStream;
   private audioContext: AudioContext;
   private workletNode: AudioWorkletNode;
+  // WebCodecs itself does not require AudioWorklet. Keep the OGG/Opus encoder
+  // path available in browsers where the worklet module cannot start by using
+  // the standard ScriptProcessor PCM callback as a compatibility fallback.
+  private scriptProcessor: ScriptProcessorNode;
   private encoder: AudioEncoder;
   private writer: OggOpusWriter;
   private encoderTimestampUs = 0;
@@ -103,60 +151,149 @@ export default class NativeVoiceRecorder {
   public async start(): Promise<void> {
     if(this.state !== 'inactive') return;
 
-    // Reuse the call stack's getUserMedia chokepoint: if the selected mic is
-    // gone it strips the deviceId, clears the stale appSettings.callDevices.
-    // microphoneId and retries on the OS default — same self-healing as calls.
-    this.stream = await getStream({audio: this.config.mediaTrackConstraints});
+    // stop()/failed-start cleanup leaves no live audio graph. Clear stale node
+    // references before choosing this session's preferred pipeline so a prior
+    // fallback can never suppress a fresh fallback decision.
+    this.workletNode = undefined;
+    this.scriptProcessor = undefined;
 
-    this.audioContext = new AudioContext({sampleRate: this.config.encoderSampleRate});
-    this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
-
-    const blob = new Blob([WORKLET_SOURCE], {type: 'application/javascript'});
-    const workletUrl = URL.createObjectURL(blob);
     try {
-      await this.audioContext.audioWorklet.addModule(workletUrl);
-    } finally {
-      URL.revokeObjectURL(workletUrl);
+      // Reuse the call stack's getUserMedia chokepoint: if the selected mic is
+      // gone it strips the deviceId, clears the stale appSettings.callDevices
+      // microphoneId, and retries on the OS default. The explicit bound also
+      // guarantees a hung capture request restores the composer instead of
+      // leaving `isStartingRecording` true forever.
+      this.stream = await awaitStartup(
+        getStream({audio: this.config.mediaTrackConstraints}),
+        'Microphone request',
+        (stream) => stream.getTracks().forEach((track) => track.stop())
+      );
+
+      this.audioContext = new AudioContext({sampleRate: this.config.encoderSampleRate});
+      this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
+
+      const canUseWorklet = typeof AudioWorkletNode !== 'undefined' && !!this.audioContext.audioWorklet;
+      if(canUseWorklet) {
+        const blob = new Blob([WORKLET_SOURCE], {type: 'application/javascript'});
+        const workletUrl = URL.createObjectURL(blob);
+        try {
+          await awaitStartup(
+            this.audioContext.audioWorklet.addModule(workletUrl),
+            'AudioWorklet module',
+            undefined,
+            AUDIO_PIPELINE_TIMEOUT_MS
+          );
+          this.workletNode = new AudioWorkletNode(this.audioContext, WORKLET_PROCESSOR_NAME, {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [this.config.numberOfChannels],
+            processorOptions: {bufferSize: WORKLET_BUFFER_SIZE}
+          });
+          this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => this.onPcmSamples(e.data);
+          this.sourceNode.connect(this.workletNode);
+          // AudioWorkletNode needs a downstream consumer for process() to be
+          // called; its output is silent because the processor never writes it.
+          this.workletNode.connect(this.audioContext.destination);
+        } catch(error) {
+          // A Blob-backed worklet can be rejected or remain stuck by a browser
+          // policy even though capture and WebCodecs work. Fall through to the
+          // synchronous ScriptProcessor PCM tap instead of leaving recording
+          // unavailable after microphone permission has been granted.
+          try {
+            this.workletNode?.disconnect();
+          } catch(e) {}
+          if(this.workletNode) this.workletNode.port.onmessage = null;
+          this.workletNode = undefined;
+          console.warn('[NativeVoiceRecorder] AudioWorklet unavailable; using ScriptProcessor fallback:', error);
+        } finally {
+          URL.revokeObjectURL(workletUrl);
+        }
+      }
+
+      if(!this.workletNode) {
+        // Older or policy-restricted Chromium builds can expose WebCodecs while
+        // worklet module startup is unavailable. ScriptProcessor remains enough
+        // to feed the same PCM → WebCodecs → OGG/Opus pipeline.
+        this.scriptProcessor = this.audioContext.createScriptProcessor(
+          WORKLET_BUFFER_SIZE,
+          this.config.numberOfChannels,
+          this.config.numberOfChannels
+        );
+        this.scriptProcessor.onaudioprocess = (event) => {
+          const samples = event.inputBuffer.getChannelData(0).slice();
+          this.onPcmSamples(samples);
+          for(let channel = 0; channel < event.outputBuffer.numberOfChannels; channel++) {
+            event.outputBuffer.getChannelData(channel).fill(0);
+          }
+        };
+        this.sourceNode.connect(this.scriptProcessor);
+        this.scriptProcessor.connect(this.audioContext.destination);
+      }
+
+      this.writer = new OggOpusWriter({
+        channels: this.config.numberOfChannels,
+        inputSampleRate: this.config.encoderSampleRate
+      });
+
+      this.encoder = new AudioEncoder({
+        output: (chunk, metadata) => this.onEncoderChunk(chunk, metadata),
+        error: (err) => console.error('[NativeVoiceRecorder] encoder error:', err)
+      });
+
+      this.encoder.configure({
+        codec: 'opus',
+        sampleRate: this.config.encoderSampleRate,
+        numberOfChannels: this.config.numberOfChannels,
+        bitrate: this.config.encoderBitRate
+      });
+
+      // The recorder is reached after Web K's async chat-rights/profile checks,
+      // so the AudioContext may no longer inherit the original click gesture.
+      // Resume explicitly and bound it for the same no-hang guarantee.
+      if(this.audioContext.state === 'suspended') {
+        await awaitStartup(this.audioContext.resume(), 'Audio context', undefined, AUDIO_PIPELINE_TIMEOUT_MS);
+      }
+
+      this.state = 'recording';
+      this.encoderTimestampUs = 0;
+      this.opusHeadCaptured = false;
+      this.onstart();
+    } catch(error) {
+      await this.cleanupFailedStart();
+      throw error;
     }
-
-    this.workletNode = new AudioWorkletNode(this.audioContext, WORKLET_PROCESSOR_NAME, {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [this.config.numberOfChannels],
-      processorOptions: {bufferSize: WORKLET_BUFFER_SIZE}
-    });
-
-    this.writer = new OggOpusWriter({
-      channels: this.config.numberOfChannels,
-      inputSampleRate: this.config.encoderSampleRate
-    });
-
-    this.encoder = new AudioEncoder({
-      output: (chunk, metadata) => this.onEncoderChunk(chunk, metadata),
-      error: (err) => console.error('[NativeVoiceRecorder] encoder error:', err)
-    });
-
-    this.encoder.configure({
-      codec: 'opus',
-      sampleRate: this.config.encoderSampleRate,
-      numberOfChannels: this.config.numberOfChannels,
-      bitrate: this.config.encoderBitRate
-    });
-
-    this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => this.onWorkletMessage(e.data);
-
-    this.sourceNode.connect(this.workletNode);
-    // AudioWorkletNode needs a downstream consumer for process() to be called;
-    // outputs are silent (we never write to them).
-    this.workletNode.connect(this.audioContext.destination);
-
-    this.state = 'recording';
-    this.encoderTimestampUs = 0;
-    this.opusHeadCaptured = false;
-    this.onstart();
   }
 
-  private onWorkletMessage(samples: Float32Array) {
+  private async cleanupFailedStart() {
+    try {
+      this.sourceNode?.disconnect();
+    } catch(e) {}
+    try {
+      this.workletNode?.disconnect();
+    } catch(e) {}
+    if(this.workletNode) this.workletNode.port.onmessage = null;
+    this.workletNode = undefined;
+    if(this.scriptProcessor) {
+      try {
+        this.scriptProcessor.disconnect();
+      } catch(e) {}
+      this.scriptProcessor.onaudioprocess = null;
+    }
+    this.scriptProcessor = undefined;
+    if(this.stream) this.stream.getTracks().forEach((track) => track.stop());
+    if(this.encoder && this.encoder.state !== 'closed') {
+      try {
+        this.encoder.close();
+      } catch(e) {}
+    }
+    if(this.audioContext && this.audioContext.state !== 'closed') {
+      try {
+        await this.audioContext.close();
+      } catch(e) {}
+    }
+  }
+
+  private onPcmSamples(samples: Float32Array) {
     if(this.state !== 'recording') return;
     if(this.notifySamples) this.notifySamples(samples);
     const numberOfFrames = samples.length / this.config.numberOfChannels;
@@ -237,6 +374,14 @@ export default class NativeVoiceRecorder {
       } catch(e) {}
       this.workletNode.port.onmessage = null;
     }
+    this.workletNode = undefined;
+    if(this.scriptProcessor) {
+      try {
+        this.scriptProcessor.disconnect();
+      } catch(e) {}
+      this.scriptProcessor.onaudioprocess = null;
+    }
+    this.scriptProcessor = undefined;
 
     if(this.stream) {
       this.stream.getTracks().forEach((t) => t.stop());

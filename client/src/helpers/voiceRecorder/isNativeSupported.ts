@@ -4,9 +4,18 @@
 // the OGG muxer, or the AudioWorklet source into their bundle.
 
 export default function isNativeVoiceRecorderSupported(): boolean {
-  return typeof AudioEncoder !== 'undefined' &&
-    typeof AudioData !== 'undefined' &&
-    typeof AudioWorkletNode !== 'undefined' &&
-    typeof AudioContext !== 'undefined' &&
-    !!navigator.mediaDevices?.getUserMedia;
+  if(
+    typeof AudioEncoder === 'undefined' ||
+    typeof AudioData === 'undefined' ||
+    typeof AudioContext === 'undefined' ||
+    !navigator.mediaDevices?.getUserMedia
+  ) {
+    return false;
+  }
+
+  // AudioWorklet is preferred, but WebCodecs can retain the same native
+  // OGG/Opus output through ScriptProcessor when module loading is blocked by
+  // browser policy or unavailable in an otherwise capable runtime.
+  return typeof AudioWorkletNode !== 'undefined' ||
+    typeof AudioContext.prototype.createScriptProcessor === 'function';
 }
