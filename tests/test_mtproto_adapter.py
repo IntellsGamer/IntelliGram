@@ -4359,3 +4359,53 @@ def test_web_k_authorization_removal_revokes_live_other_adapters(tmp_path) -> No
     reader = invoke(primary, primary_key, encode_uint32(ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR), 4)
     # The current device remains authorized and returns account.authorizations.
     assert reader.uint32() != RPC_ERROR_CONSTRUCTOR
+
+
+def test_generic_attachment_accepts_unknown_extension_at_50_mib_and_rejects_overage(tmp_path) -> None:
+    from intelligram.database import Database
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import MessagingError
+
+    database = Database(tmp_path / "attachment-limit.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        user = register_password_account(
+            connection,
+            phone="+15550000542",
+            password="correct-horse-battery-staple",
+            first_name="Attachment Boundary",
+            device_label="Attachment test",
+        )
+
+    adapter = MTProtoSessionAdapter(
+        auth_key=bytes(range(256)),
+        server_salt=123,
+        database=database,
+        user_id=user.user_id,
+    )
+    exact = b"x" * (50 * 1024 * 1024)
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "INSERT INTO upload_parts(file_id, user_id, part_index, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (9001, user.user_id, 0, exact, 1),
+        )
+        stored = adapter._assemble_uploaded_file(
+            connection,
+            user_id=user.user_id,
+            file={"file_id": 9001, "parts": 1, "name": "archive.unknownext"},
+        )
+        assert stored["mime_type"] == "application/octet-stream"
+        assert int(stored["id"]) > 0
+
+    overage = b"x" * (50 * 1024 * 1024) + b"y"
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "INSERT INTO upload_parts(file_id, user_id, part_index, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (9002, user.user_id, 0, overage, 1),
+        )
+        with pytest.raises(MessagingError, match="FILE_TOO_BIG"):
+            adapter._assemble_uploaded_file(
+                connection,
+                user_id=user.user_id,
+                file={"file_id": 9002, "parts": 1, "name": "payload.no_known_extension"},
+            )

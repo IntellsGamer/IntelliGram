@@ -171,6 +171,7 @@ from intelligram.mtproto.tl import (
 
 MAX_PAST_SECONDS = 300
 MAX_FUTURE_SECONDS = 30
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 LOGGER = logging.getLogger("intelligram.mtproto.adapter")
 
 
@@ -1280,6 +1281,17 @@ class MTProtoSessionAdapter:
             ).fetchone()
             if existing is not None and int(existing["user_id"]) not in (0, self_user_id):
                 return self._encrypt_rpc_error(message, "FILE_ID_INVALID")
+            previous = connection.execute(
+                "SELECT length(content) AS size FROM upload_parts WHERE file_id = ? AND user_id = ? AND part_index = ?",
+                (file_id, self_user_id, file_part),
+            ).fetchone()
+            total = connection.execute(
+                "SELECT COALESCE(SUM(length(content)), 0) AS size FROM upload_parts WHERE file_id = ? AND user_id = ?",
+                (file_id, self_user_id),
+            ).fetchone()
+            previous_size = int(previous["size"]) if previous is not None else 0
+            if int(total["size"]) - previous_size + len(content) > MAX_ATTACHMENT_BYTES:
+                return self._encrypt_rpc_error(message, "FILE_TOO_BIG")
             connection.execute(
                 """
                 INSERT INTO upload_parts(file_id, user_id, part_index, content, created_at)
@@ -3504,7 +3516,7 @@ class MTProtoSessionAdapter:
         if len(rows) != parts or [int(row["part_index"]) for row in rows] != list(range(parts)):
             raise MessagingError("FILE_PART_INVALID")
         content = b"".join(bytes(row["content"]) for row in rows)
-        if not content or len(content) > 20 * 1024 * 1024:
+        if not content or len(content) > MAX_ATTACHMENT_BYTES:
             raise MessagingError("FILE_TOO_BIG")
         now = int(time.time())
         # `inputMediaUploadedDocument` carries the browser-detected MIME type.
