@@ -222,6 +222,8 @@ from intelligram.mtproto.tl import (
     encode_rpc_result,
     encode_updates_state,
     encode_updates_too_long,
+    encode_update_paid_reaction_privacy,
+    PAID_REACTION_PRIVACY_ANONYMOUS_CONSTRUCTOR,
     encode_vector,
     parse_request,
     unwrap_client_query,
@@ -617,7 +619,7 @@ class MTProtoSessionAdapter:
         if request.name == "messages_get_peer_settings":
             return self._handle_messages_get_peer_settings(message, peer=request.fields["peer"])
         if request.name == "messages_get_paid_reaction_privacy":
-            return self._encrypt_result(message, encode_updates_too_long())
+            return self._handle_messages_get_paid_reaction_privacy(message)
         if request.name == "messages_get_available_reactions":
             return self._encrypt_result(
                 message,
@@ -2404,6 +2406,22 @@ class MTProtoSessionAdapter:
                 users=self._encode_users(users, self_user_id=self_user_id),
             ),
         )
+
+    def _handle_messages_get_paid_reaction_privacy(self, message: EncryptedMessage) -> bytes:
+        if self.database is not None and self.user_id is not None:
+            with self.database.transaction() as connection:
+                state = get_state(connection, self.user_id)
+            date, seq = state["date"], state["seq"]
+        else:
+            date, seq = int(time.time()), 0
+        updates = encode_updates(
+            updates=[encode_update_paid_reaction_privacy(private=PAID_REACTION_PRIVACY_ANONYMOUS_CONSTRUCTOR)],
+            users=[],
+            chats=[],
+            date=date,
+            seq=seq,
+        )
+        return self._encrypt_result(message, updates)
 
     def _handle_messages_set_typing(self, message: EncryptedMessage, *, peer: dict[str, object]) -> bytes:
         authenticated = self._require_authenticated(message)
