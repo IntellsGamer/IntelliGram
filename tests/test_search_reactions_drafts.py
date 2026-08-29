@@ -15,6 +15,7 @@ from intelligram.mtproto.tl import (
     MESSAGES_GET_MESSAGE_REACTIONS_LIST_CONSTRUCTOR,
     MESSAGES_GET_MESSAGES_REACTIONS_CONSTRUCTOR,
     MESSAGES_GET_RECENT_REACTIONS_CONSTRUCTOR,
+    MESSAGES_GET_TOP_REACTIONS_CONSTRUCTOR,
     MESSAGES_GET_SEARCH_COUNTERS_CONSTRUCTOR,
     MESSAGES_GET_SEARCH_RESULTS_CALENDAR_CONSTRUCTOR,
     MESSAGES_MESSAGE_REACTIONS_LIST_CONSTRUCTOR,
@@ -211,6 +212,18 @@ def test_search_reactions_and_drafts_round_trip(tmp_path) -> None:
         + encode_int64(0)  # hash
     )
     assert recent_reader.uint32() == 0xEAFDF716
+
+    # messages.getTopReactions returns messages.Reactions with the reacted emoji.
+    top_reader = invoke(
+        encode_uint32(MESSAGES_GET_TOP_REACTIONS_CONSTRUCTOR)
+        + struct.pack("<i", 50)  # limit
+        + encode_int64(0)  # hash
+    )
+    assert top_reader.uint32() == 0xEAFDF716
+    top_reader.int64()  # hash
+    assert top_reader.uint32() == VECTOR_CONSTRUCTOR
+    top_count = top_reader.int32()
+    assert top_count >= 1
 
     # messages.getMessagesReactions returns Updates with the reaction update.
     get_reader = invoke(

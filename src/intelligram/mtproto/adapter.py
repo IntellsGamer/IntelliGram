@@ -79,6 +79,7 @@ from intelligram.services.messaging import (
     get_message_reactions,
     get_message_reactions_list,
     get_recent_reactions,
+    get_top_reactions,
     set_default_reaction,
     save_draft,
     get_all_drafts,
@@ -727,6 +728,10 @@ class MTProtoSessionAdapter:
             )
         if request.name == "messages_get_recent_reactions":
             return self._handle_messages_get_recent_reactions(
+                message, limit=int(request.fields.get("limit", 0) or 0)
+            )
+        if request.name == "messages_get_top_reactions":
+            return self._handle_messages_get_top_reactions(
                 message, limit=int(request.fields.get("limit", 0) or 0)
             )
         if request.name == "messages_set_default_reaction":
@@ -3931,6 +3936,20 @@ class MTProtoSessionAdapter:
         try:
             with database.transaction() as connection:
                 reactions = get_recent_reactions(connection, user_id=self_user_id)
+                reactions_bytes = [encode_reaction(r["reaction"]) for r in reactions]
+                result = encode_messages_reactions(hash_value=0, reactions=reactions_bytes)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_top_reactions(self, message: EncryptedMessage, *, limit) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                reactions = get_top_reactions(connection, user_id=self_user_id, limit=int(limit))
                 reactions_bytes = [encode_reaction(r["reaction"]) for r in reactions]
                 result = encode_messages_reactions(hash_value=0, reactions=reactions_bytes)
         except MessagingError as exc:

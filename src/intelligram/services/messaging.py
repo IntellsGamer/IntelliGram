@@ -2098,6 +2098,29 @@ def get_recent_reactions(connection: sqlite3.Connection, *, user_id: int) -> lis
     ]
 
 
+def get_top_reactions(connection: sqlite3.Connection, *, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    if limit is None or limit <= 0:
+        limit = 50
+    rows = connection.execute(
+        """
+        SELECT reaction_kind, reaction, COUNT(*) AS uses
+        FROM message_reactions
+        WHERE user_id = ?
+        GROUP BY reaction_kind, reaction
+        ORDER BY uses DESC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    ).fetchall()
+    return [
+        {
+            "reaction": _reaction_dict(str(row["reaction_kind"]), str(row["reaction"])),
+            "big": False,
+        }
+        for row in rows
+    ]
+
+
 def set_default_reaction(connection: sqlite3.Connection, *, user_id: int, reaction: dict[str, Any]) -> bool:
     connection.execute(
         "UPDATE users SET default_reaction = ? WHERE id = ?",

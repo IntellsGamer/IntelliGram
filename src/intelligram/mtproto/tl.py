@@ -109,6 +109,7 @@ MESSAGES_SEND_REACTION_CONSTRUCTOR = 0xD30D78D4
 MESSAGES_GET_MESSAGES_REACTIONS_CONSTRUCTOR = 0x8BBA90E6
 MESSAGES_GET_MESSAGE_REACTIONS_LIST_CONSTRUCTOR = 0x461B3F48
 MESSAGES_GET_RECENT_REACTIONS_CONSTRUCTOR = 0x39461DB2
+MESSAGES_GET_TOP_REACTIONS_CONSTRUCTOR = 0xBB9976BA
 MESSAGES_SET_DEFAULT_REACTION_CONSTRUCTOR = 0x4F47A016
 MESSAGES_SAVE_DRAFT_CONSTRUCTOR = 0xAD0FA15C
 MESSAGES_GET_ALL_DRAFTS_CONSTRUCTOR = 0x6A3F8D65
@@ -1677,6 +1678,11 @@ def parse_request(data: bytes) -> TLRequest:
         })
     elif constructor_id == MESSAGES_GET_RECENT_REACTIONS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_recent_reactions", {
+            "limit": reader.int32(),
+            "hash": reader.int64(),
+        })
+    elif constructor_id == MESSAGES_GET_TOP_REACTIONS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_top_reactions", {
             "limit": reader.int32(),
             "hash": reader.int64(),
         })
