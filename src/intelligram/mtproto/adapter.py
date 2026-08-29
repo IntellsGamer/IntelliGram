@@ -73,12 +73,35 @@ from intelligram.services.messaging import (
     send_message,
 )
 from intelligram.services.updates import get_difference, get_state
+from intelligram.services.premium import attachment_limit_bytes, user_is_premium
+from intelligram.services.contacts import (
+    ContactLink,
+    delete_contacts as delete_saved_contacts,
+    is_blocked,
+    list_blocked,
+    list_contacts,
+    load_contact_links,
+    save_contact,
+    set_blocked,
+)
+from intelligram.services.privacy import (
+    PREMIUM_ONLY_KEYS as PREMIUM_ONLY_PRIVACY_KEYS,
+    PrivacyRule,
+    default_rules as privacy_default_rules,
+    get_rules as get_privacy_rules,
+    key_for_constructor as privacy_key_for_constructor,
+    output_constructor as privacy_output_constructor,
+    rules_from_input as privacy_rules_from_input,
+    set_rules as set_privacy_rules,
+)
 from intelligram.mtproto.tl import (
     TLDecodeError,
     channel_access_hash,
+    user_access_hash,
     encode_account_content_settings,
     encode_account_password,
     encode_account_privacy_rules,
+    encode_privacy_value,
     encode_channel,
     encode_channel_full,
     encode_chat,
@@ -95,14 +118,20 @@ from intelligram.mtproto.tl import (
     encode_config,
     encode_help_app_config,
     encode_help_nearest_dc,
+    encode_help_premium_promo,
+    encode_global_privacy_settings,
     encode_help_countries_list,
     encode_lang_pack_difference,
     encode_contacts_contacts,
+    encode_contacts_blocked,
     encode_contacts_found,
     encode_contacts_imported_contacts,
     encode_contacts_resolved_peer,
     encode_bool,
     encode_contact,
+    encode_contact_status,
+    encode_peer_blocked,
+    encode_update_user,
     encode_imported_contact,
     encode_dialog,
     encode_message,
@@ -171,7 +200,10 @@ from intelligram.mtproto.tl import (
 
 MAX_PAST_SECONDS = 300
 MAX_FUTURE_SECONDS = 30
-MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+# Attachment ceiling for Premium accounts. Free accounts are capped at
+# FREE_ATTACHMENT_BYTES (services.premium) so oversized uploads fail fast
+# with FILE_TOO_BIG instead of wasting a full part round-trip.
+MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 LOGGER = logging.getLogger("intelligram.mtproto.adapter")
 
 
@@ -335,6 +367,31 @@ class MTProtoSessionAdapter:
             return self._handle_contacts_resolve_username(message, username=str(request.fields["username"]))
         if request.name == "contacts_import_contacts":
             return self._handle_contacts_import_contacts(message, contacts=request.fields["contacts"])
+        if request.name == "contacts_add_contact":
+            return self._handle_contacts_add_contact(
+                message,
+                user=request.fields["user"],
+                first_name=str(request.fields["first_name"]),
+                last_name=str(request.fields["last_name"]),
+                phone=str(request.fields["phone"]),
+            )
+        if request.name == "contacts_delete_contacts":
+            return self._handle_contacts_delete_contacts(message, users=request.fields["users"])
+        if request.name == "contacts_get_statuses":
+            return self._handle_contacts_get_statuses(message)
+        if request.name in {"contacts_block", "contacts_unblock"}:
+            return self._handle_contacts_set_blocked(
+                message,
+                peer=request.fields["peer"],
+                blocked=request.name == "contacts_block",
+                stories_only=bool(request.fields.get("my_stories_from")),
+            )
+        if request.name == "contacts_get_blocked":
+            return self._handle_contacts_get_blocked(
+                message,
+                offset=int(request.fields["offset"]),
+                limit=int(request.fields["limit"]),
+            )
         if request.name == "contacts_search":
             return self._handle_contacts_search(
                 message, query=str(request.fields["query"]), limit=int(request.fields["limit"])
@@ -622,7 +679,23 @@ class MTProtoSessionAdapter:
         if request.name == "account_update_status":
             return self._encrypt_result(message, b"\xb5\x75\x72\x99")
         if request.name == "account_get_privacy":
-            return self._encrypt_result(message, encode_account_privacy_rules())
+            return self._handle_account_get_privacy(message, key_id=int(request.fields["key_id"]))
+        if request.name == "account_set_privacy":
+            return self._handle_account_set_privacy(
+                message,
+                key_id=int(request.fields["key_id"]),
+                rules=request.fields["rules"],
+            )
+        if request.name == "account_get_global_privacy_settings":
+            return self._handle_account_get_global_privacy_settings(message)
+        if request.name == "account_set_global_privacy_settings":
+            return self._handle_account_set_global_privacy_settings(
+                message,
+                archive_and_mute=bool(request.fields.get("archive_and_mute")),
+                require_premium_for_messages=bool(request.fields.get("require_premium_for_messages")),
+            )
+        if request.name == "help_get_premium_promo":
+            return self._handle_help_get_premium_promo(message)
         if request.name == "account_get_content_settings":
             return self._encrypt_result(message, encode_account_content_settings())
         if request.name == "account_get_authorizations":
@@ -1003,7 +1076,7 @@ class MTProtoSessionAdapter:
             raise RuntimeError("Database is required for a signed-in user")
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, premium_until, noncontacts_require_premium, verified, is_service FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         if row is None:
@@ -1070,7 +1143,7 @@ class MTProtoSessionAdapter:
             return {}
         placeholders = ",".join("?" for _ in user_ids)
         rows = connection.execute(
-            f"SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service FROM users WHERE id IN ({placeholders})",
+            f"SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, premium_until, noncontacts_require_premium, verified, is_service FROM users WHERE id IN ({placeholders})",
             sorted(user_ids),
         ).fetchall()
         return {int(row["id"]): dict(row) for row in rows}
@@ -1125,10 +1198,66 @@ class MTProtoSessionAdapter:
         )
 
     def _encode_users(self, users: dict[int, dict[str, object]], *, self_user_id: int) -> list[bytes]:
-        return [
-            encode_user(user=user, self_user_id=self_user_id, contact=user_id != self_user_id)
-            for user_id, user in sorted(users.items())
-        ]
+        """Encode a batch of users from one viewer's perspective.
+
+        The viewer's saved contacts decide three things at once: the
+        ``contact``/``mutual_contact`` flags Web K uses to drive its contact
+        list, whose saved name overrides the profile name, and whether the
+        Premium "who can message me" restriction is advertised. They are
+        resolved together so the answers cannot disagree.
+        """
+        links = self._contact_links(self_user_id, set(users))
+        restricted_ids = {
+            user_id
+            for user_id, user in users.items()
+            if user_id != self_user_id
+            and int(user.get("noncontacts_require_premium") or 0)
+            and user_id not in links
+        }
+        require_premium: set[int] = set()
+        if restricted_ids and self.database is not None:
+            try:
+                with self.database.transaction() as connection:
+                    if not user_is_premium(connection, self_user_id):
+                        require_premium = restricted_ids
+            except Exception:  # pragma: no cover - display-only hint path
+                require_premium = set()
+        encoded: list[bytes] = []
+        for user_id, user in sorted(users.items()):
+            link = links.get(user_id)
+            if link is not None or user_id in require_premium:
+                user = dict(user)
+                if link is not None:
+                    user["contact_first_name"] = link.first_name
+                    user["contact_last_name"] = link.last_name
+                if user_id in require_premium:
+                    user["require_premium_for_contact"] = True
+            encoded.append(
+                encode_user(
+                    user=user,
+                    self_user_id=self_user_id,
+                    contact=link is not None,
+                    mutual=link is not None and link.mutual,
+                )
+            )
+        return encoded
+
+    def _contact_links(self, self_user_id: int, user_ids: set[int]) -> dict[int, ContactLink]:
+        """Load the viewer's saved-contact edges, tolerating a missing database.
+
+        User encoding happens on read paths that already hold a connection, so
+        this opens its own short-lived read transaction (WAL keeps that safe)
+        and degrades to "no contacts" rather than failing the whole response.
+        """
+        if not user_ids or self.database is None:
+            return {}
+        try:
+            with self.database.transaction() as connection:
+                return load_contact_links(
+                    connection, owner_user_id=self_user_id, user_ids=user_ids
+                )
+        except Exception:  # pragma: no cover - display-only hint path
+            return {}
 
     def _encode_chats(self, connection: object, *, chat_ids: set[int], self_user_id: int) -> list[bytes]:
         if not chat_ids:
@@ -1290,7 +1419,8 @@ class MTProtoSessionAdapter:
                 (file_id, self_user_id),
             ).fetchone()
             previous_size = int(previous["size"]) if previous is not None else 0
-            if int(total["size"]) - previous_size + len(content) > MAX_ATTACHMENT_BYTES:
+            limit_bytes = attachment_limit_bytes(premium=user_is_premium(connection, self_user_id))
+            if int(total["size"]) - previous_size + len(content) > limit_bytes:
                 return self._encrypt_rpc_error(message, "FILE_TOO_BIG")
             connection.execute(
                 """
@@ -1389,7 +1519,7 @@ class MTProtoSessionAdapter:
                     [*updates.values(), int(time.time()), self_user_id],
                 )
             user = connection.execute(
-                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, verified, is_service FROM users WHERE id = ?",
+                "SELECT id, phone, username, first_name, last_name, about, profile_photo_id, premium, premium_until, noncontacts_require_premium, verified, is_service FROM users WHERE id = ?",
                 (self_user_id,),
             ).fetchone()
         if user is None:
@@ -1399,52 +1529,273 @@ class MTProtoSessionAdapter:
             encode_user(user=dict(user), self_user_id=self_user_id),
         )
 
-    def _handle_contacts_get_contacts(self, message: EncryptedMessage) -> bytes:
+    def _privacy_rules_result(self, message: EncryptedMessage, rules: list[PrivacyRule]) -> bytes:
+        encoded = [
+            encode_privacy_value(constructor_id=constructor_id, users=rule.users)
+            for rule in rules
+            if (constructor_id := privacy_output_constructor(rule.kind)) is not None
+        ]
+        return self._encrypt_result(message, encode_account_privacy_rules(rules=encoded))
+
+    def _handle_account_get_privacy(self, message: EncryptedMessage, *, key_id: int) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        key = privacy_key_for_constructor(key_id)
+        if key is None:
+            return self._encrypt_rpc_error(message, "PRIVACY_KEY_INVALID")
+        with database.transaction() as connection:
+            rules = get_privacy_rules(connection, user_id=self_user_id, key=key)
+        return self._privacy_rules_result(message, rules)
+
+    def _handle_account_set_privacy(
+        self, message: EncryptedMessage, *, key_id: int, rules: list[dict[str, object]]
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        key = privacy_key_for_constructor(key_id)
+        if key is None:
+            return self._encrypt_rpc_error(message, "PRIVACY_KEY_INVALID")
+        requested = privacy_rules_from_input(rules)
+        with database.transaction(immediate=True) as connection:
+            if key in PREMIUM_ONLY_PRIVACY_KEYS and not user_is_premium(connection, self_user_id):
+                # Free accounts may only leave the setting at its default;
+                # narrowing it is the Premium feature.
+                if requested and requested != privacy_default_rules(key):
+                    return self._encrypt_rpc_error(message, "PREMIUM_ACCOUNT_REQUIRED")
+            stored = set_privacy_rules(connection, user_id=self_user_id, key=key, rules=requested)
+        return self._privacy_rules_result(message, stored)
+
+    def _handle_account_get_global_privacy_settings(self, message: EncryptedMessage) -> bytes:
         authenticated = self._require_authenticated(message)
         if isinstance(authenticated, bytes):
             return authenticated
         database, self_user_id = authenticated
         with database.transaction() as connection:
-            rows = connection.execute(
-                """
-                WITH contact_candidates AS (
-                    SELECT c.contact_user_id AS user_id,
-                           EXISTS(
-                               SELECT 1
-                               FROM contacts reciprocal
-                               WHERE reciprocal.user_id = c.contact_user_id
-                                 AND reciprocal.contact_user_id = c.user_id
-                           ) AS mutual
-                    FROM contacts c
-                    WHERE c.user_id = ?
+            row = connection.execute(
+                "SELECT noncontacts_require_premium FROM users WHERE id = ?",
+                (self_user_id,),
+            ).fetchone()
+        require_premium = row is not None and bool(int(row["noncontacts_require_premium"]))
+        return self._encrypt_result(
+            message,
+            encode_global_privacy_settings(require_premium_for_messages=require_premium),
+        )
 
-                    UNION ALL
+    def _handle_account_set_global_privacy_settings(
+        self,
+        message: EncryptedMessage,
+        *,
+        archive_and_mute: bool,
+        require_premium_for_messages: bool,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        # "Who can send me messages" is a Premium feature: non-Premium
+        # accounts stay on the default Everybody policy.
+        if require_premium_for_messages:
+            with database.transaction() as connection:
+                allowed = user_is_premium(connection, self_user_id)
+            if not allowed:
+                return self._encrypt_rpc_error(message, "PREMIUM_ACCOUNT_REQUIRED")
+        with database.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE users SET noncontacts_require_premium = ?, updated_at = ? WHERE id = ?",
+                (int(require_premium_for_messages), int(time.time()), self_user_id),
+            )
+        return self._encrypt_result(
+            message,
+            encode_global_privacy_settings(
+                archive_and_mute=archive_and_mute,
+                require_premium_for_messages=require_premium_for_messages,
+            ),
+        )
 
-                    SELECT DISTINCT CASE WHEN dpu.user_low_id = ? THEN dpu.user_high_id ELSE dpu.user_low_id END AS user_id,
-                           1 AS mutual
-                    FROM direct_peer_users dpu
-                    JOIN peer_memberships pm ON pm.peer_id = dpu.peer_id
-                    WHERE pm.user_id = ? AND pm.left_at IS NULL
-                    AND (dpu.user_low_id = ? OR dpu.user_high_id = ?)
-                )
-                SELECT user_id, MAX(mutual) AS mutual
-                FROM contact_candidates
-                GROUP BY user_id
-                ORDER BY user_id
-                """,
-                (self_user_id, self_user_id, self_user_id, self_user_id, self_user_id),
-            ).fetchall()
-            contact_ids = {int(row["user_id"]) for row in rows if int(row["user_id"]) != self_user_id}
-            users = self._load_users(connection, contact_ids)
+    def _handle_help_get_premium_promo(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        # IntelliGram Premium is granted through the owner console, so the
+        # subscription option's bot_url points there instead of a payment bot.
+        bot_url = f"{str(self.public_link_base_url).rstrip('/')}/admin"
+        return self._encrypt_result(message, encode_help_premium_promo(bot_url=bot_url))
+
+    def _handle_contacts_get_contacts(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        # Only accounts the viewer actually saved are contacts. Deriving them
+        # from existing conversations instead would mark every correspondent as
+        # a contact, which silently disables both the saved-name overrides and
+        # the Premium "who can message me" rule.
+        with database.transaction() as connection:
+            links = list_contacts(connection, owner_user_id=self_user_id)
+            users = self._load_users(connection, {link.user_id for link in links})
         contacts = [
-            encode_contact(user_id=int(row["user_id"]), mutual=bool(row["mutual"]))
-            for row in rows
-            if int(row["user_id"]) in users
+            encode_contact(user_id=link.user_id, mutual=link.mutual)
+            for link in links
+            if link.user_id in users
         ]
         return self._encrypt_result(
             message,
-            encode_contacts_contacts(contacts=contacts, users=self._encode_users(users, self_user_id=self_user_id)),
+            encode_contacts_contacts(
+                contacts=contacts,
+                users=self._encode_users(users, self_user_id=self_user_id),
+                saved_count=len(contacts),
+            ),
         )
+
+    def _handle_contacts_get_statuses(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        with database.transaction() as connection:
+            links = list_contacts(connection, owner_user_id=self_user_id)
+        return self._encrypt_result(
+            message,
+            encode_vector([encode_contact_status(user_id=link.user_id) for link in links]),
+        )
+
+    def _handle_contacts_add_contact(
+        self,
+        message: EncryptedMessage,
+        *,
+        user: dict[str, object],
+        first_name: str,
+        last_name: str,
+        phone: str,
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        target_id = self._resolve_input_user_id(self_user_id, user)
+        if target_id is None:
+            return self._encrypt_rpc_error(message, "USER_ID_INVALID")
+        if target_id == self_user_id:
+            return self._encrypt_rpc_error(message, "USER_ID_INVALID")
+        with database.transaction(immediate=True) as connection:
+            if connection.execute("SELECT 1 FROM users WHERE id = ?", (target_id,)).fetchone() is None:
+                return self._encrypt_rpc_error(message, "USER_ID_INVALID")
+            save_contact(
+                connection,
+                owner_user_id=self_user_id,
+                contact_user_id=target_id,
+                first_name=first_name,
+                last_name=last_name,
+                phone=phone,
+            )
+            users = self._load_users(connection, {target_id})
+            state = get_state(connection, self_user_id)
+        return self._encrypt_result(
+            message,
+            encode_updates(
+                updates=[encode_update_user(user_id=target_id)],
+                users=self._encode_users(users, self_user_id=self_user_id),
+                chats=[],
+                date=state["date"],
+                seq=state["seq"],
+            ),
+        )
+
+    def _handle_contacts_delete_contacts(
+        self, message: EncryptedMessage, *, users: list[dict[str, object]]
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        target_ids = {
+            resolved
+            for entry in users
+            if (resolved := self._resolve_input_user_id(self_user_id, entry)) is not None
+        }
+        with database.transaction(immediate=True) as connection:
+            removed = delete_saved_contacts(
+                connection, owner_user_id=self_user_id, contact_user_ids=target_ids
+            )
+            affected = self._load_users(connection, removed)
+            state = get_state(connection, self_user_id)
+        return self._encrypt_result(
+            message,
+            encode_updates(
+                updates=[encode_update_user(user_id=user_id) for user_id in sorted(removed)],
+                users=self._encode_users(affected, self_user_id=self_user_id),
+                chats=[],
+                date=state["date"],
+                seq=state["seq"],
+            ),
+        )
+
+    def _handle_contacts_set_blocked(
+        self, message: EncryptedMessage, *, peer: dict[str, object], blocked: bool, stories_only: bool
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        if stories_only:
+            # IntelliGram has no stories, so a stories-scoped block would leave
+            # the account fully reachable while the client showed it as blocked.
+            return self._encrypt_rpc_error(message, "PEER_ID_INVALID")
+        target_id = self._resolve_input_user_id(self_user_id, peer)
+        if target_id is None or target_id == self_user_id:
+            return self._encrypt_rpc_error(message, "PEER_ID_INVALID")
+        with database.transaction(immediate=True) as connection:
+            if connection.execute("SELECT 1 FROM users WHERE id = ?", (target_id,)).fetchone() is None:
+                return self._encrypt_rpc_error(message, "PEER_ID_INVALID")
+            set_blocked(
+                connection,
+                owner_user_id=self_user_id,
+                target_user_id=target_id,
+                blocked=blocked,
+            )
+        return self._encrypt_result(message, encode_bool(True))
+
+    def _handle_contacts_get_blocked(
+        self, message: EncryptedMessage, *, offset: int, limit: int
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        with database.transaction() as connection:
+            page, total = list_blocked(
+                connection, owner_user_id=self_user_id, offset=offset, limit=limit
+            )
+            users = self._load_users(connection, {user_id for user_id, _ in page})
+        blocked = [
+            encode_peer_blocked(user_id=user_id, date=blocked_at)
+            for user_id, blocked_at in page
+            if user_id in users
+        ]
+        return self._encrypt_result(
+            message,
+            encode_contacts_blocked(
+                blocked=blocked,
+                users=self._encode_users(users, self_user_id=self_user_id),
+                count=None if offset == 0 and len(page) >= total else total,
+            ),
+        )
+
+    def _resolve_input_user_id(self, self_user_id: int, peer: dict[str, object]) -> int | None:
+        """Map an InputUser/InputPeer payload onto a concrete user id."""
+        kind = str(peer.get("kind"))
+        if kind == "self":
+            return self_user_id
+        if kind == "user":
+            user_id = int(peer["user_id"])
+            if int(peer.get("access_hash", 0)) != user_access_hash(user_id):
+                return None
+            return user_id
+        return None
 
     def _dialog_payloads(
         self,
@@ -1959,13 +2310,14 @@ class MTProtoSessionAdapter:
                         continue
                     target_id = int(target["id"])
                     client_id = int(contact["client_id"])
-                    connection.execute(
-                        """
-                        INSERT INTO contacts(user_id, contact_user_id, client_id, created_at)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(user_id, contact_user_id) DO UPDATE SET client_id = excluded.client_id
-                        """,
-                        (self_user_id, target_id, client_id, int(time.time())),
+                    save_contact(
+                        connection,
+                        owner_user_id=self_user_id,
+                        contact_user_id=target_id,
+                        first_name=contact.get("first_name"),
+                        last_name=contact.get("last_name"),
+                        phone=normalized_phone,
+                        client_id=client_id,
                     )
                     imported.append((target_id, client_id))
                 users = self._load_users(connection, {target_id for target_id, _ in imported})
@@ -3516,7 +3868,8 @@ class MTProtoSessionAdapter:
         if len(rows) != parts or [int(row["part_index"]) for row in rows] != list(range(parts)):
             raise MessagingError("FILE_PART_INVALID")
         content = b"".join(bytes(row["content"]) for row in rows)
-        if not content or len(content) > MAX_ATTACHMENT_BYTES:
+        limit_bytes = attachment_limit_bytes(premium=user_is_premium(connection, user_id))
+        if not content or len(content) > limit_bytes:
             raise MessagingError("FILE_TOO_BIG")
         now = int(time.time())
         # `inputMediaUploadedDocument` carries the browser-detected MIME type.

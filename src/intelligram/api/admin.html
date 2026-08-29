@@ -14,7 +14,9 @@
     button { border: 0; border-radius: 8px; padding: 10px 14px; font: inherit; font-weight: 650; background: #2ea6ff; color: #07131d; cursor: pointer; } button.secondary { background: #40515f; color: #eff7ff; } button.danger { background: #e85d75; color: #fff; }
     .hidden { display: none; } #status { min-height: 22px; margin-top: 14px; } .error { color: #ff9eac; } .ok { color: #8ce0b2; }
     table { width: 100%; border-collapse: collapse; margin-top: 18px; } th, td { text-align: left; border-bottom: 1px solid #344453; padding: 12px 8px; vertical-align: middle; } th { color: #9cb3c5; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
-    .controls { display: flex; gap: 8px; flex-wrap: wrap; } .pill { border-radius: 999px; padding: 4px 8px; font-size: 12px; background: #3a4a57; } .pill.premium { background: #8b68d8; color: #fff; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; } .pill { border-radius: 999px; padding: 4px 8px; font-size: 12px; background: #3a4a57; } .pill.premium { background: #8b68d8; color: #fff; }
+    .controls input[type="datetime-local"] { padding: 7px 9px; border: 1px solid #4a5e6e; border-radius: 8px; background: #17212b; color: #fff; font: inherit; font-size: 12px; }
+    .premium-until { display: block; font-size: 11px; color: #afc1cf; margin-top: 4px; }
   </style>
 </head>
 <body>
@@ -51,13 +53,34 @@
       return body;
     }
     function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value ?? ''); return node.innerHTML; }
+    function formatUntil(until) {
+      if(!until) return '';
+      const date = new Date(until * 1000);
+      const expired = until * 1000 < Date.now();
+      return `<span class="premium-until">${expired ? 'Expired' : 'Until'} ${escapeHtml(date.toLocaleString())}</span>`;
+    }
     async function renderConsole() {
       const [session, result] = await Promise.all([request('/v1/admin/session'), request('/v1/admin/users')]);
       document.getElementById('owner').textContent = `Signed in as ${session.owner.first_name} ${session.owner.last_name || ''}`.trim();
-      document.getElementById('users').innerHTML = `<table><thead><tr><th>Account</th><th>Premium</th><th>Sessions</th><th>Control</th></tr></thead><tbody>${result.users.map((user) => `<tr><td><strong>${escapeHtml(user.first_name)} ${escapeHtml(user.last_name)}</strong><br><small>@${escapeHtml(user.username || 'no username')} · #${user.id}</small></td><td><span class="pill ${user.premium ? 'premium' : ''}">${user.premium ? 'Premium' : 'Standard'}</span></td><td>${user.active_authorizations}</td><td><div class="controls"><button data-user="${user.id}" data-premium="${user.premium ? 0 : 1}">${user.premium ? 'Remove Premium' : 'Grant Premium'}</button></div></td></tr>`).join('')}</tbody></table>`;
-      document.querySelectorAll('[data-user]').forEach((button) => button.addEventListener('click', async () => {
+      document.getElementById('users').innerHTML = `<table><thead><tr><th>Account</th><th>Premium</th><th>Sessions</th><th>Control</th></tr></thead><tbody>${result.users.map((user) => {
+        const status = `<span class="pill ${user.premium ? 'premium' : ''}">${user.premium ? 'Premium' : 'Standard'}</span>${user.premium && user.premium_until ? formatUntil(user.premium_until) : (user.premium ? '<span class="premium-until">No expiry</span>' : '')}`;
+        const controls = user.premium
+          ? `<div class="controls"><button data-user="${user.id}" data-action="revoke" class="danger">Remove Premium</button></div>`
+          : `<div class="controls"><input type="datetime-local" data-until-input="${user.id}" title="Premium until (leave empty for no expiry)"><button data-user="${user.id}" data-action="grant">Grant Premium</button></div>`;
+        return `<tr><td><strong>${escapeHtml(user.first_name)} ${escapeHtml(user.last_name)}</strong><br><small>@${escapeHtml(user.username || 'no username')} · #${user.id}</small></td><td>${status}</td><td>${user.active_authorizations}</td><td>${controls}</td></tr>`;
+      }).join('')}</tbody></table>`;
+      document.querySelectorAll('[data-action]').forEach((button) => button.addEventListener('click', async () => {
         button.disabled = true;
-        try { await request(`/v1/admin/users/${button.dataset.user}/premium`, {method: 'POST', body: JSON.stringify({premium: button.dataset.premium === '1'})}); await renderConsole(); }
+        try {
+          const granting = button.dataset.action === 'grant';
+          let until = null;
+          if(granting) {
+            const input = document.querySelector(`[data-until-input="${button.dataset.user}"]`);
+            if(input && input.value) until = Math.floor(new Date(input.value).getTime() / 1000);
+          }
+          await request(`/v1/admin/users/${button.dataset.user}/premium`, {method: 'POST', body: JSON.stringify({premium: granting, until})});
+          await renderConsole();
+        }
         catch(error) { setStatus(error.message, true); }
         finally { button.disabled = false; }
       }));

@@ -98,9 +98,9 @@ class Settings:
         data_dir = Path(os.getenv("INTELLIGRAM_DATA_DIR", "./data")).resolve()
         return cls(
             database_path=Path(os.getenv("INTELLIGRAM_DATABASE_PATH", str(data_dir / "intelligram.sqlite3"))).resolve(),
-            host=os.getenv("INTELLIGRAM_HOST", "127.0.0.1"),
+            host=os.getenv("INTELLIGRAM_HOST", "0.0.0.0"),
             port=int(os.getenv("INTELLIGRAM_PORT", "8080")),
-            public_base_url=os.getenv("INTELLIGRAM_PUBLIC_BASE_URL", "http://127.0.0.1:8080").rstrip("/"),
+            public_base_url=os.getenv("INTELLIGRAM_PUBLIC_BASE_URL", "http://0.0.0.0:8080").rstrip("/"),
             token_secret=token_secret,
             development_mode=development_mode,
             development_login_code=development_login_code,

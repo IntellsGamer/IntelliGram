@@ -126,7 +126,8 @@ def test_web_k_chat_startup_compatibility_calls_return_valid_results() -> None:
             assert reader.int32() == 17
             assert reader.uint32() == JSON_OBJECT_CONSTRUCTOR
             assert reader.uint32() == VECTOR_CONSTRUCTOR
-            assert reader.int32() == 0
+            # Tiered upload caps plus the Premium feature order.
+            assert reader.int32() == 3
         elif expected_constructor == MESSAGES_AVAILABLE_REACTIONS_CONSTRUCTOR:
             assert reader.int32() == 0
             assert reader.uint32() == VECTOR_CONSTRUCTOR
@@ -580,7 +581,10 @@ def test_signed_in_web_k_core_rpcs_return_real_tl_entities(tmp_path) -> None:
     contacts_reader = invoke(encode_uint32(CONTACTS_GET_CONTACTS_CONSTRUCTOR) + encode_int64(0))
     assert contacts_reader.uint32() == CONTACTS_CONTACTS_CONSTRUCTOR
     assert contacts_reader.uint32() == 0x1CB5C415
-    assert contacts_reader.int32() == 1
+    # Exchanging messages does not create a contact; only contacts.addContact
+    # and contacts.importContacts do. See
+    # test_web_k_contact_management_round_trip.
+    assert contacts_reader.int32() == 0
 
     status_reader = invoke(encode_uint32(ACCOUNT_UPDATE_STATUS_CONSTRUCTOR) + encode_uint32(BOOL_FALSE_CONSTRUCTOR))
     assert status_reader.uint32() == BOOL_TRUE_CONSTRUCTOR
@@ -2830,7 +2834,7 @@ def test_web_k_contacts_import_and_search_are_durable(tmp_path) -> None:
     assert reader.uint32() == CONTACT_CONSTRUCTOR
     assert reader.int64() == bob.user_id
     reader.uint32()  # mutual flag
-    assert reader.int32() == 0  # saved_count
+    assert reader.int32() == 1  # saved_count
     assert reader.vector_count() == 1
 
     search_response = adapter.handle_encrypted(_encrypt_client(
@@ -4409,3 +4413,627 @@ def test_generic_attachment_accepts_unknown_extension_at_50_mib_and_rejects_over
                 user_id=user.user_id,
                 file={"file_id": 9002, "parts": 1, "name": "payload.no_known_extension"},
             )
+
+
+def test_web_k_gzip_packed_upload_part_is_accepted(tmp_path) -> None:
+    """Web K gzips upload parts for files whose mime type is not already
+    compressed, so .jar/.md/.txt attachments arrive wrapped in gzip_packed."""
+    import gzip
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        GZIP_PACKED_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        UPLOAD_SAVE_FILE_PART_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_int64,
+        encode_tl_bytes,
+        encode_uint32,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 971, 314
+    database = Database(tmp_path / "gzip-upload.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        user = register_password_account(
+            connection,
+            phone="+15550000901",
+            password="correct-horse-battery-staple",
+            first_name="Uploader",
+            device_label="Uploader",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=user.user_id)
+    payload = b"PK\x03\x04ViaVersion-jar-part-bytes"
+    query = (
+        encode_uint32(UPLOAD_SAVE_FILE_PART_CONSTRUCTOR)
+        + encode_int64(16373782892030258)
+        + encode_int32(0)
+        + encode_tl_bytes(payload)
+    )
+    message_id = (int(time.time()) << 32) + 4
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key,
+        salt=salt,
+        session_id=session_id,
+        msg_id=message_id,
+        seq_no=1,
+        body=encode_uint32(GZIP_PACKED_CONSTRUCTOR) + encode_tl_bytes(gzip.compress(_wrapped_query(query))),
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+    with database.transaction() as connection:
+        stored = connection.execute(
+            "SELECT content FROM upload_parts WHERE file_id = ? AND part_index = ?",
+            (16373782892030258, 0),
+        ).fetchone()
+        assert stored is not None and bytes(stored["content"]) == payload
+
+
+def _read_encoded_user(reader) -> dict:
+    """Decode one ``user`` constructor into the fields this suite asserts on."""
+    from intelligram.mtproto.tl import USER_CONSTRUCTOR
+
+    assert reader.uint32() == USER_CONSTRUCTOR
+    flags = reader.uint32()
+    reader.uint32()  # flags2
+    decoded = {
+        "id": reader.int64(),
+        "access_hash": reader.int64(),
+        "self": bool(flags & (1 << 10)),
+        "contact": bool(flags & (1 << 11)),
+        "mutual_contact": bool(flags & (1 << 12)),
+        "first_name": None,
+        "last_name": None,
+        "username": None,
+        "phone": None,
+    }
+    if flags & (1 << 1):
+        decoded["first_name"] = reader.bytes().decode("utf-8")
+    if flags & (1 << 2):
+        decoded["last_name"] = reader.bytes().decode("utf-8")
+    if flags & (1 << 3):
+        decoded["username"] = reader.bytes().decode("utf-8")
+    if flags & (1 << 4):
+        decoded["phone"] = reader.bytes().decode("utf-8")
+    return decoded
+
+
+def test_web_k_contact_management_round_trip(tmp_path) -> None:
+    """Saving a contact must set the contact flag, apply the saved name, and
+    leave unsaved accounts unflagged -- Web K keys its whole contact list off
+    ``user.pFlags.contact``, so flagging everyone makes "add contact" a no-op."""
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        BOOL_TRUE_CONSTRUCTOR,
+        CONTACTS_ADD_CONTACT_CONSTRUCTOR,
+        CONTACTS_BLOCKED_CONSTRUCTOR,
+        CONTACTS_BLOCK_CONSTRUCTOR,
+        CONTACTS_CONTACTS_CONSTRUCTOR,
+        CONTACTS_DELETE_CONTACTS_CONSTRUCTOR,
+        CONTACTS_GET_BLOCKED_CONSTRUCTOR,
+        CONTACTS_GET_CONTACTS_CONSTRUCTOR,
+        CONTACT_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        INPUT_USER_CONSTRUCTOR,
+        PEER_BLOCKED_CONSTRUCTOR,
+        PEER_USER_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        UPDATES_CONSTRUCTOR,
+        USERS_GET_USERS_CONSTRUCTOR,
+        TLReader,
+        encode_int32,
+        encode_int64,
+        encode_tl_string,
+        encode_uint32,
+        encode_vector,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 977, 315
+    database = Database(tmp_path / "contact-management.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000801", password="correct-horse-battery-staple",
+            first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000802", password="correct-horse-battery-staple",
+            first_name="Bob", device_label="Bob",
+        )
+        carol = register_password_account(
+            connection, phone="+15550000803", password="correct-horse-battery-staple",
+            first_name="Carol", device_label="Carol",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=alice.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    seq = 0
+
+    def invoke(body: bytes) -> TLReader:
+        nonlocal message_id, seq
+        message_id += 4
+        seq += 2
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=seq, body=body,
+        ))
+        assert response is not None
+        _, _, _, _, decrypted = _decrypt_server(auth_key, response)
+        reader = TLReader(decrypted)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        assert reader.int64() == message_id
+        return reader
+
+    def input_user(user_id: int) -> bytes:
+        return encode_uint32(INPUT_USER_CONSTRUCTOR) + encode_int64(user_id) + encode_int64(user_access_hash(user_id))
+
+    reader = invoke(
+        encode_uint32(CONTACTS_ADD_CONTACT_CONSTRUCTOR)
+        + encode_uint32(0)
+        + input_user(bob.user_id)
+        + encode_tl_string("Bobby")
+        + encode_tl_string("Saved")
+        + encode_tl_string("+15550000802")
+    )
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    reader.vector_count()  # updates
+    reader.uint32()  # updateUser
+    assert reader.int64() == bob.user_id
+    assert reader.vector_count() == 1
+    saved = _read_encoded_user(reader)
+    assert saved["id"] == bob.user_id
+    assert saved["contact"] is True and saved["mutual_contact"] is False
+    assert (saved["first_name"], saved["last_name"]) == ("Bobby", "Saved")
+    assert saved["phone"] == "+15550000802"
+
+    with database.transaction() as connection:
+        row = connection.execute(
+            "SELECT first_name, last_name, phone FROM contacts WHERE user_id = ? AND contact_user_id = ?",
+            (alice.user_id, bob.user_id),
+        ).fetchone()
+        assert row is not None
+        assert (row["first_name"], row["last_name"]) == ("Bobby", "Saved")
+        # The shared profile row keeps the account's own name.
+        assert connection.execute("SELECT first_name FROM users WHERE id = ?", (bob.user_id,)).fetchone()["first_name"] == "Bob"
+
+    reader = invoke(encode_uint32(CONTACTS_GET_CONTACTS_CONSTRUCTOR) + encode_int64(0))
+    assert reader.uint32() == CONTACTS_CONTACTS_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == CONTACT_CONSTRUCTOR
+    assert reader.int64() == bob.user_id
+    reader.uint32()  # mutual Bool
+    assert reader.int32() == 1  # saved_count
+    assert reader.vector_count() == 1
+    assert _read_encoded_user(reader)["first_name"] == "Bobby"
+
+    # Carol was never saved, so she must not look like a contact and must not
+    # leak her phone number to Alice.
+    reader = invoke(encode_uint32(USERS_GET_USERS_CONSTRUCTOR) + encode_vector([input_user(carol.user_id)]))
+    assert reader.vector_count() == 1
+    stranger = _read_encoded_user(reader)
+    assert stranger["id"] == carol.user_id
+    assert stranger["contact"] is False
+    assert stranger["phone"] is None
+
+    reader = invoke(
+        encode_uint32(CONTACTS_BLOCK_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(carol.user_id)
+        + encode_int64(user_access_hash(carol.user_id))
+    )
+    assert reader.uint32() == BOOL_TRUE_CONSTRUCTOR
+
+    reader = invoke(
+        encode_uint32(CONTACTS_GET_BLOCKED_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(0)
+        + encode_int32(100)
+    )
+    assert reader.uint32() == CONTACTS_BLOCKED_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == PEER_BLOCKED_CONSTRUCTOR
+    assert reader.uint32() == PEER_USER_CONSTRUCTOR
+    assert reader.int64() == carol.user_id
+
+    reader = invoke(encode_uint32(CONTACTS_DELETE_CONTACTS_CONSTRUCTOR) + encode_vector([input_user(bob.user_id)]))
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    assert reader.vector_count() == 1
+
+    reader = invoke(encode_uint32(CONTACTS_GET_CONTACTS_CONSTRUCTOR) + encode_int64(0))
+    assert reader.uint32() == CONTACTS_CONTACTS_CONSTRUCTOR
+    assert reader.vector_count() == 0
+
+
+def _read_forward_fwd_header_from_response(body: bytes, message_id: int) -> tuple[int | None, str | None, int | None]:
+    """Unwrap a forward RPC update and return (fwd from_id user, from_name, fwd date)."""
+    from intelligram.mtproto.tl import (
+        MESSAGE_CONSTRUCTOR,
+        MESSAGE_FWD_HEADER_CONSTRUCTOR,
+        PEER_USER_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        UPDATES_CONSTRUCTOR,
+        UPDATE_MESSAGE_ID_CONSTRUCTOR,
+        UPDATE_NEW_MESSAGE_CONSTRUCTOR,
+    )
+
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    assert reader.int64() == message_id
+    assert reader.uint32() == UPDATES_CONSTRUCTOR
+    update_count = reader.vector_count()
+    fwd_user_id: int | None = None
+    fwd_name: str | None = None
+    fwd_date: int | None = None
+    for _ in range(update_count):
+        ctor = reader.uint32()
+        if ctor == UPDATE_MESSAGE_ID_CONSTRUCTOR:
+            reader.int32()
+            reader.int64()
+            continue
+        assert ctor == UPDATE_NEW_MESSAGE_CONSTRUCTOR
+        assert reader.uint32() == MESSAGE_CONSTRUCTOR
+        flags = reader.uint32()
+        reader.uint32()  # flags2
+        reader.int32()  # message id
+        reader.uint32()  # from_id peer constructor
+        reader.int64()
+        reader.uint32()  # peer_id constructor
+        reader.int64()
+        if flags & (1 << 2):
+            assert reader.uint32() == MESSAGE_FWD_HEADER_CONSTRUCTOR
+            fwd_flags = reader.uint32()
+            if fwd_flags & 1:
+                assert reader.uint32() == PEER_USER_CONSTRUCTOR
+                fwd_user_id = reader.int64()
+            else:
+                fwd_user_id = None
+                fwd_name = reader.bytes().decode("utf-8")
+            fwd_date = reader.int32()
+        break
+    return fwd_user_id, fwd_name, fwd_date
+
+
+def test_web_k_forwarded_message_carries_message_fwd_header(tmp_path) -> None:
+    """A forward into Saved Messages keeps the clickable original author."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_SELF_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR,
+        encode_int64,
+        encode_uint32,
+        encode_vector_ints,
+        encode_vector_longs,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 927, 202
+    database = Database(tmp_path / "forward-fwd.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000251", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000252", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        source_peer = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        stored, _ = send_message(
+            connection, peer_id=source_peer, sender_user_id=alice.user_id, body="Forward me", client_random_id="fwd-source",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=bob.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    request = (
+        encode_uint32(MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(alice.user_id)
+        + encode_int64(user_access_hash(alice.user_id))
+        + encode_vector_ints([int(stored["id"])])
+        + encode_vector_longs([987_654_322])
+        + encode_uint32(INPUT_PEER_SELF_CONSTRUCTOR)
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=request,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    fwd_user_id, fwd_name, fwd_date = _read_forward_fwd_header_from_response(body, message_id)
+    assert fwd_user_id == alice.user_id
+    assert fwd_name is None
+    assert fwd_date == int(stored["sent_at"])
+    with database.transaction() as connection:
+        saved_peer = get_or_create_direct_peer(connection, user_id=bob.user_id, other_user_id=bob.user_id)
+        fwd_row = connection.execute(
+            "SELECT fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name FROM messages WHERE peer_id = ? ORDER BY id DESC LIMIT 1",
+            (saved_peer,),
+        ).fetchone()
+        assert fwd_row is not None
+        assert int(fwd_row["fwd_from_user_id"]) == alice.user_id
+        assert int(fwd_row["fwd_from_peer_id"]) == source_peer
+        assert int(fwd_row["fwd_date"]) == int(stored["sent_at"])
+        assert int(fwd_row["fwd_hidden"]) == 0
+
+
+def test_forward_into_another_user_hides_the_private_sender(tmp_path) -> None:
+    """Forwarding a direct-chat message out hides the author: from_name only."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR,
+        encode_int64,
+        encode_uint32,
+        encode_vector_ints,
+        encode_vector_longs,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    auth_key = bytes(range(256))
+    salt, session_id = 928, 203
+    database = Database(tmp_path / "forward-hide.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        alice = register_password_account(
+            connection, phone="+15550000261", password="correct-horse-battery-staple", first_name="Alice", device_label="Alice",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000262", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        carol = register_password_account(
+            connection, phone="+15550000263", password="correct-horse-battery-staple", first_name="Carol", device_label="Carol",
+        )
+        source_peer = get_or_create_direct_peer(connection, user_id=alice.user_id, other_user_id=bob.user_id)
+        destination_peer = get_or_create_direct_peer(connection, user_id=bob.user_id, other_user_id=carol.user_id)
+        stored, _ = send_message(
+            connection, peer_id=source_peer, sender_user_id=alice.user_id, body="Private word", client_random_id="hide-source",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=bob.user_id)
+    message_id = (int(time.time()) << 32) + 4
+    request = (
+        encode_uint32(MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(alice.user_id)
+        + encode_int64(user_access_hash(alice.user_id))
+        + encode_vector_ints([int(stored["id"])])
+        + encode_vector_longs([987_654_333])
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(carol.user_id)
+        + encode_int64(user_access_hash(carol.user_id))
+    )
+    response = adapter.handle_encrypted(_encrypt_client(
+        auth_key, salt=salt, session_id=session_id, msg_id=message_id, seq_no=1, body=request,
+    ))
+    assert response is not None
+    _, _, _, _, body = _decrypt_server(auth_key, response)
+    fwd_user_id, fwd_name, fwd_date = _read_forward_fwd_header_from_response(body, message_id)
+    assert fwd_user_id is None
+    assert fwd_name == "Alice"
+    assert fwd_date == int(stored["sent_at"])
+    with database.transaction() as connection:
+        fwd_row = connection.execute(
+            "SELECT fwd_from_user_id, fwd_date, fwd_hidden, fwd_from_name FROM messages WHERE peer_id = ? ORDER BY id DESC LIMIT 1",
+            (destination_peer,),
+        ).fetchone()
+        assert fwd_row is not None
+        assert int(fwd_row["fwd_from_user_id"]) == alice.user_id
+        assert int(fwd_row["fwd_hidden"]) == 1
+        assert str(fwd_row["fwd_from_name"]) == "Alice"
+
+
+def test_author_forwards_privacy_blocks_forwarding_by_strangers(tmp_path) -> None:
+    """The author's "who can forward my messages" key gates messages.forwardMessages."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_PRIVACY_RULES_CONSTRUCTOR,
+        ACCOUNT_SET_PRIVACY_CONSTRUCTOR,
+        INPUT_PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR,
+        INPUT_PEER_SELF_CONSTRUCTOR,
+        INPUT_PEER_USER_CONSTRUCTOR,
+        MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR,
+        RPC_ERROR_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_int64,
+        encode_uint32,
+        encode_vector,
+        encode_vector_ints,
+        encode_vector_longs,
+        user_access_hash,
+    )
+    from intelligram.services.accounts import register_password_account
+    from intelligram.services.messaging import get_or_create_direct_peer, send_message
+
+    database = Database(tmp_path / "forward-privacy.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        carol = register_password_account(
+            connection, phone="+15550000271", password="correct-horse-battery-staple", first_name="Carol", device_label="Carol",
+        )
+        bob = register_password_account(
+            connection, phone="+15550000272", password="correct-horse-battery-staple", first_name="Bob", device_label="Bob",
+        )
+        source_peer = get_or_create_direct_peer(connection, user_id=carol.user_id, other_user_id=bob.user_id)
+        stored, _ = send_message(
+            connection, peer_id=source_peer, sender_user_id=carol.user_id, body="Do not spread", client_random_id="privacy-source",
+        )
+
+    def invoke(adapter: MTProtoSessionAdapter, key: bytes, index: int, query: bytes) -> bytes:
+        request_message_id = (int(time.time()) << 32) + index * 4
+        response = adapter.handle_encrypted(_encrypt_client(
+            key, salt=911, session_id=505, msg_id=request_message_id, seq_no=index, body=query,
+        ))
+        assert response is not None
+        return _decrypt_server(key, response)[4]
+
+    bob_key = bytes(range(256))
+    carol_key = bytes([(i * 7 + 3) % 256 for i in range(256)])
+    bob_adapter = MTProtoSessionAdapter(auth_key=bob_key, server_salt=911, database=database, user_id=bob.user_id)
+    carol_adapter = MTProtoSessionAdapter(auth_key=carol_key, server_salt=911, database=database, user_id=carol.user_id)
+
+    set_privacy = (
+        encode_uint32(ACCOUNT_SET_PRIVACY_CONSTRUCTOR)
+        + encode_uint32(0xA4DD4C08)  # inputPrivacyKeyForwards
+        + encode_vector([encode_uint32(INPUT_PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR)])
+    )
+    body = invoke(carol_adapter, carol_key, 1, set_privacy)
+    reader = TLReader(body)
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    reader.int64()  # echoed request message id
+    assert reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR
+
+    forward = (
+        encode_uint32(MESSAGES_FORWARD_MESSAGES_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+        + encode_int64(carol.user_id)
+        + encode_int64(user_access_hash(carol.user_id))
+        + encode_vector_ints([int(stored["id"])])
+        + encode_vector_longs([987_654_344])
+        + encode_uint32(INPUT_PEER_SELF_CONSTRUCTOR)
+    )
+    reader = TLReader(invoke(bob_adapter, bob_key, 1, forward))
+    assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+    reader.int64()  # echoed request message id
+    assert reader.uint32() == RPC_ERROR_CONSTRUCTOR
+    assert reader.int32() == 400
+    assert reader.bytes().decode() == "USER_PRIVACY_RESTRICTED"
+
+
+def test_web_k_privacy_rules_persist_and_survive_reload(tmp_path) -> None:
+    """account.setPrivacy persists; account.getPrivacy echoes the stored rules."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_GET_PRIVACY_CONSTRUCTOR,
+        ACCOUNT_PRIVACY_RULES_CONSTRUCTOR,
+        ACCOUNT_SET_PRIVACY_CONSTRUCTOR,
+        INPUT_PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR,
+        PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_uint32,
+        encode_vector,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 929, 204
+    database = Database(tmp_path / "privacy-set-get.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection, phone="+15550000281", password="correct-horse-battery-staple", first_name="Issued", device_label="Issued",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=issued.user_id)
+
+    def invoke(query: bytes, index: int) -> TLReader:
+        request_message_id = (int(time.time()) << 32) + index * 4
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key, salt=salt, session_id=session_id, msg_id=request_message_id, seq_no=index * 2 + 1, body=query,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        reader.int64()  # echoed request message id
+        return reader
+
+    set_privacy = (
+        encode_uint32(ACCOUNT_SET_PRIVACY_CONSTRUCTOR)
+        + encode_uint32(0x4F96CB18)  # inputPrivacyKeyStatusTimestamp
+        + encode_vector([encode_uint32(INPUT_PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR)])
+    )
+    reader = invoke(set_privacy, 1)
+    assert reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR
+
+    reader = invoke(encode_uint32(ACCOUNT_GET_PRIVACY_CONSTRUCTOR) + encode_uint32(0x4F96CB18), 2)
+    assert reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR
+
+    with database.transaction() as connection:
+        row = connection.execute(
+            "SELECT rules FROM privacy_rules WHERE user_id = ? AND key = 'status_timestamp'",
+            (issued.user_id,),
+        ).fetchone()
+        assert row is not None and "allow_contacts" in str(row["rules"])
+
+
+def test_free_account_cannot_narrow_voice_message_privacy(tmp_path) -> None:
+    """Restricting voice messages is a Premium feature; free accounts are locked to default."""
+
+    from intelligram.database import Database
+    from intelligram.mtproto.tl import (
+        ACCOUNT_PRIVACY_RULES_CONSTRUCTOR,
+        ACCOUNT_SET_PRIVACY_CONSTRUCTOR,
+        INPUT_PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR,
+        PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR,
+        RPC_ERROR_CONSTRUCTOR,
+        RPC_RESULT_CONSTRUCTOR,
+        TLReader,
+        encode_uint32,
+        encode_vector,
+    )
+    from intelligram.services.accounts import register_password_account
+
+    auth_key = bytes(range(256))
+    salt, session_id = 930, 205
+    database = Database(tmp_path / "privacy-premium.sqlite3")
+    database.initialize()
+    with database.transaction(immediate=True) as connection:
+        issued = register_password_account(
+            connection, phone="+15550000291", password="correct-horse-battery-staple", first_name="Issued", device_label="Issued",
+        )
+    adapter = MTProtoSessionAdapter(auth_key=auth_key, server_salt=salt, database=database, user_id=issued.user_id)
+
+    def invoke(query: bytes, index: int) -> tuple[TLReader, int]:
+        request_message_id = (int(time.time()) << 32) + index * 4
+        response = adapter.handle_encrypted(_encrypt_client(
+            auth_key, salt=salt, session_id=session_id, msg_id=request_message_id, seq_no=index * 2 + 1, body=query,
+        ))
+        assert response is not None
+        _, _, _, _, body = _decrypt_server(auth_key, response)
+        reader = TLReader(body)
+        assert reader.uint32() == RPC_RESULT_CONSTRUCTOR
+        reader.int64()  # echoed request message id
+        return reader, index
+
+    voice_key = 0xAEE69D68  # inputPrivacyKeyVoiceMessages
+    narrow = (
+        encode_uint32(ACCOUNT_SET_PRIVACY_CONSTRUCTOR)
+        + encode_uint32(voice_key)
+        + encode_vector([encode_uint32(INPUT_PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR)])
+    )
+    reader, _ = invoke(narrow, 1)
+    assert reader.uint32() == RPC_ERROR_CONSTRUCTOR
+    assert reader.int32() == 400
+    assert reader.bytes().decode() == "PREMIUM_ACCOUNT_REQUIRED"
+
+    with database.transaction(immediate=True) as connection:
+        connection.execute("UPDATE users SET premium = 1 WHERE id = ?", (issued.user_id,))
+    reader, _ = invoke(narrow, 2)
+    assert reader.uint32() == ACCOUNT_PRIVACY_RULES_CONSTRUCTOR
+    assert reader.vector_count() == 1
+    assert reader.uint32() == PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR

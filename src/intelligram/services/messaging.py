@@ -10,6 +10,9 @@ from typing import Any
 
 from intelligram.database import now_unix
 from intelligram.services.login_security import invalidate_codes_shared_by_owner
+from intelligram.services.premium import can_message_user, is_contact, user_is_premium
+from intelligram.services.privacy import KEY_FORWARDS, viewer_allowed
+from intelligram.services.contacts import is_blocked
 from intelligram.services.updates import UpdateEnvelope, append_update
 
 
@@ -30,6 +33,31 @@ def _require_active_membership(connection: sqlite3.Connection, peer_id: int, use
     if row is None:
         raise MessagingError("PEER_ID_INVALID")
     return row
+
+
+def _enforce_direct_message_privacy(connection: sqlite3.Connection, *, peer_id: int, sender_user_id: int) -> None:
+    """Reject sends into a direct chat the recipient has closed off.
+
+    Two independent rules apply: an explicit block in either direction, and the
+    recipient's Premium-only "who can send me messages" restriction.
+    """
+    direct = connection.execute(
+        "SELECT user_low_id, user_high_id FROM direct_peer_users WHERE peer_id = ?",
+        (peer_id,),
+    ).fetchone()
+    if direct is None:
+        return
+    recipient_user_id = (
+        int(direct["user_high_id"]) if sender_user_id == int(direct["user_low_id"]) else int(direct["user_low_id"])
+    )
+    if recipient_user_id == sender_user_id:
+        return
+    if is_blocked(connection, owner_user_id=sender_user_id, target_user_id=recipient_user_id):
+        raise MessagingError("YOU_BLOCKED_USER")
+    if is_blocked(connection, owner_user_id=recipient_user_id, target_user_id=sender_user_id):
+        raise MessagingError("USER_IS_BLOCKED")
+    if not can_message_user(connection, sender_user_id=sender_user_id, recipient_user_id=recipient_user_id):
+        raise MessagingError("USER_PRIVACY_RESTRICTED")
 
 
 def create_user(
@@ -1088,8 +1116,14 @@ def send_message(
     client_random_id: str,
     reply_to_message_id: int | None = None,
     media: dict[str, Any] | None = None,
+    fwd_from_user_id: int | None = None,
+    fwd_from_peer_id: int | None = None,
+    fwd_date: int | None = None,
+    fwd_hidden: bool = False,
+    fwd_from_name: str = "",
 ) -> tuple[dict[str, Any], list[UpdateEnvelope]]:
     _require_active_membership(connection, peer_id, sender_user_id)
+    _enforce_direct_message_privacy(connection, peer_id=peer_id, sender_user_id=sender_user_id)
     body = (body or "").strip()
     if not body and media is None:
         raise MessagingError("MESSAGE_EMPTY")
@@ -1107,7 +1141,7 @@ def send_message(
 
     existing = connection.execute(
         """
-        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name
         FROM messages WHERE sender_user_id = ? AND client_random_id = ?
         """,
         (sender_user_id, client_random_id),
@@ -1128,10 +1162,22 @@ def send_message(
     try:
         cursor = connection.execute(
             """
-            INSERT INTO messages(peer_id, sender_user_id, client_random_id, body, reply_to_message_id, sent_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO messages(peer_id, sender_user_id, client_random_id, body, reply_to_message_id, sent_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (peer_id, sender_user_id, client_random_id, body, reply_to_message_id, now),
+            (
+                peer_id,
+                sender_user_id,
+                client_random_id,
+                body,
+                reply_to_message_id,
+                now,
+                fwd_from_user_id,
+                fwd_from_peer_id,
+                fwd_date,
+                1 if fwd_hidden else 0,
+                fwd_from_name or "",
+            ),
         )
     except sqlite3.IntegrityError as exc:
         raise MessagingError("REPLY_MESSAGE_ID_INVALID") from exc
@@ -1139,7 +1185,7 @@ def send_message(
     if media is not None:
         _store_message_media(connection, message_id=message_id, media=media)
     row = connection.execute(
-        "SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at FROM messages WHERE id = ?",
+        "SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name FROM messages WHERE id = ?",
         (message_id,),
     ).fetchone()
     if row is None:
@@ -1191,9 +1237,14 @@ def forward_messages(
     _require_active_membership(connection, destination_peer_id, actor_user_id)
     if not message_ids or len(message_ids) != len(random_ids):
         raise MessagingError("INPUT_REQUEST_INVALID")
+    content_protected = connection.execute(
+        "SELECT 1 FROM channel_settings WHERE peer_id = ? AND noforwards = 1", (source_peer_id,)
+    ).fetchone()
+    if content_protected is not None:
+        raise MessagingError("CHAT_FORWARDS_RESTRICTED")
     source_rows = connection.execute(
         f"""
-        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name
         FROM messages WHERE peer_id = ? AND id IN ({','.join('?' for _ in message_ids)}) AND deleted_at IS NULL
         """,
         (source_peer_id, *message_ids),
@@ -1205,16 +1256,80 @@ def forward_messages(
     emitted: list[UpdateEnvelope] = []
     for message_id, random_id in zip(message_ids, random_ids, strict=True):
         source = messages_by_id[message_id]
+        source_author_id = int(source["sender_user_id"])
+        if source_author_id != actor_user_id and not _may_forward_from(
+            connection, author_user_id=source_author_id, actor_user_id=actor_user_id
+        ):
+            raise MessagingError("USER_PRIVACY_RESTRICTED")
+        fwd_from_user_id = int(source["fwd_from_user_id"]) if source.get("fwd_from_user_id") is not None else source_author_id
+        fwd_date = int(source["fwd_date"]) if source.get("fwd_date") is not None else int(source["sent_at"])
+        fwd_from_peer_id = int(source["fwd_from_peer_id"]) if source.get("fwd_from_peer_id") is not None else source_peer_id
+        fwd_hidden = bool(source.get("fwd_hidden"))
+        fwd_from_name = str(source.get("fwd_from_name") or "")
+        if source.get("fwd_from_user_id") is None and not fwd_hidden:
+            fwd_hidden, fwd_from_name = _new_forward_identity(
+                connection,
+                source_peer_id=source_peer_id,
+                author_user_id=source_author_id,
+                destination_peer_id=destination_peer_id,
+                actor_user_id=actor_user_id,
+            )
         stored, updates = send_message(
             connection,
             peer_id=destination_peer_id,
             sender_user_id=actor_user_id,
             body=str(source["body"]),
             client_random_id=f"forward:{random_id}",
+            media=source.get("media"),
+            fwd_from_user_id=fwd_from_user_id,
+            fwd_from_peer_id=fwd_from_peer_id,
+            fwd_date=fwd_date,
+            fwd_hidden=fwd_hidden,
+            fwd_from_name=fwd_from_name,
         )
         forwarded.append(stored)
         emitted.extend(updates)
     return forwarded, emitted
+
+
+def _may_forward_from(
+    connection: sqlite3.Connection, *, author_user_id: int, actor_user_id: int
+) -> bool:
+    """Respect the author's "who can forward my messages" privacy key."""
+    if author_user_id == actor_user_id:
+        return True
+    return viewer_allowed(
+        connection,
+        owner_user_id=author_user_id,
+        key=KEY_FORWARDS,
+        viewer_id=actor_user_id,
+        is_contact=is_contact(connection, owner_user_id=author_user_id, contact_user_id=actor_user_id),
+        viewer_premium=user_is_premium(connection, actor_user_id),
+    )
+
+
+def _new_forward_identity(
+    connection: sqlite3.Connection,
+    *,
+    source_peer_id: int,
+    author_user_id: int,
+    destination_peer_id: int,
+    actor_user_id: int,
+) -> tuple[bool, str]:
+    """Decide the MessageFwdHeader for a brand-new forward.
+
+    A direct-chat (private) sender's identity is hidden when the message leaves
+    that chat -- from_name only -- exactly like Telegram. Saved Messages keeps
+    the clickable author, and group/channel forwards keep the author peer.
+    """
+    saved_messages = get_or_create_direct_peer(connection, user_id=actor_user_id, other_user_id=actor_user_id)
+    if destination_peer_id == saved_messages:
+        return False, ""
+    source_kind = connection.execute("SELECT kind FROM peers WHERE id = ?", (source_peer_id,)).fetchone()
+    if source_kind is None or str(source_kind["kind"]) != "user":
+        return False, ""
+    author = connection.execute("SELECT first_name FROM users WHERE id = ?", (author_user_id,)).fetchone()
+    return True, str(author["first_name"]) if author is not None else ""
 
 
 def edit_message(
@@ -1228,7 +1343,7 @@ def edit_message(
         raise MessagingError("MESSAGE_TOO_LONG")
     row = connection.execute(
         """
-        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name
         FROM messages WHERE id = ? AND peer_id = ? AND deleted_at IS NULL
         """,
         (message_id, peer_id),
@@ -1241,7 +1356,7 @@ def edit_message(
     connection.execute("UPDATE messages SET body = ?, edited_at = ? WHERE id = ?", (body, now, message_id))
     updated = connection.execute(
         """
-        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+        SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name
         FROM messages WHERE id = ?
         """,
         (message_id,),
@@ -1392,7 +1507,7 @@ connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | 
     if before_id is None:
         rows = connection.execute(
             """
-            SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+            SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name
             FROM messages WHERE peer_id = ? AND deleted_at IS NULL
             ORDER BY id DESC LIMIT ?
             """,
@@ -1401,7 +1516,7 @@ connection: sqlite3.Connection, *, peer_id: int, user_id: int, before_id: int | 
     else:
         rows = connection.execute(
             """
-            SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at
+            SELECT id, peer_id, sender_user_id, body, reply_to_message_id, sent_at, edited_at, deleted_at, fwd_from_user_id, fwd_from_peer_id, fwd_date, fwd_hidden, fwd_from_name
             FROM messages WHERE peer_id = ? AND id < ? AND deleted_at IS NULL
             ORDER BY id DESC LIMIT ?
             """,
@@ -1547,6 +1662,16 @@ def _message_row(row: sqlite3.Row, connection: sqlite3.Connection | None = None)
         "edited_at": int(row["edited_at"]) if row["edited_at"] is not None else None,
         "deleted_at": int(row["deleted_at"]) if row["deleted_at"] is not None else None,
     }
+    if "fwd_from_user_id" in row.keys():
+        message["fwd_from_user_id"] = (
+            int(row["fwd_from_user_id"]) if row["fwd_from_user_id"] is not None else None
+        )
+        message["fwd_from_peer_id"] = (
+            int(row["fwd_from_peer_id"]) if row["fwd_from_peer_id"] is not None else None
+        )
+        message["fwd_date"] = int(row["fwd_date"]) if row["fwd_date"] is not None else None
+        message["fwd_hidden"] = bool(int(row["fwd_hidden"] or 0))
+        message["fwd_from_name"] = str(row["fwd_from_name"] or "")
     if connection is not None:
         media = _load_message_media(connection, int(row["id"]))
         if media is not None:

@@ -42,6 +42,8 @@ class Database:
                     about TEXT NOT NULL DEFAULT '',
                     password_hash TEXT,
                     premium INTEGER NOT NULL DEFAULT 0 CHECK(premium IN (0, 1)),
+                    premium_until INTEGER,
+                    noncontacts_require_premium INTEGER NOT NULL DEFAULT 0 CHECK(noncontacts_require_premium IN (0, 1)),
                     verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0, 1)),
                     is_service INTEGER NOT NULL DEFAULT 0 CHECK(is_service IN (0, 1)),
                     created_at INTEGER NOT NULL,
@@ -180,7 +182,25 @@ class Database:
                     contact_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     client_id INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    phone TEXT,
                     PRIMARY KEY(user_id, contact_user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS blocked_peers (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    blocked_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(user_id, blocked_user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS privacy_rules (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    rules TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(user_id, key)
                 );
 
                 CREATE TABLE IF NOT EXISTS direct_peer_users (
@@ -210,6 +230,11 @@ class Database:
                     sent_at INTEGER NOT NULL,
                     edited_at INTEGER,
                     deleted_at INTEGER,
+                    fwd_from_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    fwd_from_peer_id INTEGER,
+                    fwd_date INTEGER,
+                    fwd_hidden INTEGER NOT NULL DEFAULT 0 CHECK(fwd_hidden IN (0, 1)),
+                    fwd_from_name TEXT NOT NULL DEFAULT '',
                     UNIQUE(sender_user_id, client_random_id)
                 );
 
@@ -325,10 +350,26 @@ class Database:
                 connection.execute("ALTER TABLE users ADD COLUMN profile_photo_id INTEGER")
             if "premium" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN premium INTEGER NOT NULL DEFAULT 0")
+            if "premium_until" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN premium_until INTEGER")
+            if "noncontacts_require_premium" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN noncontacts_require_premium INTEGER NOT NULL DEFAULT 0")
             if "verified" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
             if "is_service" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0")
+            contact_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(contacts)").fetchall()
+            }
+            # Saved contact names are per-owner overrides, so they live on the
+            # contacts row rather than on the shared users row.
+            if "first_name" not in contact_columns:
+                connection.execute("ALTER TABLE contacts ADD COLUMN first_name TEXT")
+            if "last_name" not in contact_columns:
+                connection.execute("ALTER TABLE contacts ADD COLUMN last_name TEXT")
+            if "phone" not in contact_columns:
+                connection.execute("ALTER TABLE contacts ADD COLUMN phone TEXT")
             login_challenge_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(login_challenges)").fetchall()
@@ -370,6 +411,20 @@ class Database:
             }
             if "attributes_json" not in message_media_columns:
                 connection.execute("ALTER TABLE message_media ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '[]'")
+            message_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            if "fwd_from_user_id" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN fwd_from_user_id INTEGER")
+            if "fwd_from_peer_id" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN fwd_from_peer_id INTEGER")
+            if "fwd_date" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN fwd_date INTEGER")
+            if "fwd_hidden" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN fwd_hidden INTEGER NOT NULL DEFAULT 0")
+            if "fwd_from_name" not in message_columns:
+                connection.execute("ALTER TABLE messages ADD COLUMN fwd_from_name TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:

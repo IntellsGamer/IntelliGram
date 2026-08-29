@@ -14,7 +14,7 @@ import {AppNewChannelTab} from '@components/solidJsTabs/tabs';
 import {AppContactsTab} from '@components/solidJsTabs/tabs';
 import {AppArchivedTab} from '@components/solidJsTabs/tabs';
 import createNewGroupTab from '@components/sidebarLeft/tabs/createNewGroupTab';
-import I18n, {i18n} from '@lib/langPack';
+import {i18n} from '@lib/langPack';
 import ButtonMenu, {ButtonMenuItemOptions, ButtonMenuItemOptionsVerifiable} from '@components/buttonMenu';
 import {IS_APPLE, IS_MOBILE_SAFARI} from '@environment/userAgent';
 import appNavigationController, {NavigationItem} from '@components/appNavigationController';
@@ -26,6 +26,7 @@ import sessionStorage from '@lib/sessionStorage';
 import {attachClickEvent, CLICK_EVENT_NAME, simulateClickEvent} from '@helpers/dom/clickEvent';
 import ButtonIcon from '@components/buttonIcon';
 import confirmationPopup from '@components/confirmationPopup';
+import PopupPremium from '@components/popups/premium';
 import {replaceButtonIcon} from '@components/button';
 import noop from '@helpers/noop';
 import ripple from '@components/ripple';
@@ -947,11 +948,12 @@ export class AppSidebarLeft extends SidebarSlider {
       separator: App.isMainDomain,
       verify: () => App.isMainDomain
     }, {
-      icon: 'help',
+      icon: 'premium_badge',
       text: 'TelegramFeatures',
       onClick: () => {
-        const url = I18n.format('TelegramFeaturesUrl', true);
-        appImManager.openUrl(url);
+        // IntelliGram self-hosts Premium: show the local feature sheet
+        // instead of Telegram's external marketing URL.
+        PopupPremium.show();
       },
       separator: !App.isMainDomain
     }, {

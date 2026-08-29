@@ -79,6 +79,8 @@ class AdminLoginRequest(BaseModel):
 
 class PremiumGrantRequest(BaseModel):
     premium: bool
+    # Unix seconds; None with premium=true grants Premium without expiry.
+    until: int | None = None
 
 
 class CreateGroupRequest(BaseModel):
@@ -418,13 +420,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rows = connection.execute(
                 """
                 SELECT u.id, u.first_name, u.last_name, u.username, u.premium,
-                       u.created_at,
+                       u.premium_until, u.created_at,
                        COUNT(ak.auth_key_id) AS active_authorizations
                 FROM users u
                 LEFT JOIN auth_keys ak ON ak.user_id = u.id
                     AND ak.revoked_at IS NULL
                     AND (ak.expires_at IS NULL OR ak.expires_at >= ?)
-                GROUP BY u.id
+                GROUP BY u.id, u.premium, u.premium_until
                 ORDER BY u.id ASC
                 LIMIT 500
                 """,
@@ -439,13 +441,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _owner_user_id: int = Depends(require_owner),
     ) -> dict[str, Any]:
         with database.transaction(immediate=True) as connection:
+            if request.premium:
+                premium_until = (
+                    int(request.until) if request.until is not None else None
+                )
+                if premium_until is not None and premium_until <= now_unix():
+                    raise HTTPException(status_code=400, detail="PREMIUM_UNTIL_INVALID")
+            else:
+                premium_until = None
             changed = connection.execute(
-                "UPDATE users SET premium = ?, updated_at = ? WHERE id = ?",
-                (int(request.premium), now_unix(), target_user_id),
+                "UPDATE users SET premium = ?, premium_until = ?, updated_at = ? WHERE id = ?",
+                (int(request.premium), premium_until, now_unix(), target_user_id),
             ).rowcount
         if not changed:
             raise HTTPException(status_code=404, detail="USER_ID_INVALID")
-        return {"user_id": target_user_id, "premium": request.premium}
+        return {
+            "user_id": target_user_id,
+            "premium": request.premium,
+            "premium_until": premium_until,
+        }
 
     @app.get("/v1/auth/login-challenges")
     def login_challenges(user_id: int = Depends(current_user_id)) -> dict[str, Any]:

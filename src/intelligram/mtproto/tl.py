@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
+import time
+import zlib
 from typing import Any, Iterable
 
 
@@ -23,6 +25,7 @@ NEW_SESSION_CREATED_CONSTRUCTOR = 0x9EC20908
 BAD_SERVER_SALT_CONSTRUCTOR = 0xEDAB447B
 BOOL_TRUE_CONSTRUCTOR = 0x997275B5
 BOOL_FALSE_CONSTRUCTOR = 0xBC799737
+GZIP_PACKED_CONSTRUCTOR = 0x3072CFA1
 INVOKE_WITH_LAYER_CONSTRUCTOR = 0xDA9B0D0D
 INIT_CONNECTION_CONSTRUCTOR = 0xC1CD5EA9
 HELP_GET_CONFIG_CONSTRUCTOR = 0xC4F9186B
@@ -31,6 +34,12 @@ HELP_GET_APP_CONFIG_CONSTRUCTOR = 0x61E3F854
 HELP_APP_CONFIG_CONSTRUCTOR = 0xDD18782E
 NEAREST_DC_CONSTRUCTOR = -1910892683
 JSON_OBJECT_CONSTRUCTOR = 0x99C1D49D
+JSON_OBJECT_VALUE_CONSTRUCTOR = 0xC0DE1BD9
+JSON_STRING_CONSTRUCTOR = 0xB71E767A
+JSON_NUMBER_CONSTRUCTOR = 0x2BE0DFA4
+JSON_BOOL_CONSTRUCTOR = 0xC7345E6A
+JSON_NULL_CONSTRUCTOR = 0x3F6D7B68
+JSON_ARRAY_CONSTRUCTOR = 0xF7444763
 CONFIG_CONSTRUCTOR = 0xCC1A241E
 DC_OPTION_CONSTRUCTOR = 0x18B7A10D
 AUTH_EXPORT_LOGIN_TOKEN_CONSTRUCTOR = 0xB7E085FE
@@ -59,7 +68,10 @@ INPUT_PEER_USER_CONSTRUCTOR = 0xDDE8A54C
 INPUT_PEER_CHAT_CONSTRUCTOR = 0x35A95CB9
 INPUT_PEER_CHANNEL_CONSTRUCTOR = 0x27BCBBFC
 INPUT_USER_SELF_CONSTRUCTOR = 0xF7C1B13F
-INPUT_USER_CONSTRUCTOR = 0xF210AAE0
+INPUT_USER_CONSTRUCTOR = 0xF21158C6
+# Superseded id kept accepted so sessions built against the earlier constant
+# keep decoding rather than failing the whole request.
+INPUT_USER_LEGACY_CONSTRUCTOR = 0xF210AAE0
 INPUT_CHANNEL_CONSTRUCTOR = 0xF35AEC28
 INPUT_DIALOG_PEER_CONSTRUCTOR = 0xFCAAFEB7
 MESSAGE_CONSTRUCTOR = 0x7600B9D3
@@ -127,9 +139,40 @@ INPUT_STICKER_SET_SHORT_NAME_CONSTRUCTOR = 0x861CC8A0
 MESSAGES_GET_PEER_DIALOGS_CONSTRUCTOR = 0xE470BCFD
 ACCOUNT_UPDATE_STATUS_CONSTRUCTOR = 0x6628562C
 ACCOUNT_GET_PRIVACY_CONSTRUCTOR = 0xDADBC950
+ACCOUNT_SET_PRIVACY_CONSTRUCTOR = 0xC9F81CE8
+INPUT_PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR = 0x0D09E07B
+INPUT_PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR = 0x184B35CE
+INPUT_PRIVACY_VALUE_ALLOW_USERS_CONSTRUCTOR = 0x131CC67F
+INPUT_PRIVACY_VALUE_ALLOW_PREMIUM_CONSTRUCTOR = 0x77CDC9F1
+INPUT_PRIVACY_VALUE_ALLOW_CLOSE_FRIENDS_CONSTRUCTOR = 0x2F453E49
+INPUT_PRIVACY_VALUE_ALLOW_BOTS_CONSTRUCTOR = 0x5A4FCCE5
+INPUT_PRIVACY_VALUE_ALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR = 0x840649CF
+INPUT_PRIVACY_VALUE_DISALLOW_CONTACTS_CONSTRUCTOR = 0x0BA52007
+INPUT_PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR = 0xD66B66C9
+INPUT_PRIVACY_VALUE_DISALLOW_USERS_CONSTRUCTOR = 0x90110467
+INPUT_PRIVACY_VALUE_DISALLOW_BOTS_CONSTRUCTOR = 0xC4E57915
+INPUT_PRIVACY_VALUE_DISALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR = 0xE94F0F86
+PRIVACY_VALUE_ALLOW_USERS_CONSTRUCTOR = 0xB8905FB2
+PRIVACY_VALUE_ALLOW_PREMIUM_CONSTRUCTOR = 0xECE9814B
+PRIVACY_VALUE_ALLOW_CLOSE_FRIENDS_CONSTRUCTOR = 0xF7E8D89B
+PRIVACY_VALUE_ALLOW_BOTS_CONSTRUCTOR = 0x21461B5D
+PRIVACY_VALUE_ALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR = 0x6B134E8E
+PRIVACY_VALUE_DISALLOW_ALL_CONSTRUCTOR = 0x8B73E763
+PRIVACY_VALUE_DISALLOW_CONTACTS_CONSTRUCTOR = 0xF888FA1A
+PRIVACY_VALUE_DISALLOW_USERS_CONSTRUCTOR = 0xE4621141
+PRIVACY_VALUE_DISALLOW_BOTS_CONSTRUCTOR = 0xF6A5F82F
+PRIVACY_VALUE_DISALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR = 0x41C87565
+MESSAGE_FWD_HEADER_CONSTRUCTOR = 0x4E4DF4BB
+ACCOUNT_GET_GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR = 0xEB2B4CF6
+ACCOUNT_SET_GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR = 0x1EDAAAC2
+GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR = 0xFE41B34F
+HELP_GET_PREMIUM_PROMO_CONSTRUCTOR = 0xB81B93D4
+HELP_PREMIUM_PROMO_CONSTRUCTOR = 0x5334759C
+PREMIUM_SUBSCRIPTION_OPTION_CONSTRUCTOR = 0x5F2D1DF2
 ACCOUNT_GET_CONTENT_SETTINGS_CONSTRUCTOR = 0x8B9B4DAE
 ACCOUNT_CONTENT_SETTINGS_CONSTRUCTOR = 0x57E28221
 PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR = 0x65427B82
+PRIVACY_VALUE_ALLOW_CONTACTS_CONSTRUCTOR = 0xFFFE1BAC
 ACCOUNT_PRIVACY_RULES_CONSTRUCTOR = 0x50A04E45
 CHAT_CONSTRUCTOR = 0x41CBF256
 CHANNEL_CONSTRUCTOR = 0xD49F34C6
@@ -264,6 +307,18 @@ IMPORTED_CONTACT_CONSTRUCTOR = 0xC13E3C50
 CONTACTS_IMPORTED_CONTACTS_CONSTRUCTOR = 0x77D01C3B
 CONTACTS_SEARCH_CONSTRUCTOR = 0x05F58D0F
 CONTACTS_FOUND_CONSTRUCTOR = 0xB3134D9D
+CONTACTS_ADD_CONTACT_CONSTRUCTOR = 0xD9BA2E54
+CONTACTS_DELETE_CONTACTS_CONSTRUCTOR = 0x096A0E00
+CONTACTS_GET_STATUSES_CONSTRUCTOR = 0xC4A353EE
+CONTACTS_BLOCK_CONSTRUCTOR = 0x2E2E8734
+CONTACTS_UNBLOCK_CONSTRUCTOR = 0xB550D328
+CONTACTS_GET_BLOCKED_CONSTRUCTOR = 0x9A868F80
+CONTACTS_BLOCKED_CONSTRUCTOR = 0x0ADE1591
+CONTACTS_BLOCKED_SLICE_CONSTRUCTOR = 0xE1664194
+PEER_BLOCKED_CONSTRUCTOR = 0xE8FD8014
+CONTACT_STATUS_CONSTRUCTOR = 0x16D9703B
+UPDATE_USER_CONSTRUCTOR = 0x20529438
+UPDATE_USER_NAME_CONSTRUCTOR = 0xA7848924
 ACCOUNT_AUTHORIZATION_CONSTRUCTOR = 0xAD01D61D
 ACCOUNT_AUTHORIZATIONS_CONSTRUCTOR = 0x4BFF8EA0
 ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR = 0xE320C158
@@ -408,6 +463,17 @@ def unwrap_client_query(data: bytes) -> bytes:
     """Strip Telegram Web A's standard invokeWithLayer/initConnection wrappers."""
     reader = TLReader(data)
     constructor_id = reader.uint32()
+    if constructor_id == GZIP_PACKED_CONSTRUCTOR:
+        # Web K gzips whole request bodies whose payload is not already
+        # compressed -- apiFileManager does this for every upload.saveFilePart
+        # of a non-media file, so .jar/.md/.txt attachments arrive packed while
+        # .pdf/.docx/images arrive raw. The wrapper is outermost, so recursing
+        # afterwards still strips invokeWithLayer/initConnection.
+        try:
+            packed = zlib.decompress(reader.bytes(), 47)
+        except zlib.error as error:
+            raise TLDecodeError("gzip_packed payload is not decompressible") from error
+        return unwrap_client_query(packed)
     if constructor_id == INVOKE_WITH_LAYER_CONSTRUCTOR:
         reader.int32()  # layer
         return unwrap_client_query(reader.raw_bytes(reader.remaining))
@@ -457,6 +523,30 @@ def _read_input_phone_contact(reader: TLReader) -> dict[str, Any]:
     }
 
 
+def _read_input_privacy_rule(reader: TLReader) -> dict[str, Any]:
+    """Read one InputPrivacyRule, keeping the constructor id.
+
+    Rule *meaning* lives in ``services.privacy``; this only knows which
+    constructors carry a user or chat id vector.
+    """
+    constructor_id = reader.uint32()
+    users: list[int] = []
+    chats: list[int] = []
+    if constructor_id in (
+        INPUT_PRIVACY_VALUE_ALLOW_USERS_CONSTRUCTOR,
+        INPUT_PRIVACY_VALUE_DISALLOW_USERS_CONSTRUCTOR,
+    ):
+        for entry in (_read_input_user(reader) for _ in range(reader.vector_count())):
+            if entry.get("kind") == "user":
+                users.append(int(entry["user_id"]))
+    elif constructor_id in (
+        INPUT_PRIVACY_VALUE_ALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR,
+        INPUT_PRIVACY_VALUE_DISALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR,
+    ):
+        chats = reader.vector_longs()
+    return {"constructor_id": constructor_id, "users": users, "chats": chats}
+
+
 def _read_input_reply_to(reader: TLReader) -> dict[str, Any]:
     if reader.uint32() != INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR:
         raise TLDecodeError("Only inputReplyToMessage is supported")
@@ -472,7 +562,7 @@ def _read_input_user(reader: TLReader) -> dict[str, Any]:
         return {"kind": "empty"}
     if constructor_id == INPUT_USER_SELF_CONSTRUCTOR:
         return {"kind": "self"}
-    if constructor_id == INPUT_USER_CONSTRUCTOR:
+    if constructor_id in (INPUT_USER_CONSTRUCTOR, INPUT_USER_LEGACY_CONSTRUCTOR):
         return {
             "kind": "user",
             "user_id": reader.int64(),
@@ -911,6 +1001,49 @@ def parse_request(data: bytes) -> TLRequest:
             raise TLDecodeError("Unsupported contacts.search optional fields")
         request = TLRequest(constructor_id, "contacts_search", {
             "query": reader.bytes().decode("utf-8"),
+            "limit": reader.int32(),
+        })
+    elif constructor_id == CONTACTS_ADD_CONTACT_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & (1 << 1):
+            # note:flags.1?TextWithEntities -- Web K sends contact notes through
+            # contacts.updateContactNote instead, so decoding it here would be
+            # dead weight. Refuse rather than desynchronize the reader.
+            raise TLDecodeError("Unsupported contacts.addContact note field")
+        if flags & ~0b1:
+            raise TLDecodeError("Unsupported contacts.addContact optional fields")
+        request = TLRequest(constructor_id, "contacts_add_contact", {
+            "add_phone_privacy_exception": bool(flags & 1),
+            "user": _read_input_user(reader),
+            "first_name": reader.bytes().decode("utf-8"),
+            "last_name": reader.bytes().decode("utf-8"),
+            "phone": reader.bytes().decode("utf-8"),
+        })
+    elif constructor_id == CONTACTS_DELETE_CONTACTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "contacts_delete_contacts", {
+            "users": [_read_input_user(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == CONTACTS_GET_STATUSES_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "contacts_get_statuses", {})
+    elif constructor_id in (CONTACTS_BLOCK_CONSTRUCTOR, CONTACTS_UNBLOCK_CONSTRUCTOR):
+        flags = reader.uint32()
+        if flags & ~0b1:
+            raise TLDecodeError("Unsupported contacts.block optional fields")
+        name = "contacts_block" if constructor_id == CONTACTS_BLOCK_CONSTRUCTOR else "contacts_unblock"
+        request = TLRequest(constructor_id, name, {
+            # my_stories_from scopes the block to stories only; IntelliGram has
+            # no stories, so a scoped block would be a no-op the client cannot
+            # observe. Track it and let the handler reject it explicitly.
+            "my_stories_from": bool(flags & 1),
+            "peer": _read_input_peer(reader),
+        })
+    elif constructor_id == CONTACTS_GET_BLOCKED_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b1:
+            raise TLDecodeError("Unsupported contacts.getBlocked optional fields")
+        request = TLRequest(constructor_id, "contacts_get_blocked", {
+            "my_stories_from": bool(flags & 1),
+            "offset": reader.int32(),
             "limit": reader.int32(),
         })
     elif constructor_id == ACCOUNT_GET_AUTHORIZATIONS_CONSTRUCTOR:
@@ -1360,8 +1493,32 @@ def parse_request(data: bytes) -> TLRequest:
     elif constructor_id == ACCOUNT_UPDATE_STATUS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "account_update_status", {"offline": _read_bool(reader)})
     elif constructor_id == ACCOUNT_GET_PRIVACY_CONSTRUCTOR:
-        reader.uint32()  # InputPrivacyKey constructor; all current variants have no fields.
-        request = TLRequest(constructor_id, "account_get_privacy", {})
+        # Every InputPrivacyKey variant is a bare constructor, so the id alone
+        # identifies which setting is being read.
+        request = TLRequest(constructor_id, "account_get_privacy", {"key_id": reader.uint32()})
+    elif constructor_id == ACCOUNT_SET_PRIVACY_CONSTRUCTOR:
+        key_id = reader.uint32()
+        request = TLRequest(constructor_id, "account_set_privacy", {
+            "key_id": key_id,
+            "rules": [_read_input_privacy_rule(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == ACCOUNT_GET_GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "account_get_global_privacy_settings", {})
+    elif constructor_id == ACCOUNT_SET_GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR:
+        settings_constructor = reader.uint32()
+        if settings_constructor != GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR:
+            raise TLDecodeError("Unsupported globalPrivacySettings constructor")
+        flags = reader.uint32()
+        if flags & (1 << 6):
+            raise TLDecodeError("Unsupported globalPrivacySettings disallowed_gifts field")
+        if flags & (1 << 5):
+            reader.int64()  # noncontact_peers_paid_stars (unused by IntelliGram)
+        request = TLRequest(constructor_id, "account_set_global_privacy_settings", {
+            "archive_and_mute": bool(flags & (1 << 0)),
+            "require_premium_for_messages": bool(flags & (1 << 4)),
+        })
+    elif constructor_id == HELP_GET_PREMIUM_PROMO_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "help_get_premium_promo", {})
     elif constructor_id == ACCOUNT_GET_CONTENT_SETTINGS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "account_get_content_settings", {})
     else:
@@ -1375,13 +1532,63 @@ def encode_pong(*, message_id: int, ping_id: int) -> bytes:
     return encode_uint32(PONG_CONSTRUCTOR) + encode_int64(message_id) + encode_int64(ping_id)
 
 
+def encode_json_string(value: str) -> bytes:
+    return encode_uint32(JSON_STRING_CONSTRUCTOR) + encode_tl_string(value)
+
+
+def encode_json_number(value: int | float) -> bytes:
+    return encode_uint32(JSON_NUMBER_CONSTRUCTOR) + struct.pack("<d", float(value))
+
+
+def encode_json_bool(value: bool) -> bytes:
+    return encode_uint32(JSON_BOOL_CONSTRUCTOR) + encode_bool(value)
+
+
+def encode_json_array(values: Iterable[bytes]) -> bytes:
+    # jsonArray.value is a boxed Vector<JSONValue>, so the vector constructor
+    # has to precede the count or Web K cannot decode the app config at all.
+    return encode_uint32(JSON_ARRAY_CONSTRUCTOR) + encode_vector(values)
+
+
+def encode_json_object(pairs: Iterable[tuple[str, bytes]]) -> bytes:
+    return encode_uint32(JSON_OBJECT_CONSTRUCTOR) + encode_vector(
+        encode_uint32(JSON_OBJECT_VALUE_CONSTRUCTOR) + encode_tl_string(key) + value
+        for key, value in pairs
+    )
+
+
 def encode_help_app_config(*, config_hash: int = 0) -> bytes:
-    """Return an empty but valid layer-228 application configuration object."""
+    """Return a layer-228 application configuration object.
+
+    ``upload_max_fileparts_*`` mirror the server's tiered attachment caps
+    (50 MiB free / 200 MiB Premium at 512 KiB parts) so Web K rejects
+    oversized uploads client-side with its native FILE_TOO_BIG UX.
+    ``premium_promo_order`` drives the IntelliGram Premium feature sheet.
+    """
     return (
         encode_uint32(HELP_APP_CONFIG_CONSTRUCTOR)
         + encode_int32(config_hash)
-        + encode_uint32(JSON_OBJECT_CONSTRUCTOR)
-        + encode_vector([])
+        + encode_json_object([
+            ("upload_max_fileparts_default", encode_json_number(100)),
+            ("upload_max_fileparts_premium", encode_json_number(400)),
+            ("premium_promo_order", encode_json_array([
+                encode_json_string(feature)
+                for feature in (
+                    "more_upload",
+                    "message_privacy",
+                    "last_seen",
+                    "no_ads",
+                    "faster_download",
+                    "animated_emoji",
+                    "emoji_status",
+                    "profile_badge",
+                    "double_limits",
+                    "translations",
+                    "peer_colors",
+                    "wallpapers",
+                )
+            ])),
+        ])
     )
 
 
@@ -1608,19 +1815,44 @@ def encode_user_profile_photo(*, photo_id: int, dc_id: int = 1) -> bytes:
     )
 
 
-def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contact: bool = False) -> bytes:
+def encode_user(
+    *,
+    user: dict[str, Any],
+    self_user_id: int | None = None,
+    contact: bool = False,
+    mutual: bool = False,
+) -> bytes:
     user_id = int(user["id"])
     first_name = str(user.get("first_name") or "")
     last_name = str(user.get("last_name") or "")
     username = user.get("username")
     phone = user.get("phone")
     profile_photo_id = user.get("profile_photo_id")
+    is_self = self_user_id == user_id
+    # A saved contact name is the viewer's own override; it replaces the
+    # account's profile name only for that viewer.
+    if contact and not is_self:
+        if user.get("contact_first_name"):
+            first_name = str(user["contact_first_name"])
+            last_name = str(user.get("contact_last_name") or "")
+        elif user.get("contact_last_name"):
+            last_name = str(user["contact_last_name"])
+    # Phone numbers are only shared with the account itself and with viewers who
+    # already saved it as a contact, matching Telegram's visibility rules.
+    if not is_self and not contact:
+        phone = None
     # Service routing identifiers are durable implementation details. The
     # official account should present like Telegram's verified notifications
     # peer, not expose a sign-in phone or public username to chat recipients.
     if user.get("is_service"):
         username = None
         phone = None
+    # Premium is only authoritative while unexpired; rows without the
+    # premium_until column keep their legacy permanent-badge behavior.
+    premium_until = user.get("premium_until")
+    premium_active = bool(user.get("premium")) and (
+        premium_until is None or int(premium_until) >= int(time.time())
+    )
     flags = 1  # access_hash
     if first_name:
         flags |= 1 << 1
@@ -1634,16 +1866,21 @@ def encode_user(*, user: dict[str, Any], self_user_id: int | None = None, contac
         flags |= 1 << 5
     if user.get("verified"):
         flags |= 1 << 17
-    if user.get("premium"):
+    if premium_active:
         flags |= 1 << 28
     if self_user_id == user_id:
         flags |= 1 << 10
     elif contact:
         flags |= 1 << 11
+        if mutual:
+            flags |= 1 << 12
+    # flags2 bit 10 tells non-contact, non-Premium viewers that messaging
+    # this account requires IntelliGram Premium (Web K locks the composer).
+    flags2 = 1 << 10 if user.get("require_premium_for_contact") else 0
     result = (
         encode_uint32(USER_CONSTRUCTOR)
         + encode_uint32(flags)
-        + encode_uint32(0)  # flags2
+        + encode_uint32(flags2)
         + encode_int64(user_id)
         + encode_int64(user_access_hash(user_id))
     )
@@ -2097,9 +2334,17 @@ def encode_message(
     reply_to_message_id = message.get("reply_to_message_id")
     edited_at = message.get("edited_at")
     encoded_media = encode_message_media(message.get("media") if isinstance(message.get("media"), dict) else None)
+    encoded_fwd_from = None
+    if message.get("fwd_from_user_id") is not None and message.get("fwd_date") is not None:
+        if message.get("fwd_hidden"):
+            fwd_from = encode_fwd_from(name=str(message.get("fwd_from_name") or ""), date=int(message["fwd_date"]))
+        else:
+            fwd_from = encode_fwd_from(user_id=int(message["fwd_from_user_id"]), date=int(message["fwd_date"]))
+        encoded_fwd_from = fwd_from
     flags = (
         (1 << 8)
         | ((1 << 1) if outgoing else 0)
+        | ((1 << 2) if encoded_fwd_from is not None else 0)
         | ((1 << 3) if reply_to_message_id is not None else 0)
         | ((1 << 9) if encoded_media is not None else 0)
         | ((1 << 15) if edited_at is not None else 0)
@@ -2111,11 +2356,28 @@ def encode_message(
         + encode_int32(int(message["id"]))
         + (sender_peer if sender_peer is not None else encode_peer_user(user_id=int(message["sender_user_id"])))
         + recipient_peer
+        + (encoded_fwd_from or b"")
         + (encode_message_reply_header(reply_to_message_id=int(reply_to_message_id)) if reply_to_message_id is not None else b"")
         + encode_int32(int(message["sent_at"]))
         + encode_tl_string(str(message["body"]))
         + (encoded_media or b"")
         + (encode_int32(int(edited_at)) if edited_at is not None else b"")
+    )
+
+
+def encode_fwd_from(*, user_id: int | None = None, name: str = "", date: int) -> bytes:
+    """Encode a messageFwdHeader; a private forward carries only from_name."""
+    if user_id is not None:
+        flags = 1 << 0
+        identity = encode_peer_user(user_id=int(user_id))
+    else:
+        flags = 1 << 5
+        identity = encode_tl_string(name or "")
+    return (
+        encode_uint32(MESSAGE_FWD_HEADER_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + identity
+        + encode_int32(int(date))
     )
 
 
@@ -2170,13 +2432,53 @@ def encode_contact(*, user_id: int, mutual: bool = False) -> bytes:
     return encode_uint32(CONTACT_CONSTRUCTOR) + encode_int64(user_id) + encode_bool(mutual)
 
 
-def encode_contacts_contacts(*, contacts: Iterable[bytes], users: Iterable[bytes]) -> bytes:
+def encode_contacts_contacts(*, contacts: Iterable[bytes], users: Iterable[bytes], saved_count: int = 0) -> bytes:
     return (
         encode_uint32(CONTACTS_CONTACTS_CONSTRUCTOR)
         + encode_vector(contacts)
-        + encode_int32(0)
+        + encode_int32(saved_count)
         + encode_vector(users)
     )
+
+
+def encode_contact_status(*, user_id: int) -> bytes:
+    """Encode ``contactStatus`` with an empty status.
+
+    IntelliGram does not persist last-seen timestamps, so every contact reports
+    ``userStatusEmpty`` -- the same shape Telegram uses for hidden statuses.
+    """
+    return (
+        encode_uint32(CONTACT_STATUS_CONSTRUCTOR)
+        + encode_int64(user_id)
+        + encode_uint32(USER_STATUS_EMPTY_CONSTRUCTOR)
+    )
+
+
+def encode_update_user(*, user_id: int) -> bytes:
+    return encode_uint32(UPDATE_USER_CONSTRUCTOR) + encode_int64(user_id)
+
+
+def encode_peer_blocked(*, user_id: int, date: int) -> bytes:
+    return (
+        encode_uint32(PEER_BLOCKED_CONSTRUCTOR)
+        + encode_peer_user(user_id=user_id)
+        + encode_int32(date)
+    )
+
+
+def encode_contacts_blocked(
+    *,
+    blocked: Iterable[bytes],
+    users: Iterable[bytes],
+    chats: Iterable[bytes] = (),
+    count: int | None = None,
+) -> bytes:
+    """Encode ``contacts.blocked``, or ``contacts.blockedSlice`` when the page
+    does not cover the whole block list."""
+    body = encode_vector(blocked) + encode_vector(chats) + encode_vector(users)
+    if count is None:
+        return encode_uint32(CONTACTS_BLOCKED_CONSTRUCTOR) + body
+    return encode_uint32(CONTACTS_BLOCKED_SLICE_CONSTRUCTOR) + encode_int32(count) + body
 
 
 def encode_messages_invited_users(*, updates: bytes, missing_invitees: Iterable[bytes] = ()) -> bytes:
@@ -2336,12 +2638,71 @@ def encode_updates(*, updates: Iterable[bytes], users: Iterable[bytes], chats: I
     )
 
 
-def encode_account_privacy_rules() -> bytes:
+def encode_privacy_value(*, constructor_id: int, users: Iterable[int] = (), chats: Iterable[int] = ()) -> bytes:
+    """Encode one PrivacyRule; only the *Users/*ChatParticipants variants carry ids."""
+    if constructor_id in (
+        PRIVACY_VALUE_ALLOW_USERS_CONSTRUCTOR,
+        PRIVACY_VALUE_DISALLOW_USERS_CONSTRUCTOR,
+    ):
+        return encode_uint32(constructor_id) + encode_vector_longs(users)
+    if constructor_id in (
+        PRIVACY_VALUE_ALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR,
+        PRIVACY_VALUE_DISALLOW_CHAT_PARTICIPANTS_CONSTRUCTOR,
+    ):
+        return encode_uint32(constructor_id) + encode_vector_longs(chats)
+    return encode_uint32(constructor_id)
+
+
+def encode_account_privacy_rules(*, rules: Iterable[bytes] | None = None, users: Iterable[bytes] = ()) -> bytes:
+    encoded = list(rules) if rules is not None else [encode_uint32(PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR)]
     return (
         encode_uint32(ACCOUNT_PRIVACY_RULES_CONSTRUCTOR)
-        + encode_vector([encode_uint32(PRIVACY_VALUE_ALLOW_ALL_CONSTRUCTOR)])
-        + encode_vector([])
-        + encode_vector([])
+        + encode_vector(encoded)
+        + encode_vector(())
+        + encode_vector(users)
+    )
+
+
+def encode_global_privacy_settings(
+    *, archive_and_mute: bool = False, require_premium_for_messages: bool = False
+) -> bytes:
+    """Encode ``globalPrivacySettings`` (layer 228).
+
+    Only the flags IntelliGram persists are ever set, so the client echoes
+    them back on ``account.setGlobalPrivacySettings`` without unexpected
+    conditional fields.
+    """
+    flags = 0
+    if archive_and_mute:
+        flags |= 1 << 0
+    if require_premium_for_messages:
+        flags |= 1 << 4
+    return encode_uint32(GLOBAL_PRIVACY_SETTINGS_CONSTRUCTOR) + encode_uint32(flags)
+
+
+def encode_help_premium_promo(*, bot_url: str) -> bytes:
+    """Encode ``help.premiumPromo`` for the IntelliGram Premium feature sheet.
+
+    IntelliGram has no payment processor: the single 12-month option's
+    ``bot_url`` points at the owner console where Premium is granted, and the
+    feature list itself comes from ``help.appConfig``'s premium_promo_order.
+    """
+    option = (
+        encode_uint32(PREMIUM_SUBSCRIPTION_OPTION_CONSTRUCTOR)
+        + encode_uint32(0)  # flags
+        + encode_int32(12)  # months
+        + encode_tl_string("XTR")
+        + encode_int64(0)  # amount
+        + encode_tl_string(bot_url)
+    )
+    return (
+        encode_uint32(HELP_PREMIUM_PROMO_CONSTRUCTOR)
+        + encode_tl_string("")  # status_text
+        + encode_vector([])  # status_entities
+        + encode_vector([])  # video_sections
+        + encode_vector([])  # videos
+        + encode_vector([option])  # period_options
+        + encode_vector([])  # users
     )
 
 
