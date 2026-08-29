@@ -1651,6 +1651,573 @@ def _load_message_media(connection: sqlite3.Connection, message_id: int) -> dict
     }
 
 
+# ---------------------------------------------------------------------------
+# Reactions & message search & drafts (ported from teamgram BFF)
+# ---------------------------------------------------------------------------
+
+REACTION_INVALID = "REACTION_INVALID"
+
+
+def _reaction_value(reaction: dict[str, Any]) -> str:
+    kind = str(reaction.get("kind"))
+    if kind == "emoji":
+        return str(reaction.get("emoticon", ""))
+    if kind == "custom":
+        return str(reaction.get("document_id", ""))
+    return "paid"
+
+
+def _reaction_dict(kind: str, value: str) -> dict[str, Any]:
+    kind = str(kind)
+    if kind == "emoji":
+        return {"kind": "emoji", "emoticon": value}
+    if kind == "custom":
+        return {"kind": "custom", "document_id": int(value or 0)}
+    return {"kind": "paid"}
+
+
+def _has_media_attr(row: sqlite3.Row, attr_kind: str) -> bool:
+    raw = row["attributes_json"] if "attributes_json" in row.keys() and row["attributes_json"] is not None else None
+    if not raw:
+        return False
+    try:
+        attrs = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(attrs, list):
+        return False
+    for attr in attrs:
+        if isinstance(attr, dict) and str(attr.get("kind")) == attr_kind:
+            return True
+    return False
+
+
+def _is_voice_media(row: sqlite3.Row) -> bool:
+    raw = row["attributes_json"] if "attributes_json" in row.keys() and row["attributes_json"] is not None else None
+    if not raw:
+        return False
+    try:
+        attrs = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(attrs, list):
+        return False
+    for attr in attrs:
+        if isinstance(attr, dict) and str(attr.get("kind")) == "audio":
+            if attr.get("voice") or attr.get("round"):
+                return True
+    return False
+
+
+def _make_media_filter(filter_kind: str | None):
+    """Return a row predicate matching the requested media search filter."""
+    if filter_kind in (None, "empty"):
+        return None
+    if filter_kind == "photos":
+        return lambda r: r["media_kind"] == "photo"
+    if filter_kind == "video":
+        return lambda r: r["media_kind"] == "document" and _has_media_attr(r, "video")
+    if filter_kind == "photo_video":
+        return lambda r: r["media_kind"] == "photo" or (r["media_kind"] == "document" and _has_media_attr(r, "video"))
+    if filter_kind == "document":
+        return lambda r: r["media_kind"] == "document" and not _has_media_attr(r, "video")
+    if filter_kind == "url":
+        return lambda r: "://" in (str(r["body"]) or "")
+    if filter_kind == "gif":
+        return lambda r: r["media_kind"] == "document" and _has_media_attr(r, "animated")
+    if filter_kind == "music":
+        return lambda r: r["media_kind"] == "document" and _has_media_attr(r, "audio") and not _is_voice_media(r)
+    if filter_kind == "voice":
+        return lambda r: r["media_kind"] == "document" and _is_voice_media(r)
+    if filter_kind == "round_voice":
+        return lambda r: r["media_kind"] == "document" and _is_voice_media(r)
+    # round_video, my_mentions, geo, contacts, phone_calls, pinned: not supported
+    return lambda r: False
+
+
+def _build_search_query(
+    peer_id: int,
+    from_id: int | None,
+    q: str | None,
+    filter_kind: str | None,
+    min_date: int | None,
+    max_date: int | None,
+    offset_id: int | None,
+) -> tuple[str, str, list[Any], Any, Any]:
+    base_where = ["m.peer_id = ?", "m.deleted_at IS NULL", "m.body != ''"]
+    params: list[Any] = [int(peer_id)]
+    media_join = ""
+    post_filter_text = None
+
+    post_filter_media = _make_media_filter(filter_kind)
+    if post_filter_media is not None:
+        media_join = " JOIN message_media mm ON mm.message_id = m.id "
+        base_where.append("mm.kind IS NOT NULL")
+
+    if from_id is not None:
+        base_where.append("m.sender_user_id = ?")
+        params.append(int(from_id))
+    else:
+        if q and q.startswith("#"):
+            tag = q[1:].split(" ", 1)[0]
+            if tag:
+                base_where.append("m.body LIKE ? ESCAPE '\\'")
+                params.append(f"%#{tag}%")
+                post_filter_text = re.compile(r"(?:^|\W)#" + re.escape(tag) + r"(?=\W|$)", re.IGNORECASE)
+        elif q:
+            base_where.append("m.body LIKE ? ESCAPE '\\'")
+            params.append(f"%{q}%")
+        if min_date:
+            base_where.append("m.sent_at >= ?")
+            params.append(int(min_date))
+        if max_date:
+            base_where.append("m.sent_at <= ?")
+            params.append(int(max_date))
+
+    base_where.append("m.id < ?")
+    params.append(int(offset_id) if offset_id and offset_id > 0 else 2147483647)
+
+    where = " AND ".join(base_where)
+    return media_join, where, params, post_filter_text, post_filter_media
+
+
+def search_messages(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    user_id: int,
+    q: str | None,
+    from_id: int | None,
+    filter_kind: str | None,
+    min_date: int | None,
+    max_date: int | None,
+    offset_id: int | None,
+    limit: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    _require_active_membership(connection, peer_id, user_id)
+    media_join, where, params, pf_text, pf_media = _build_search_query(
+        peer_id, from_id, q, filter_kind, min_date, max_date, offset_id
+    )
+    limit = max(1, min(limit or 50, 50))
+    select_columns = "m.*"
+    if media_join:
+        select_columns += ", mm.kind AS media_kind, mm.attributes_json AS attributes_json"
+    rows = connection.execute(
+        f"SELECT {select_columns} FROM messages m {media_join} WHERE {where} ORDER BY m.id DESC LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+    if pf_text is not None:
+        rows = [r for r in rows if pf_text.search(str(r["body"]))]
+    if pf_media is not None:
+        rows = [r for r in rows if pf_media(r)]
+    messages = [_message_row(r, connection) for r in rows]
+    count = connection.execute(
+        f"SELECT COUNT(*) AS c FROM messages m {media_join} WHERE {where}", params
+    ).fetchone()["c"]
+    return messages, int(count)
+
+
+def _count_search_messages(
+    connection: sqlite3.Connection, *, peer_id: int, filter_kind: str | None
+) -> int:
+    media_join, where, params, _, _ = _build_search_query(
+        peer_id, None, "", filter_kind, None, None, None
+    )
+    return int(
+        connection.execute(
+            f"SELECT COUNT(*) AS c FROM messages m {media_join} WHERE {where}", params
+        ).fetchone()["c"]
+    )
+
+
+def search_messages_global(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    q: str | None,
+    min_date: int | None,
+    max_date: int | None,
+    offset_id: int | None,
+    limit: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if not q:
+        raise MessagingError("SEARCH_QUERY_EMPTY")
+    peer_rows = connection.execute(
+        "SELECT peer_id FROM peer_memberships WHERE user_id = ? AND left_at IS NULL", (user_id,)
+    ).fetchall()
+    peer_ids = [int(r["peer_id"]) for r in peer_rows]
+    if not peer_ids:
+        return [], 0
+    placeholders = ",".join("?" for _ in peer_ids)
+    params: list[Any] = list(peer_ids)
+    where = [
+        f"m.peer_id IN ({placeholders})",
+        "m.deleted_at IS NULL",
+        "m.body != ''",
+        "m.body LIKE ? ESCAPE '\\'",
+    ]
+    params.append(f"%{q}%")
+    if min_date:
+        where.append("m.sent_at >= ?")
+        params.append(int(min_date))
+    if max_date:
+        where.append("m.sent_at <= ?")
+        params.append(int(max_date))
+    where.append("m.id < ?")
+    params.append(int(offset_id) if offset_id and offset_id > 0 else 2147483647)
+    where_sql = " AND ".join(where)
+    limit = max(1, min(limit or 50, 50))
+    rows = connection.execute(
+        f"SELECT m.* FROM messages m WHERE {where_sql} ORDER BY m.id DESC LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+    messages = [_message_row(r, connection) for r in rows]
+    count = connection.execute(
+        f"SELECT COUNT(*) AS c FROM messages m WHERE {where_sql}", params
+    ).fetchone()["c"]
+    return messages, int(count)
+
+
+def search_counters(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    user_id: int,
+    filters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    _require_active_membership(connection, peer_id, user_id)
+    results: list[dict[str, Any]] = []
+    for f in filters:
+        kind = f.get("kind")
+        ctor = f.get("constructor_id")
+        if kind in (
+            "photos",
+            "video",
+            "photo_video",
+            "document",
+            "url",
+            "gif",
+            "music",
+            "voice",
+            "round_voice",
+        ):
+            count = _count_search_messages(connection, peer_id=peer_id, filter_kind=kind)
+        else:
+            count = 0
+        results.append({"constructor_id": ctor, "count": count})
+    return results
+
+
+def _build_message_reactions(connection: sqlite3.Connection, *, peer_id: int, message_id: int) -> dict[str, Any]:
+    rows = connection.execute(
+        """SELECT reaction_kind, reaction, COUNT(*) AS c
+           FROM message_reactions
+           WHERE peer_id = ? AND message_id = ?
+           GROUP BY reaction_kind, reaction
+           ORDER BY c DESC""",
+        (peer_id, message_id),
+    ).fetchall()
+    reactions = [
+        {
+            "reaction": _reaction_dict(str(row["reaction_kind"]), str(row["reaction"])),
+            "count": int(row["c"]),
+            "chosen_order": None,
+        }
+        for row in rows
+    ]
+    recent_rows = connection.execute(
+        "SELECT user_id, reaction_kind, reaction, big, date "
+        "FROM message_reactions WHERE peer_id = ? AND message_id = ? ORDER BY date DESC LIMIT 50",
+        (peer_id, message_id),
+    ).fetchall()
+    recent = [
+        {
+            "user_id": int(row["user_id"]),
+            "reaction": _reaction_dict(str(row["reaction_kind"]), str(row["reaction"])),
+            "date": int(row["date"]),
+            "big": bool(int(row["big"])),
+        }
+        for row in recent_rows
+    ]
+    return {"peer_id": int(peer_id), "msg_id": int(message_id), "reactions": reactions, "recent": recent}
+
+
+def set_message_reaction(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    message_id: int,
+    user_id: int,
+    reaction: dict[str, Any],
+    big: bool,
+) -> tuple[dict[str, Any], list[Any]]:
+    membership = _require_active_membership(connection, peer_id, user_id)
+    kind = str(membership["kind"])
+    message = connection.execute(
+        "SELECT id FROM messages WHERE id = ? AND peer_id = ? AND deleted_at IS NULL",
+        (message_id, peer_id),
+    ).fetchone()
+    if message is None:
+        raise MessagingError("MESSAGE_ID_INVALID")
+
+    if kind == "channel":
+        settings = connection.execute(
+            "SELECT mode, allow_custom, emoticons_json FROM channel_reaction_settings WHERE peer_id = ?",
+            (peer_id,),
+        ).fetchone()
+        mode = str(settings["mode"]) if settings is not None else "none"
+        allow_custom = bool(int(settings["allow_custom"])) if settings is not None else False
+        emoticons: list[str] = []
+        if settings is not None:
+            try:
+                emoticons = [str(x) for x in json.loads(str(settings["emoticons_json"] or "[]") or "[]")]
+            except (ValueError, TypeError):
+                emoticons = []
+        is_admin = str(membership["role"]) in {"owner", "admin"}
+        if reaction.get("kind") == "custom" and not allow_custom:
+            raise MessagingError(REACTION_INVALID)
+        if reaction.get("kind") == "paid" and not is_admin:
+            raise MessagingError(REACTION_INVALID)
+        if mode == "none" and not is_admin:
+            raise MessagingError(REACTION_INVALID)
+        if mode == "some" and reaction.get("kind") == "emoji":
+            if str(reaction.get("emoticon", "")) not in emoticons:
+                raise MessagingError(REACTION_INVALID)
+
+    existing = connection.execute(
+        "SELECT reaction_kind, reaction FROM message_reactions WHERE peer_id = ? AND message_id = ? AND user_id = ?",
+        (peer_id, message_id, user_id),
+    ).fetchone()
+
+    toggling_off = False
+    if existing is not None:
+        same = str(existing["reaction_kind"]) == str(reaction.get("kind")) and str(existing["reaction"]) == _reaction_value(
+            reaction
+        )
+        if same:
+            toggling_off = True
+
+    value = _reaction_value(reaction)
+    rkind = str(reaction.get("kind"))
+    now = now_unix()
+
+    if toggling_off:
+        connection.execute(
+            "DELETE FROM message_reactions WHERE peer_id = ? AND message_id = ? AND user_id = ?",
+            (peer_id, message_id, user_id),
+        )
+        connection.execute(
+            "DELETE FROM recent_reactions WHERE user_id = ? AND reaction_kind = ? AND reaction = ?",
+            (user_id, rkind, value),
+        )
+    else:
+        connection.execute(
+            """INSERT INTO message_reactions(peer_id, message_id, user_id, reaction_kind, reaction, big, date)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(peer_id, message_id, user_id) DO UPDATE SET
+                 reaction_kind = excluded.reaction_kind,
+                 reaction = excluded.reaction,
+                 big = excluded.big,
+                 date = excluded.date""",
+            (peer_id, message_id, user_id, rkind, value, 1 if big else 0, now),
+        )
+        connection.execute(
+            """INSERT INTO recent_reactions(user_id, reaction_kind, reaction, big, date)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, reaction_kind, reaction) DO UPDATE SET
+                 big = excluded.big,
+                 date = excluded.date""",
+            (user_id, rkind, value, 1 if big else 0, now),
+        )
+
+    agg = _build_message_reactions(connection, peer_id=peer_id, message_id=message_id)
+    emitted = [
+        append_update(connection, user_id=member_id, kind="updateMessageReactions", payload=agg)
+        for member_id in _active_member_ids(connection, peer_id=peer_id)
+    ]
+    return agg, emitted
+
+
+def get_message_reactions(
+    connection: sqlite3.Connection, *, peer_id: int, message_id: int
+) -> dict[str, Any]:
+    return _build_message_reactions(connection, peer_id=peer_id, message_id=message_id)
+
+
+def get_message_reactions_list(
+    connection: sqlite3.Connection,
+    *,
+    peer_id: int,
+    message_id: int,
+    reaction: dict[str, Any] | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    total = int(
+        connection.execute(
+            "SELECT COUNT(*) AS c FROM message_reactions WHERE peer_id = ? AND message_id = ?",
+            (peer_id, message_id),
+        ).fetchone()["c"]
+    )
+    limit = max(1, min(limit, 100))
+    if reaction is not None:
+        rows = connection.execute(
+            "SELECT user_id, reaction_kind, reaction, big, date "
+            "FROM message_reactions WHERE peer_id = ? AND message_id = ? AND reaction_kind = ? AND reaction = ? "
+            "ORDER BY date DESC LIMIT ?",
+            (peer_id, message_id, str(reaction.get("kind")), _reaction_value(reaction), limit),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            "SELECT user_id, reaction_kind, reaction, big, date "
+            "FROM message_reactions WHERE peer_id = ? AND message_id = ? ORDER BY date DESC LIMIT ?",
+            (peer_id, message_id, limit),
+        ).fetchall()
+    items = [
+        {
+            "user_id": int(row["user_id"]),
+            "reaction": _reaction_dict(str(row["reaction_kind"]), str(row["reaction"])),
+            "date": int(row["date"]),
+            "big": bool(int(row["big"])),
+        }
+        for row in rows
+    ]
+    return {"count": total, "items": items, "next_offset": None}
+
+
+def get_recent_reactions(connection: sqlite3.Connection, *, user_id: int) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        "SELECT reaction_kind, reaction, big FROM recent_reactions WHERE user_id = ? ORDER BY date DESC LIMIT 50",
+        (user_id,),
+    ).fetchall()
+    return [
+        {
+            "reaction": _reaction_dict(str(row["reaction_kind"]), str(row["reaction"])),
+            "big": bool(int(row["big"])),
+        }
+        for row in rows
+    ]
+
+
+def set_default_reaction(connection: sqlite3.Connection, *, user_id: int, reaction: dict[str, Any]) -> bool:
+    connection.execute(
+        "UPDATE users SET default_reaction = ? WHERE id = ?",
+        (json.dumps(reaction, sort_keys=True), int(user_id)),
+    )
+    return True
+
+
+def _draft_payload_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    if row["message"] is None and row["reply_to_message_id"] is None and row["effect"] is None:
+        return None
+    return {
+        "message": str(row["message"] or ""),
+        "no_webpage": bool(int(row["no_webpage"] or 0)),
+        "invert_media": bool(int(row["invert_media"] or 0)),
+        "reply_to_message_id": int(row["reply_to_message_id"]) if row["reply_to_message_id"] is not None else None,
+        "top_msg_id": int(row["top_msg_id"]) if row["top_msg_id"] is not None else None,
+        "effect": int(row["effect"]) if row["effect"] is not None else None,
+    }
+
+
+def save_draft(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    peer_id: int,
+    no_webpage: bool = False,
+    invert_media: bool = False,
+    reply_to_message_id: int | None = None,
+    top_msg_id: int | None = None,
+    message: str = "",
+    effect: int | None = None,
+) -> tuple[dict[str, Any], list[Any]]:
+    _require_active_membership(connection, peer_id, user_id)
+    is_empty = not message and reply_to_message_id is None and effect is None
+    if is_empty:
+        connection.execute(
+            "DELETE FROM drafts WHERE user_id = ? AND peer_id = ?", (user_id, peer_id)
+        )
+        payload: dict[str, Any] = {"peer_id": int(peer_id), "draft": None}
+    else:
+        now = now_unix()
+        connection.execute(
+            """INSERT INTO drafts(user_id, peer_id, message, reply_to_message_id, no_webpage, invert_media, effect, date, top_msg_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, peer_id) DO UPDATE SET
+                 message = excluded.message,
+                 reply_to_message_id = excluded.reply_to_message_id,
+                 no_webpage = excluded.no_webpage,
+                 invert_media = excluded.invert_media,
+                 effect = excluded.effect,
+                 date = excluded.date,
+                 top_msg_id = excluded.top_msg_id""",
+            (
+                user_id,
+                peer_id,
+                message,
+                reply_to_message_id,
+                int(no_webpage),
+                int(invert_media),
+                effect,
+                now,
+                top_msg_id,
+            ),
+        )
+        payload = {
+            "peer_id": int(peer_id),
+            "draft": {
+                "message": message,
+                "no_webpage": bool(no_webpage),
+                "invert_media": bool(invert_media),
+                "reply_to_message_id": reply_to_message_id,
+                "top_msg_id": top_msg_id,
+                "effect": effect,
+            },
+        }
+    emitted = [append_update(connection, user_id=user_id, kind="updateDraftMessage", payload=payload)]
+    return payload, emitted
+
+
+def get_all_drafts(connection: sqlite3.Connection, *, user_id: int) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        "SELECT peer_id, message, reply_to_message_id, no_webpage, invert_media, effect, top_msg_id "
+        "FROM drafts WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+    drafts: list[dict[str, Any]] = []
+    for row in rows:
+        draft = _draft_payload_from_row(row)
+        if draft is None:
+            continue
+        drafts.append({"peer_id": int(row["peer_id"]), "draft": draft})
+    return drafts
+
+
+def clear_all_drafts(connection: sqlite3.Connection, *, user_id: int) -> list[Any]:
+    rows = connection.execute("SELECT peer_id FROM drafts WHERE user_id = ?", (user_id,)).fetchall()
+    peer_ids = [int(r["peer_id"]) for r in rows]
+    connection.execute("DELETE FROM drafts WHERE user_id = ?", (user_id,))
+    emitted = [
+        append_update(connection, user_id=user_id, kind="updateDraftMessage", payload={"peer_id": pid, "draft": None})
+        for pid in peer_ids
+    ]
+    return emitted
+
+
+def clear_draft(connection: sqlite3.Connection, *, user_id: int, peer_id: int) -> list[Any]:
+    existing = connection.execute(
+        "SELECT 1 FROM drafts WHERE user_id = ? AND peer_id = ?", (user_id, peer_id)
+    ).fetchone()
+    if existing is None:
+        return []
+    connection.execute("DELETE FROM drafts WHERE user_id = ? AND peer_id = ?", (user_id, peer_id))
+    return [
+        append_update(
+            connection, user_id=user_id, kind="updateDraftMessage", payload={"peer_id": int(peer_id), "draft": None}
+        )
+    ]
+
+
 def _message_row(row: sqlite3.Row, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
     message = {
         "id": int(row["id"]),

@@ -9,7 +9,7 @@ import time
 from typing import Iterator
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +303,47 @@ class Database:
                     date INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS message_reactions (
+                    peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    reaction_kind TEXT NOT NULL DEFAULT 'emoji' CHECK(reaction_kind IN ('emoji', 'custom', 'paid')),
+                    reaction TEXT NOT NULL,
+                    big INTEGER NOT NULL DEFAULT 0 CHECK(big IN (0, 1)),
+                    date INTEGER NOT NULL,
+                    PRIMARY KEY(peer_id, message_id, user_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS message_reactions_message_idx
+                    ON message_reactions(peer_id, message_id, date);
+
+                CREATE INDEX IF NOT EXISTS message_reactions_user_idx
+                    ON message_reactions(user_id, date DESC);
+
+                CREATE TABLE IF NOT EXISTS recent_reactions (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    reaction_kind TEXT NOT NULL CHECK(reaction_kind IN ('emoji', 'custom', 'paid')),
+                    reaction TEXT NOT NULL,
+                    big INTEGER NOT NULL DEFAULT 0 CHECK(big IN (0, 1)),
+                    date INTEGER NOT NULL,
+                    PRIMARY KEY(user_id, reaction_kind, reaction)
+                );
+
+                CREATE TABLE IF NOT EXISTS drafts (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    peer_id INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+                    message TEXT NOT NULL DEFAULT '',
+                    reply_to_message_id INTEGER,
+                    no_webpage INTEGER NOT NULL DEFAULT 0 CHECK(no_webpage IN (0, 1)),
+                    invert_media INTEGER NOT NULL DEFAULT 0 CHECK(invert_media IN (0, 1)),
+                    effect INTEGER,
+                    entities_json TEXT NOT NULL DEFAULT '[]',
+                    media_json TEXT,
+                    date INTEGER NOT NULL,
+                    top_msg_id INTEGER,
+                    PRIMARY KEY(user_id, peer_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS updates (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -358,6 +399,8 @@ class Database:
                 connection.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
             if "is_service" not in user_columns:
                 connection.execute("ALTER TABLE users ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0")
+            if "default_reaction" not in user_columns:
+                connection.execute("ALTER TABLE users ADD COLUMN default_reaction TEXT")
             contact_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(contacts)").fetchall()

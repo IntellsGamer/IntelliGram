@@ -26,3 +26,8 @@ node_modules/
 
 # Local gateway and Web K preview logs
 *.log
+
+# Python build metadata
+*.egg-info/
+__pycache__/
+*.pyc

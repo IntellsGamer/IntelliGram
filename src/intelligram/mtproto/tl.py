@@ -99,6 +99,22 @@ USERS_GET_FULL_USER_CONSTRUCTOR = 0xB60F5918
 CONTACTS_GET_CONTACTS_CONSTRUCTOR = 0x5DD69E12
 MESSAGES_GET_DIALOGS_CONSTRUCTOR = 0xA0F4CB4F
 MESSAGES_GET_HISTORY_CONSTRUCTOR = 0x4423E6C5
+MESSAGES_SEARCH_CONSTRUCTOR = 0x29EE847A
+MESSAGES_SEARCH_GLOBAL_CONSTRUCTOR = 0x6126A43C
+MESSAGES_GET_SEARCH_COUNTERS_CONSTRUCTOR = 0x1BBCF300
+MESSAGES_SEARCH_SENT_MEDIA_CONSTRUCTOR = 0x107E31A0
+MESSAGES_GET_SEARCH_RESULTS_CALENDAR_CONSTRUCTOR = 0x6AA3F6BD
+MESSAGES_GET_SEARCH_RESULTS_POSITIONS_CONSTRUCTOR = 0x9C7F2F10
+MESSAGES_SEND_REACTION_CONSTRUCTOR = 0xD30D78D4
+MESSAGES_GET_MESSAGES_REACTIONS_CONSTRUCTOR = 0x8BBA90E6
+MESSAGES_GET_MESSAGE_REACTIONS_LIST_CONSTRUCTOR = 0x461B3F48
+MESSAGES_GET_RECENT_REACTIONS_CONSTRUCTOR = 0x39461DB2
+MESSAGES_SET_DEFAULT_REACTION_CONSTRUCTOR = 0x4F47A016
+MESSAGES_SAVE_DRAFT_CONSTRUCTOR = 0xAD0FA15C
+MESSAGES_GET_ALL_DRAFTS_CONSTRUCTOR = 0x6A3F8D65
+MESSAGES_CLEAR_ALL_DRAFTS_CONSTRUCTOR = 0x7E58EE9C
+INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR = 0x3BD4B7C2
+INPUT_REPLY_TO_MONO_FORUM_CONSTRUCTOR = 0x69D66C45
 MESSAGES_SEND_MESSAGE_CONSTRUCTOR = 0xFEF48F62
 MESSAGES_SEND_MEDIA_CONSTRUCTOR = 0x0330E77F
 MESSAGES_UPLOAD_MEDIA_CONSTRUCTOR = 0x14967978
@@ -254,6 +270,50 @@ CHAT_REACTIONS_NONE_CONSTRUCTOR = 0xEAFC32BC
 CHAT_REACTIONS_ALL_CONSTRUCTOR = 0x52928BCA
 CHAT_REACTIONS_SOME_CONSTRUCTOR = 0x661D4037
 REACTION_EMOJI_CONSTRUCTOR = 0x1B2286B8
+REACTION_CUSTOM_EMOJI_CONSTRUCTOR = 0x8935FC73
+REACTION_PAID_CONSTRUCTOR = 0x523DA4EB
+REACTION_EMPTY_CONSTRUCTOR = 0x79F5D419
+MESSAGE_REACTIONS_CONSTRUCTOR = 0x0A339F0B
+REACTION_COUNT_CONSTRUCTOR = 0xA3D1CB80
+MESSAGE_PEER_REACTION_CONSTRUCTOR = 0x8C79B63C
+UPDATE_MESSAGE_REACTIONS_CONSTRUCTOR = 0x1E297BFA
+MESSAGES_MESSAGE_REACTIONS_LIST_CONSTRUCTOR = 0x31BD492D
+MESSAGES_REACTIONS_CONSTRUCTOR = 0xEAFDF716
+MESSAGES_REACTIONS_NOT_MODIFIED_CONSTRUCTOR = 0xB06FDBDF
+MESSAGES_AVAILABLE_REACTIONS_NOT_MODIFIED_CONSTRUCTOR = 0x9F071957
+MESSAGES_SEARCH_COUNTER_CONSTRUCTOR = 0xE844EBFF
+MESSAGES_SEARCH_RESULTS_CALENDAR_CONSTRUCTOR = 0x147EE23C
+SEARCH_RESULTS_CALENDAR_PERIOD_CONSTRUCTOR = 0xC9B0539F
+MESSAGES_SEARCH_RESULTS_POSITIONS_CONSTRUCTOR = 0x53B22BAF
+UPDATE_DRAFT_MESSAGE_CONSTRUCTOR = 0xEDFC111E
+DRAFT_MESSAGE_CONSTRUCTOR = 0x60FE3294
+DRAFT_MESSAGE_EMPTY_CONSTRUCTOR = 0x1B0C841A
+INPUT_MESSAGES_FILTER_EMPTY_CONSTRUCTOR = 0x57E2F66C
+INPUT_MESSAGES_FILTER_PHOTOS_CONSTRUCTOR = 0x9609A51C
+INPUT_MESSAGES_FILTER_VIDEO_CONSTRUCTOR = 0x9FC00E65
+INPUT_MESSAGES_FILTER_PHOTO_VIDEO_CONSTRUCTOR = 0x56E9F0E4
+INPUT_MESSAGES_FILTER_DOCUMENT_CONSTRUCTOR = 0x9EDDF188
+INPUT_MESSAGES_FILTER_URL_CONSTRUCTOR = 0x7EF0DD87
+INPUT_MESSAGES_FILTER_MUSIC_CONSTRUCTOR = 0x3751B49E
+INPUT_MESSAGES_FILTER_VOICE_CONSTRUCTOR = 0x50F5C392
+INPUT_MESSAGES_FILTER_ROUND_VOICE_CONSTRUCTOR = 0x7A7C17A4
+INPUT_MESSAGES_FILTER_ROUND_VIDEO_CONSTRUCTOR = 0xB549DA53
+INPUT_MESSAGES_FILTER_MY_MENTIONS_CONSTRUCTOR = 0xC1F8E69A
+INPUT_MESSAGES_FILTER_GEO_CONSTRUCTOR = 0xE7026D0D
+INPUT_MESSAGES_FILTER_CONTACTS_CONSTRUCTOR = 0xE062DB83
+INPUT_MESSAGES_FILTER_PINNED_CONSTRUCTOR = 0x1BB00451
+INPUT_MESSAGES_FILTER_GIF_CONSTRUCTOR = 0x1FC86587
+INPUT_MESSAGES_FILTER_PHONE_CALLS_CONSTRUCTOR = 0x80C99768
+MESSAGE_ENTITY_BOLD_CONSTRUCTOR = 0xBD610BC9
+MESSAGE_ENTITY_ITALIC_CONSTRUCTOR = 0x826F8B60
+MESSAGE_ENTITY_UNDERLINE_CONSTRUCTOR = 0x9C4E7E8B
+MESSAGE_ENTITY_STRIKE_CONSTRUCTOR = 0xBF0693D4
+MESSAGE_ENTITY_CODE_CONSTRUCTOR = 0x28A20571
+MESSAGE_ENTITY_PRE_CONSTRUCTOR = 0x73924BE0
+MESSAGE_ENTITY_TEXT_URL_CONSTRUCTOR = 0x76A6D327
+MESSAGE_ENTITY_CUSTOM_EMOJI_CONSTRUCTOR = 0xC8CF05F8
+MESSAGE_ENTITY_MENTION_NAME_CONSTRUCTOR = 0xDC7B1140
+MESSAGE_ENTITY_BLOCKQUOTE_CONSTRUCTOR = 0xF1CCAAAC
 MESSAGES_EXPORT_CHAT_INVITE_CONSTRUCTOR = 0xA455DE90
 MESSAGES_EDIT_EXPORTED_CHAT_INVITE_CONSTRUCTOR = 0xBDCA2F75
 MESSAGES_DELETE_REVOKED_EXPORTED_CHAT_INVITES_CONSTRUCTOR = 0x56987BD5
@@ -571,10 +631,16 @@ def _read_input_user(reader: TLReader) -> dict[str, Any]:
     raise TLDecodeError(f"Unsupported InputUser constructor: 0x{constructor_id:08x}")
 
 
-def _read_reaction(reader: TLReader) -> dict[str, str]:
-    if reader.uint32() != REACTION_EMOJI_CONSTRUCTOR:
-        raise TLDecodeError("Only standard emoji reactions are supported")
-    return {"emoticon": reader.bytes().decode("utf-8")}
+def _read_reaction(reader: TLReader) -> dict[str, Any]:
+    """Decode one ``Reaction`` (emoji / custom emoji / paid)."""
+    constructor_id = reader.uint32()
+    if constructor_id == REACTION_EMOJI_CONSTRUCTOR:
+        return {"kind": "emoji", "emoticon": reader.bytes().decode("utf-8")}
+    if constructor_id == REACTION_CUSTOM_EMOJI_CONSTRUCTOR:
+        return {"kind": "custom", "document_id": reader.int64()}
+    if constructor_id == REACTION_PAID_CONSTRUCTOR:
+        return {"kind": "paid"}
+    raise TLDecodeError(f"Unsupported Reaction constructor: 0x{constructor_id:08x}")
 
 
 def _read_chat_reactions(reader: TLReader) -> dict[str, Any]:
@@ -667,6 +733,89 @@ def _read_channel_messages_filter(reader: TLReader) -> None:
             reader.int32()
         return
     raise TLDecodeError(f"Unsupported ChannelMessagesFilter constructor: 0x{constructor_id:08x}")
+
+
+def _read_messages_filter(reader: TLReader) -> dict[str, Any]:
+    """Decode an ``inputMessagesFilter*`` value into its normalized media key."""
+    constructor_id = reader.uint32()
+    mapping = {
+        INPUT_MESSAGES_FILTER_EMPTY_CONSTRUCTOR: "empty",
+        INPUT_MESSAGES_FILTER_PHOTOS_CONSTRUCTOR: "photos",
+        INPUT_MESSAGES_FILTER_VIDEO_CONSTRUCTOR: "video",
+        INPUT_MESSAGES_FILTER_PHOTO_VIDEO_CONSTRUCTOR: "photo_video",
+        INPUT_MESSAGES_FILTER_DOCUMENT_CONSTRUCTOR: "document",
+        INPUT_MESSAGES_FILTER_URL_CONSTRUCTOR: "url",
+        INPUT_MESSAGES_FILTER_MUSIC_CONSTRUCTOR: "music",
+        INPUT_MESSAGES_FILTER_VOICE_CONSTRUCTOR: "voice",
+        INPUT_MESSAGES_FILTER_ROUND_VOICE_CONSTRUCTOR: "round_voice",
+        INPUT_MESSAGES_FILTER_ROUND_VIDEO_CONSTRUCTOR: "round_video",
+        INPUT_MESSAGES_FILTER_MY_MENTIONS_CONSTRUCTOR: "my_mentions",
+        INPUT_MESSAGES_FILTER_GEO_CONSTRUCTOR: "geo",
+        INPUT_MESSAGES_FILTER_CONTACTS_CONSTRUCTOR: "contacts",
+        INPUT_MESSAGES_FILTER_PINNED_CONSTRUCTOR: "pinned",
+        INPUT_MESSAGES_FILTER_GIF_CONSTRUCTOR: "gif",
+        INPUT_MESSAGES_FILTER_PHONE_CALLS_CONSTRUCTOR: "phone_calls",
+    }
+    if constructor_id not in mapping:
+        raise TLDecodeError(f"Unsupported MessagesFilter constructor: 0x{constructor_id:08x}")
+    return {"kind": mapping[constructor_id], "constructor_id": constructor_id}
+
+
+def _read_draft_reply_to(reader: TLReader) -> dict[str, Any]:
+    """Decode InputReplyTo variants used by ``messages.saveDraft``."""
+    constructor_id = reader.uint32()
+    if constructor_id == INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR:
+        flags = reader.uint32()
+        result: dict[str, Any] = {"kind": "message", "reply_to_message_id": reader.int32()}
+        top_msg_id = None
+        reply_to_peer_id = None
+        monoforum_peer_id = None
+        if flags & 1:
+            top_msg_id = reader.int32()
+        if flags & 2:
+            reply_to_peer_id = _read_input_peer(reader)
+        if flags & 4:
+            reader.bytes()  # quote_text
+        if flags & 8:
+            for _ in range(reader.vector_count()):
+                _read_message_entity(reader)
+        if flags & 16:
+            reader.int32()  # quote_offset
+        if flags & 32:
+            monoforum_peer_id = _read_input_peer(reader)
+        if flags & 64:
+            reader.int32()  # todo_item_id
+        if flags & 128:
+            reader.bytes()  # poll_option
+        result["top_msg_id"] = top_msg_id
+        result["reply_to_peer_id"] = reply_to_peer_id
+        result["monoforum_peer_id"] = monoforum_peer_id
+        return result
+    if constructor_id == INPUT_REPLY_TO_MONO_FORUM_CONSTRUCTOR:
+        return {"kind": "monoforum", "monoforum_peer_id": _read_input_peer(reader)}
+    raise TLDecodeError(f"Unsupported InputReplyTo constructor: 0x{constructor_id:08x}")
+
+
+def _read_message_entity(reader: TLReader) -> dict[str, Any]:
+    """Decode a ``MessageEntity`` pure-structurally to keep the reader in sync.
+
+    Only the fields needed to advance the cursor are consumed; the server does
+    not persist entity formatting for drafts beyond the plain draft text.
+    """
+    constructor_id = reader.uint32()
+    offset = reader.int32()
+    length = reader.int32()
+    if constructor_id == MESSAGE_ENTITY_BLOCKQUOTE_CONSTRUCTOR:
+        reader.uint32()  # flags; collapsed only
+    elif constructor_id in (
+        MESSAGE_ENTITY_MENTION_NAME_CONSTRUCTOR,
+        MESSAGE_ENTITY_CUSTOM_EMOJI_CONSTRUCTOR,
+    ):
+        reader.int64()
+    elif constructor_id in (MESSAGE_ENTITY_TEXT_URL_CONSTRUCTOR, MESSAGE_ENTITY_PRE_CONSTRUCTOR):
+        reader.bytes()
+    return {"constructor_id": constructor_id, "offset": offset, "length": length}
+
 
 
 def _read_input_file(reader: TLReader) -> dict[str, Any]:
@@ -1429,6 +1578,130 @@ def parse_request(data: bytes) -> TLRequest:
         request = TLRequest(constructor_id, "messages_get_paid_reaction_privacy", {})
     elif constructor_id == MESSAGES_GET_AVAILABLE_REACTIONS_CONSTRUCTOR:
         request = TLRequest(constructor_id, "messages_get_available_reactions", {"hash": reader.int32()})
+    elif constructor_id == MESSAGES_SEARCH_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b1111:
+            raise TLDecodeError("Unsupported messages.search optional fields")
+        request = TLRequest(constructor_id, "messages_search", {
+            "peer": _read_input_peer(reader),
+            "q": reader.bytes().decode("utf-8"),
+            "from_id": _read_input_peer(reader) if flags & (1 << 0) else None,
+            "saved_peer_id": _read_input_peer(reader) if flags & (1 << 2) else None,
+            "saved_reaction": [_read_reaction(reader) for _ in range(reader.vector_count())] if flags & (1 << 3) else None,
+            "top_msg_id": reader.int32() if flags & (1 << 1) else None,
+            "filter": _read_messages_filter(reader),
+            "min_date": reader.int32(),
+            "max_date": reader.int32(),
+            "offset_id": reader.int32(),
+            "add_offset": reader.int32(),
+            "limit": reader.int32(),
+            "max_id": reader.int32(),
+            "min_id": reader.int32(),
+            "hash": reader.int64(),
+        })
+    elif constructor_id == MESSAGES_SEARCH_GLOBAL_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b11111:
+            raise TLDecodeError("Unsupported messages.searchGlobal optional fields")
+        request = TLRequest(constructor_id, "messages_search_global", {
+            "broadcasts_only": bool(flags & (1 << 1)),
+            "groups_only": bool(flags & (1 << 2)),
+            "users_only": bool(flags & (1 << 3)),
+            "folder_id": reader.int32() if flags & (1 << 0) else None,
+            "community": _read_input_channel(reader) if flags & (1 << 4) else None,
+            "q": reader.bytes().decode("utf-8"),
+            "filter": _read_messages_filter(reader),
+            "min_date": reader.int32(),
+            "max_date": reader.int32(),
+            "offset_rate": reader.int32(),
+            "offset_peer": _read_input_peer(reader),
+            "offset_id": reader.int32(),
+            "limit": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_GET_SEARCH_COUNTERS_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_get_search_counters", {
+            "peer": _read_input_peer(reader),
+            "saved_peer_id": _read_input_peer(reader) if flags & (1 << 2) else None,
+            "top_msg_id": reader.int32() if flags & (1 << 0) else None,
+            "filters": [_read_messages_filter(reader) for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == MESSAGES_SEARCH_SENT_MEDIA_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_search_sent_media", {
+            "q": reader.bytes().decode("utf-8"),
+            "filter": _read_messages_filter(reader),
+            "limit": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_GET_SEARCH_RESULTS_CALENDAR_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_get_search_results_calendar", {
+            "peer": _read_input_peer(reader),
+            "saved_peer_id": _read_input_peer(reader) if flags & (1 << 2) else None,
+            "filter": _read_messages_filter(reader),
+            "offset_id": reader.int32(),
+            "offset_date": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_GET_SEARCH_RESULTS_POSITIONS_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_get_search_results_positions", {
+            "peer": _read_input_peer(reader),
+            "saved_peer_id": _read_input_peer(reader) if flags & (1 << 2) else None,
+            "filter": _read_messages_filter(reader),
+            "offset_id": reader.int32(),
+            "limit": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_SEND_REACTION_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~0b111:
+            raise TLDecodeError("Unsupported messages.sendReaction optional fields")
+        request = TLRequest(constructor_id, "messages_send_reaction", {
+            "big": _read_bool(reader) if flags & (1 << 1) else False,
+            "add_to_recent": _read_bool(reader) if flags & (1 << 2) else False,
+            "peer": _read_input_peer(reader),
+            "msg_id": reader.int32(),
+            "reaction": [_read_reaction(reader) for _ in range(reader.vector_count())] if flags & (1 << 0) else None,
+        })
+    elif constructor_id == MESSAGES_GET_MESSAGES_REACTIONS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_messages_reactions", {
+            "peer": _read_input_peer(reader),
+            "id": [reader.int32() for _ in range(reader.vector_count())],
+        })
+    elif constructor_id == MESSAGES_GET_MESSAGE_REACTIONS_LIST_CONSTRUCTOR:
+        flags = reader.uint32()
+        request = TLRequest(constructor_id, "messages_get_message_reactions_list", {
+            "peer": _read_input_peer(reader),
+            "msg_id": reader.int32(),
+            "reaction": _read_reaction(reader) if flags & (1 << 0) else None,
+            "offset": reader.bytes().decode("utf-8") if flags & (1 << 1) else None,
+            "limit": reader.int32(),
+        })
+    elif constructor_id == MESSAGES_GET_RECENT_REACTIONS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_recent_reactions", {
+            "limit": reader.int32(),
+            "hash": reader.int64(),
+        })
+    elif constructor_id == MESSAGES_SET_DEFAULT_REACTION_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_set_default_reaction", {
+            "reaction": _read_reaction(reader),
+        })
+    elif constructor_id == MESSAGES_SAVE_DRAFT_CONSTRUCTOR:
+        flags = reader.uint32()
+        if flags & ~((1 << 1) | (1 << 6) | (1 << 4) | (1 << 3) | (1 << 5) | (1 << 7)):
+            raise TLDecodeError("Unsupported messages.saveDraft optional fields")
+        request = TLRequest(constructor_id, "messages_save_draft", {
+            "no_webpage": _read_bool(reader) if flags & (1 << 1) else False,
+            "invert_media": _read_bool(reader) if flags & (1 << 6) else False,
+            "reply_to": _read_draft_reply_to(reader) if flags & (1 << 4) else None,
+            "peer": _read_input_peer(reader),
+            "message": reader.bytes().decode("utf-8"),
+            "entities": [_read_message_entity(reader) for _ in range(reader.vector_count())] if flags & (1 << 3) else None,
+            "media": _read_input_media(reader) if flags & (1 << 5) else None,
+            "effect": reader.int64() if flags & (1 << 7) else None,
+        })
+    elif constructor_id == MESSAGES_GET_ALL_DRAFTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_get_all_drafts", {})
+    elif constructor_id == MESSAGES_CLEAR_ALL_DRAFTS_CONSTRUCTOR:
+        request = TLRequest(constructor_id, "messages_clear_all_drafts", {})
     elif constructor_id == COMMUNITIES_GET_JOINED_COMMUNITIES_CONSTRUCTOR:
         request = TLRequest(constructor_id, "communities_get_joined_communities", {})
     elif constructor_id == AUTH_LOG_OUT_CONSTRUCTOR:
@@ -1694,6 +1967,231 @@ def encode_messages_available_reactions(*, hash_value: int = 0, reactions: Itera
     return encode_uint32(MESSAGES_AVAILABLE_REACTIONS_CONSTRUCTOR) + encode_int32(hash_value) + encode_vector(reactions)
 
 
+def encode_messages_available_reactions_not_modified() -> bytes:
+    return encode_uint32(MESSAGES_AVAILABLE_REACTIONS_NOT_MODIFIED_CONSTRUCTOR)
+
+
+def encode_reaction(reaction: dict[str, Any]) -> bytes:
+    """Encode a single ``Reaction`` value (emoji / custom emoji / paid)."""
+
+    kind = str(reaction.get("kind") or "emoji")
+    if kind == "custom":
+        return encode_uint32(REACTION_CUSTOM_EMOJI_CONSTRUCTOR) + encode_int64(int(reaction["document_id"]))
+    if kind == "paid":
+        return encode_uint32(REACTION_PAID_CONSTRUCTOR)
+    return encode_uint32(REACTION_EMOJI_CONSTRUCTOR) + encode_tl_string(str(reaction.get("emoticon") or ""))
+
+
+def encode_reaction_count(*, reaction: dict[str, Any], count: int, chosen_order: int | None = None) -> bytes:
+    flags = (1 << 0) if chosen_order is not None else 0
+    return (
+        encode_uint32(REACTION_COUNT_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + (encode_int32(chosen_order) if chosen_order is not None else b"")
+        + encode_reaction(reaction)
+        + encode_int32(int(count))
+    )
+
+
+def encode_message_reactions(
+    *,
+    reactions: Iterable[bytes] = (),
+    recent: Iterable[bytes] = (),
+    can_see_list: bool = True,
+    min_results: bool = False,
+) -> bytes:
+    flags = (1 << 2) if can_see_list else 0
+    if min_results:
+        flags |= 1 << 0
+    if recent:
+        flags |= 1 << 1
+    return (
+        encode_uint32(MESSAGE_REACTIONS_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_vector(reactions)
+        + (encode_vector(recent) if recent else b"")
+    )
+
+
+def encode_message_peer_reaction(
+    *,
+    peer: bytes,
+    reaction: dict[str, Any],
+    date: int,
+    big: bool = False,
+    my: bool = False,
+    unread: bool = False,
+) -> bytes:
+    flags = 0
+    if big:
+        flags |= 1 << 0
+    if unread:
+        flags |= 1 << 1
+    if my:
+        flags |= 1 << 2
+    return (
+        encode_uint32(MESSAGE_PEER_REACTION_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + peer
+        + encode_int32(int(date))
+        + encode_reaction(reaction)
+    )
+
+
+def encode_update_message_reactions(*, peer: bytes, msg_id: int, message_reactions: bytes) -> bytes:
+    return (
+        encode_uint32(UPDATE_MESSAGE_REACTIONS_CONSTRUCTOR)
+        + encode_uint32(0)
+        + peer
+        + encode_int32(int(msg_id))
+        + message_reactions
+    )
+
+
+def encode_messages_message_reactions_list(
+    *,
+    count: int,
+    reactions: Iterable[bytes] = (),
+    chats: Iterable[bytes] = (),
+    users: Iterable[bytes] = (),
+    next_offset: str | None = None,
+) -> bytes:
+    flags = (1 << 0) if next_offset is not None else 0
+    return (
+        encode_uint32(MESSAGES_MESSAGE_REACTIONS_LIST_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + encode_int32(int(count))
+        + encode_vector(reactions)
+        + encode_vector(chats)
+        + encode_vector(users)
+        + (encode_tl_string(next_offset) if next_offset is not None else b"")
+    )
+
+
+def encode_messages_reactions(*, hash_value: int, reactions: Iterable[bytes] = ()) -> bytes:
+    return (
+        encode_uint32(MESSAGES_REACTIONS_CONSTRUCTOR)
+        + encode_int64(hash_value)
+        + encode_vector(reactions)
+    )
+
+
+def encode_messages_reactions_not_modified() -> bytes:
+    return encode_uint32(MESSAGES_REACTIONS_NOT_MODIFIED_CONSTRUCTOR)
+
+
+def encode_messages_search_counter(*, search_filter: bytes, count: int, inexact: bool = False) -> bytes:
+    flags = (1 << 1) if inexact else 0
+    return (
+        encode_uint32(MESSAGES_SEARCH_COUNTER_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + search_filter
+        + encode_int32(int(count))
+    )
+
+
+def encode_search_results_calendar_empty() -> bytes:
+    return (
+        encode_uint32(MESSAGES_SEARCH_RESULTS_CALENDAR_CONSTRUCTOR)
+        + encode_uint32(0)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_int32(0)
+        + encode_vector([])
+        + encode_vector([])
+        + encode_vector([])
+        + encode_vector([])
+    )
+
+
+def encode_search_results_positions_empty() -> bytes:
+    return (
+        encode_uint32(MESSAGES_SEARCH_RESULTS_POSITIONS_CONSTRUCTOR)
+        + encode_int32(0)
+        + encode_vector([])
+    )
+
+
+def encode_draft_message_empty() -> bytes:
+    return encode_uint32(DRAFT_MESSAGE_EMPTY_CONSTRUCTOR) + encode_uint32(0)
+
+
+def _encode_draft_reply_to(reply_to: dict[str, Any] | None) -> bytes:
+    if reply_to is None:
+        return b""
+    kind = str(reply_to.get("kind"))
+    if kind == "monoforum":
+        return (
+            encode_uint32(INPUT_REPLY_TO_MONO_FORUM_CONSTRUCTOR)
+            + _encode_input_peer(reply_to["monoforum_peer_id"])
+        )
+    flags = 0
+    if reply_to.get("top_msg_id") is not None:
+        flags |= 1 << 0
+    if reply_to.get("reply_to_peer_id") is not None:
+        flags |= 1 << 2
+    if reply_to.get("monoforum_peer_id") is not None:
+        flags |= 1 << 5
+    payload = encode_uint32(INPUT_REPLY_TO_MESSAGE_CONSTRUCTOR) + encode_uint32(flags)
+    payload += encode_int32(int(reply_to["reply_to_message_id"]))
+    if reply_to.get("top_msg_id") is not None:
+        payload += encode_int32(int(reply_to["top_msg_id"]))
+    if reply_to.get("reply_to_peer_id") is not None:
+        payload += _encode_input_peer(reply_to["reply_to_peer_id"])
+    if reply_to.get("monoforum_peer_id") is not None:
+        payload += _encode_input_peer(reply_to["monoforum_peer_id"])
+    return payload
+
+
+def encode_draft_message(
+    *,
+    message: str,
+    reply_to: dict[str, Any] | None = None,
+    no_webpage: bool = False,
+    invert_media: bool = False,
+    effect: int | None = None,
+) -> bytes:
+    flags = 0
+    if no_webpage:
+        flags |= 1 << 1
+    if invert_media:
+        flags |= 1 << 6
+    if reply_to is not None:
+        flags |= 1 << 4
+    if effect is not None:
+        flags |= 1 << 7
+    return (
+        encode_uint32(DRAFT_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + (_encode_draft_reply_to(reply_to) if reply_to is not None else b"")
+        + encode_tl_string(message)
+        + encode_int32(int(time.time()))
+        + (encode_int64(int(effect)) if effect is not None else b"")
+    )
+
+
+def encode_update_draft_message(
+    *,
+    peer: bytes,
+    draft: bytes,
+    top_msg_id: int | None = None,
+    saved_peer_id: bytes | None = None,
+) -> bytes:
+    flags = 0
+    if top_msg_id is not None:
+        flags |= 1 << 0
+    if saved_peer_id is not None:
+        flags |= 1 << 1
+    return (
+        encode_uint32(UPDATE_DRAFT_MESSAGE_CONSTRUCTOR)
+        + encode_uint32(flags)
+        + peer
+        + (encode_int32(int(top_msg_id)) if top_msg_id is not None else b"")
+        + (saved_peer_id if saved_peer_id is not None else b"")
+        + draft
+    )
+
+
 def encode_messages_chats(*, chats: Iterable[bytes] = ()) -> bytes:
     """Return the ordinary `messages.Chats` container used by communities discovery."""
 
@@ -1899,6 +2397,27 @@ def encode_user(
 
 def encode_peer_user(*, user_id: int) -> bytes:
     return encode_uint32(PEER_USER_CONSTRUCTOR) + encode_int64(user_id)
+
+
+def _encode_input_peer(peer: dict[str, Any]) -> bytes:
+    """Encode an ``InputPeer`` from a decoder-produced peer summary dict."""
+
+    kind = str(peer.get("kind"))
+    if kind == "user":
+        return (
+            encode_uint32(INPUT_PEER_USER_CONSTRUCTOR)
+            + encode_int64(int(peer["user_id"]))
+            + encode_int64(int(peer.get("access_hash", 0)))
+        )
+    if kind == "chat":
+        return encode_uint32(INPUT_PEER_CHAT_CONSTRUCTOR) + encode_int64(int(peer["chat_id"]))
+    if kind == "channel":
+        return (
+            encode_uint32(INPUT_PEER_CHANNEL_CONSTRUCTOR)
+            + encode_int64(int(peer["channel_id"]))
+            + encode_int64(int(peer.get("access_hash", 0)))
+        )
+    return encode_uint32(INPUT_PEER_SELF_CONSTRUCTOR)
 
 
 def encode_peer_chat(*, chat_id: int) -> bytes:

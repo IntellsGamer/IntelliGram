@@ -71,6 +71,18 @@ from intelligram.services.messaging import (
     update_channel_username,
     read_history,
     send_message,
+    clear_draft,
+    search_messages,
+    search_messages_global,
+    search_counters,
+    set_message_reaction,
+    get_message_reactions,
+    get_message_reactions_list,
+    get_recent_reactions,
+    set_default_reaction,
+    save_draft,
+    get_all_drafts,
+    clear_all_drafts,
 )
 from intelligram.services.updates import get_difference, get_state
 from intelligram.services.premium import attachment_limit_bytes, user_is_premium
@@ -97,6 +109,7 @@ from intelligram.services.privacy import (
 from intelligram.mtproto.tl import (
     TLDecodeError,
     channel_access_hash,
+    encode_uint32,
     user_access_hash,
     encode_account_content_settings,
     encode_account_password,
@@ -163,6 +176,21 @@ from intelligram.mtproto.tl import (
     encode_update_message_id,
     encode_emoji_keywords_difference,
     encode_message_media,
+    encode_messages_available_reactions_not_modified,
+    encode_messages_search_counter,
+    encode_search_results_calendar_empty,
+    encode_search_results_positions_empty,
+    encode_messages_reactions,
+    encode_messages_reactions_not_modified,
+    encode_messages_message_reactions_list,
+    encode_update_message_reactions,
+    encode_draft_message_empty,
+    encode_draft_message,
+    encode_update_draft_message,
+    encode_reaction,
+    encode_message_reactions,
+    encode_reaction_count,
+    encode_message_peer_reaction,
     encode_messages_all_stickers,
     encode_messages_all_stickers_not_modified,
     encode_messages_emoji_groups,
@@ -187,6 +215,7 @@ from intelligram.mtproto.tl import (
     encode_updates_channel_difference_empty,
     encode_user,
     encode_users_user_full,
+    encode_vector,
     encode_pong,
     encode_rpc_error,
     encode_rpc_result,
@@ -639,6 +668,85 @@ class MTProtoSessionAdapter:
                 offset_id=int(request.fields["offset_id"]),
                 limit=int(request.fields["limit"]),
             )
+        if request.name == "messages_search":
+            return self._handle_messages_search(
+                message,
+                peer=request.fields["peer"],
+                q=str(request.fields.get("q", "")),
+                from_id=request.fields.get("from_id"),
+                filter=request.fields.get("filter"),
+                min_date=int(request.fields.get("min_date", 0) or 0),
+                max_date=int(request.fields.get("max_date", 0) or 0),
+                offset_id=int(request.fields.get("offset_id", 0) or 0),
+                limit=int(request.fields.get("limit", 0) or 0),
+            )
+        if request.name == "messages_search_global":
+            return self._handle_messages_search_global(
+                message,
+                q=str(request.fields.get("q", "")),
+                offset_id=int(request.fields.get("offset_id", 0) or 0),
+                limit=int(request.fields.get("limit", 0) or 0),
+                min_date=int(request.fields.get("min_date", 0) or 0),
+                max_date=int(request.fields.get("max_date", 0) or 0),
+            )
+        if request.name == "messages_get_search_counters":
+            return self._handle_messages_get_search_counters(
+                message,
+                peer=request.fields["peer"],
+                filters=request.fields.get("filters", []),
+            )
+        if request.name == "messages_get_search_results_calendar":
+            return self._handle_messages_get_search_results_calendar(
+                message, peer=request.fields["peer"]
+            )
+        if request.name == "messages_search_sent_media":
+            return self._handle_messages_search_sent_media(message, peer=request.fields["peer"])
+        if request.name == "messages_get_search_results_positions":
+            return self._handle_messages_get_search_results_positions(
+                message, peer=request.fields["peer"]
+            )
+        if request.name == "messages_send_reaction":
+            return self._handle_messages_send_reaction(
+                message,
+                peer=request.fields["peer"],
+                msg_id=int(request.fields["msg_id"]),
+                reaction=request.fields["reaction"],
+                big=bool(request.fields.get("big")),
+            )
+        if request.name == "messages_get_messages_reactions":
+            return self._handle_messages_get_messages_reactions(
+                message, id=request.fields["id"]
+            )
+        if request.name == "messages_get_message_reactions_list":
+            return self._handle_messages_get_message_reactions_list(
+                message,
+                peer=request.fields["peer"],
+                msg_id=int(request.fields["msg_id"]),
+                reaction=request.fields.get("reaction"),
+                limit=int(request.fields.get("limit", 50) or 50),
+            )
+        if request.name == "messages_get_recent_reactions":
+            return self._handle_messages_get_recent_reactions(
+                message, limit=int(request.fields.get("limit", 0) or 0)
+            )
+        if request.name == "messages_set_default_reaction":
+            return self._handle_messages_set_default_reaction(
+                message, reaction=request.fields["reaction"]
+            )
+        if request.name == "messages_save_draft":
+            return self._handle_messages_save_draft(
+                message,
+                peer=request.fields["peer"],
+                message_text=str(request.fields.get("message", "") or ""),
+                no_webpage=bool(request.fields.get("no_webpage")),
+                invert_media=bool(request.fields.get("invert_media")),
+                reply_to=request.fields.get("reply_to"),
+                effect=request.fields.get("effect"),
+            )
+        if request.name == "messages_get_all_drafts":
+            return self._handle_messages_get_all_drafts(message)
+        if request.name == "messages_clear_all_drafts":
+            return self._handle_messages_clear_all_drafts(message)
         if request.name == "messages_create_chat":
             return self._handle_messages_create_chat(
                 message,
@@ -836,6 +944,43 @@ class MTProtoSessionAdapter:
                                     pts_count=envelope.pts_count,
                                 )
                             )
+                        elif envelope.kind == "updateMessageReactions":
+                            agg = envelope.payload
+                            summary = get_peer(
+                                connection,
+                                peer_id=int(agg["peer_id"]),
+                                user_id=self_user_id,
+                            )
+                            other_updates.append(
+                                encode_update_message_reactions(
+                                    peer=self._encode_peer(summary),
+                                    msg_id=int(agg["msg_id"]),
+                                    message_reactions=self._encode_message_reactions_from_payload(agg),
+                                )
+                            )
+                            for r in agg.get("recent", []):
+                                user_ids.add(int(r["user_id"]))
+                            if summary.get("direct_user_id") is not None:
+                                user_ids.add(int(summary["direct_user_id"]))
+                            elif str(summary.get("kind")) in {"chat", "channel"}:
+                                chat_ids.add(int(summary["peer_id"]))
+                        elif envelope.kind == "updateDraftMessage":
+                            dp = envelope.payload
+                            summary = get_peer(
+                                connection,
+                                peer_id=int(dp["peer_id"]),
+                                user_id=self_user_id,
+                            )
+                            other_updates.append(
+                                encode_update_draft_message(
+                                    peer=self._encode_peer(summary),
+                                    draft=self._encode_draft(dp.get("draft")),
+                                )
+                            )
+                            if summary.get("direct_user_id") is not None:
+                                user_ids.add(int(summary["direct_user_id"]))
+                            elif str(summary.get("kind")) in {"chat", "channel"}:
+                                chat_ids.add(int(summary["peer_id"]))
                     users = self._load_users(connection, user_ids)
                     result = encode_updates_difference(
                         new_messages=encoded_messages,
@@ -3474,6 +3619,424 @@ class MTProtoSessionAdapter:
             ),
         )
 
+    # ---- search / reactions / drafts (ported from teamgram BFF) ----
+
+    def _encode_draft(self, draft: dict[str, Any] | None) -> bytes:
+        if not draft:
+            return encode_draft_message_empty()
+        reply_to = None
+        if draft.get("reply_to_message_id") is not None:
+            reply_to = {
+                "kind": "message",
+                "reply_to_message_id": int(draft["reply_to_message_id"]),
+                "top_msg_id": draft.get("top_msg_id"),
+            }
+        return encode_draft_message(
+            message=str(draft.get("message") or ""),
+            reply_to=reply_to,
+            no_webpage=bool(draft.get("no_webpage")),
+            invert_media=bool(draft.get("invert_media")),
+            effect=draft.get("effect"),
+        )
+
+    def _encode_message_reactions_from_payload(self, payload: dict[str, Any]) -> bytes:
+        reaction_bytes = [
+            encode_reaction_count(reaction=r["reaction"], count=int(r["count"]))
+            for r in payload.get("reactions", [])
+        ]
+        recent_bytes = [
+            encode_message_peer_reaction(
+                peer=encode_peer_user(user_id=int(r["user_id"])),
+                reaction=r["reaction"],
+                date=int(r["date"]),
+                big=bool(r["big"]),
+                my=False,
+            )
+            for r in payload.get("recent", [])
+        ]
+        return encode_message_reactions(reactions=reaction_bytes, recent=recent_bytes, can_see_list=True)
+
+    def _encode_search_messages(
+        self, connection, messages: list[dict[str, Any]], self_user_id: int
+    ) -> tuple[list[bytes], list[bytes], list[bytes]]:
+        summaries: dict[int, dict[str, Any]] = {}
+        encoded: list[bytes] = []
+        user_ids: set[int] = {self_user_id}
+        chat_ids: set[int] = set()
+        for stored in messages:
+            peer_id = int(stored["peer_id"])
+            summary = summaries.get(peer_id)
+            if summary is None:
+                summary = get_peer(connection, peer_id=peer_id, user_id=self_user_id)
+                summaries[peer_id] = summary
+            encoded.append(
+                self._encode_stored_message(
+                    stored=stored,
+                    summary=summary,
+                    outgoing=int(stored["sender_user_id"]) == self_user_id,
+                )
+            )
+            user_ids.add(int(stored["sender_user_id"]))
+            if summary.get("direct_user_id") is not None:
+                user_ids.add(int(summary["direct_user_id"]))
+            elif str(summary.get("kind")) in {"chat", "channel"}:
+                chat_ids.add(peer_id)
+        users = self._load_users(connection, user_ids)
+        return (
+            encoded,
+            self._encode_users(users, self_user_id=self_user_id),
+            self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
+        )
+
+    def _handle_messages_search(
+        self, message: EncryptedMessage, *, peer, q, from_id, filter, min_date, max_date, offset_id, limit
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                fkind = filter.get("kind") if isinstance(filter, dict) else "empty"
+                from_id_resolved = None
+                if from_id is not None:
+                    src = self._resolve_input_peer(connection, user_id=self_user_id, peer=from_id)
+                    if str(src.get("kind")) == "user":
+                        from_id_resolved = int(src["peer_id"])
+                messages, count = search_messages(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    user_id=self_user_id,
+                    q=q,
+                    from_id=from_id_resolved,
+                    filter_kind=fkind,
+                    min_date=min_date or None,
+                    max_date=max_date or None,
+                    offset_id=offset_id,
+                    limit=limit,
+                )
+                encoded_messages, encoded_users, encoded_chats = self._encode_search_messages(
+                    connection, messages, self_user_id
+                )
+                result = encode_messages_messages_slice(
+                    count=count, messages=encoded_messages, chats=encoded_chats, users=encoded_users
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_search_global(
+        self, message: EncryptedMessage, *, q, offset_id, limit, min_date, max_date
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                messages, count = search_messages_global(
+                    connection,
+                    user_id=self_user_id,
+                    q=q,
+                    min_date=min_date or None,
+                    max_date=max_date or None,
+                    offset_id=offset_id,
+                    limit=limit,
+                )
+                encoded_messages, encoded_users, encoded_chats = self._encode_search_messages(
+                    connection, messages, self_user_id
+                )
+                result = encode_messages_messages_slice(
+                    count=count, messages=encoded_messages, chats=encoded_chats, users=encoded_users
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_search_counters(self, message: EncryptedMessage, *, peer, filters) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                counters = search_counters(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    user_id=self_user_id,
+                    filters=filters or [],
+                )
+                counter_bytes = [
+                    encode_messages_search_counter(
+                        search_filter=encode_uint32(int(c["constructor_id"])),
+                        count=int(c["count"]),
+                    )
+                    for c in counters
+                ]
+                result = encode_vector(counter_bytes)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_search_results_calendar(self, message: EncryptedMessage, *, peer) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        return self._encrypt_result(message, encode_search_results_calendar_empty())
+
+    def _handle_messages_search_sent_media(self, message: EncryptedMessage, *, peer) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        return self._encrypt_result(
+            message,
+            encode_messages_messages_slice(count=0, messages=[], chats=[], users=[]),
+        )
+
+    def _handle_messages_get_search_results_positions(self, message: EncryptedMessage, *, peer) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        return self._encrypt_result(message, encode_search_results_positions_empty())
+
+    def _handle_messages_send_reaction(
+        self, message: EncryptedMessage, *, peer, msg_id, reaction, big
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        if isinstance(reaction, list):
+            reaction = reaction[0] if reaction else None
+        if reaction is None:
+            return self._encrypt_rpc_error(message, "REACTION_EMPTY")
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                agg, emitted = set_message_reaction(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    message_id=msg_id,
+                    user_id=self_user_id,
+                    reaction=reaction,
+                    big=bool(big),
+                )
+                self.pending_update_envelopes.extend(emitted)
+                user_ids = {int(r["user_id"]) for r in agg.get("recent", [])}
+                users = self._load_users(connection, user_ids)
+                actor_update = next((e for e in emitted if e.user_id == self_user_id), None)
+                date = actor_update.date if actor_update is not None else now_unix()
+                seq = actor_update.seq if actor_update is not None else 0
+                result = encode_updates(
+                    updates=[encode_update_message_reactions(
+                        peer=self._encode_peer(summary),
+                        msg_id=msg_id,
+                        message_reactions=self._encode_message_reactions_from_payload(agg),
+                    )],
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=[],
+                    date=date,
+                    seq=seq,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_messages_reactions(self, message: EncryptedMessage, *, id) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                if not id:
+                    raise MessagingError("MESSAGE_ID_INVALID")
+                if isinstance(id, (list, tuple)):
+                    msg_id = int(id[0])
+                else:
+                    msg_id = int(id)
+                row = connection.execute(
+                    "SELECT peer_id FROM messages WHERE id = ? AND deleted_at IS NULL", (msg_id,)
+                ).fetchone()
+                if row is None:
+                    raise MessagingError("MESSAGE_ID_INVALID")
+                get_peer(connection, peer_id=int(row["peer_id"]), user_id=self_user_id)
+                agg = get_message_reactions(
+                    connection, peer_id=int(row["peer_id"]), message_id=msg_id
+                )
+                summary = get_peer(connection, peer_id=int(row["peer_id"]), user_id=self_user_id)
+                user_ids = {int(r["user_id"]) for r in agg.get("recent", [])}
+                users = self._load_users(connection, user_ids)
+                result = encode_updates(
+                    updates=[encode_update_message_reactions(
+                        peer=self._encode_peer(summary),
+                        msg_id=msg_id,
+                        message_reactions=self._encode_message_reactions_from_payload(agg),
+                    )],
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=[],
+                    date=now_unix(),
+                    seq=int(get_state(connection, self_user_id)["seq"]),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_message_reactions_list(
+        self, message: EncryptedMessage, *, peer, msg_id, reaction, limit
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                result = get_message_reactions_list(
+                    connection,
+                    peer_id=int(summary["peer_id"]),
+                    message_id=msg_id,
+                    reaction=reaction,
+                    limit=limit,
+                )
+                user_ids = {int(item["user_id"]) for item in result["items"]}
+                users = self._load_users(connection, user_ids)
+                reactions_bytes = [
+                    encode_message_peer_reaction(
+                        peer=encode_peer_user(user_id=int(item["user_id"])),
+                        reaction=item["reaction"],
+                        date=int(item["date"]),
+                        big=bool(item["big"]),
+                        my=int(item["user_id"]) == self_user_id,
+                    )
+                    for item in result["items"]
+                ]
+                encoded = encode_messages_message_reactions_list(
+                    count=result["count"],
+                    reactions=reactions_bytes,
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    next_offset=result.get("next_offset"),
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, encoded)
+
+    def _handle_messages_get_recent_reactions(self, message: EncryptedMessage, *, limit) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                reactions = get_recent_reactions(connection, user_id=self_user_id)
+                reactions_bytes = [encode_reaction(r["reaction"]) for r in reactions]
+                result = encode_messages_reactions(hash_value=0, reactions=reactions_bytes)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_set_default_reaction(self, message: EncryptedMessage, *, reaction) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                set_default_reaction(connection, user_id=self_user_id, reaction=reaction)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, encode_bool(True))
+
+    def _handle_messages_save_draft(
+        self, message: EncryptedMessage, *, peer, message_text, no_webpage, invert_media, reply_to, effect
+    ) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                summary = self._resolve_input_peer(connection, user_id=self_user_id, peer=peer)
+                reply_to_message_id = None
+                top_msg_id = None
+                if isinstance(reply_to, dict) and str(reply_to.get("kind")) == "message":
+                    reply_to_message_id = (
+                        int(reply_to["reply_to_message_id"])
+                        if reply_to.get("reply_to_message_id") is not None
+                        else None
+                    )
+                    top_msg_id = (
+                        int(reply_to["top_msg_id"]) if reply_to.get("top_msg_id") is not None else None
+                    )
+                _, emitted = save_draft(
+                    connection,
+                    user_id=self_user_id,
+                    peer_id=int(summary["peer_id"]),
+                    no_webpage=bool(no_webpage),
+                    invert_media=bool(invert_media),
+                    reply_to_message_id=reply_to_message_id,
+                    top_msg_id=top_msg_id,
+                    message=message_text,
+                    effect=effect,
+                )
+                self.pending_update_envelopes.extend(emitted)
+                result = encode_bool(True)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_get_all_drafts(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction() as connection:
+                drafts = get_all_drafts(connection, user_id=self_user_id)
+                updates: list[bytes] = []
+                user_ids: set[int] = set()
+                chat_ids: set[int] = set()
+                for d in drafts:
+                    peer_id = int(d["peer_id"])
+                    summary = get_peer(connection, peer_id=peer_id, user_id=self_user_id)
+                    updates.append(
+                        encode_update_draft_message(
+                            peer=self._encode_peer(summary),
+                            draft=self._encode_draft(d["draft"]),
+                        )
+                    )
+                    if summary.get("direct_user_id") is not None:
+                        user_ids.add(int(summary["direct_user_id"]))
+                    elif str(summary.get("kind")) in {"chat", "channel"}:
+                        chat_ids.add(peer_id)
+                users = self._load_users(connection, user_ids)
+                result = encode_updates(
+                    updates=updates,
+                    users=self._encode_users(users, self_user_id=self_user_id),
+                    chats=self._encode_chats(connection, chat_ids=chat_ids, self_user_id=self_user_id),
+                    date=now_unix(),
+                    seq=0,
+                )
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
+    def _handle_messages_clear_all_drafts(self, message: EncryptedMessage) -> bytes:
+        authenticated = self._require_authenticated(message)
+        if isinstance(authenticated, bytes):
+            return authenticated
+        database, self_user_id = authenticated
+        try:
+            with database.transaction(immediate=True) as connection:
+                emitted = clear_all_drafts(connection, user_id=self_user_id)
+                self.pending_update_envelopes.extend(emitted)
+                result = encode_bool(True)
+        except MessagingError as exc:
+            return self._encrypt_rpc_error(message, str(exc))
+        return self._encrypt_result(message, result)
+
     def _handle_messages_get_history(
         self, message: EncryptedMessage, *, peer: dict[str, object], offset_id: int, limit: int,
     ) -> bytes:
@@ -3636,6 +4199,9 @@ class MTProtoSessionAdapter:
                         if reply_to is not None else None
                     ),
                 )
+                self.pending_update_envelopes.extend(
+                    clear_draft(connection, user_id=self_user_id, peer_id=int(summary["peer_id"]))
+                )
                 return self._finish_outgoing_message(
                     message,
                     connection=connection,
@@ -3679,6 +4245,9 @@ class MTProtoSessionAdapter:
                         if reply_to is not None else None
                     ),
                     media=stored_media,
+                )
+                self.pending_update_envelopes.extend(
+                    clear_draft(connection, user_id=self_user_id, peer_id=int(summary["peer_id"]))
                 )
                 return self._finish_outgoing_message(
                     message,
